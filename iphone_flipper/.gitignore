@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Local runtime artifacts
+listings.db
+*.db
+*.db-journal
+*.db-wal
+browser_profile/
+browser_profiles/
+
+# Secrets
+auth.json
+auth_config.json
+.env

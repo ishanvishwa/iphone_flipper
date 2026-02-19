@@ -1,0 +1,239 @@
+name: iphone-flipper
+
+services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    environment:
+      SERVER_DOMAIN: ${SERVER_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      TZ: ${TZ:-UTC}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - ../runtime/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    command: >
+      sh -lc 'redis-server --appendonly yes --requirepass "$REDIS_PASSWORD"'
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - ../runtime/redis:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$REDIS_PASSWORD\" ping | grep PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: ../..
+      dockerfile: server/services/api/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      TZ: ${TZ:-UTC}
+      APP_ENV: ${APP_ENV:-production}
+      API_PORT: ${API_PORT:-8080}
+      APP_API_TOKEN: ${APP_API_TOKEN}
+      LISTING_EVENT_CHANNEL: ${LISTING_EVENT_CHANNEL:-listing_events}
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: ${POSTGRES_DB}
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    ports:
+      - "127.0.0.1:${API_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: server/services/worker/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      TZ: ${TZ:-UTC}
+      APP_ENV: ${APP_ENV:-production}
+      LISTING_EVENT_CHANNEL: ${LISTING_EVENT_CHANNEL:-listing_events}
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: ${POSTGRES_DB}
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      WORKER_NAME: worker
+      SCRAPE_INTERVAL_SECONDS: ${SCRAPE_INTERVAL_SECONDS:-8}
+      WORKER_HEADLESS: ${WORKER_HEADLESS:-1}
+      WORKER_USER_DATA_DIR: ${WORKER_USER_DATA_DIR:-/app/runtime/browser_profile_1}
+      SCRAPER_PROXY_SERVER: ${SCRAPER_PROXY_SERVER}
+      SCRAPER_PROXY_USERNAME: ${SCRAPER_PROXY_USERNAME}
+      SCRAPER_PROXY_PASSWORD: ${SCRAPER_PROXY_PASSWORD}
+      SCRAPER_PROXY_MODE: ${SCRAPER_PROXY_MODE:-fixed}
+      SCRAPER_PROXY_POOL: ${SCRAPER_PROXY_POOL:-}
+      SCRAPER_QUERIES: ${SCRAPER_QUERIES:-}
+      WORKER_CYCLE_RETRY_ATTEMPTS: ${WORKER_CYCLE_RETRY_ATTEMPTS:-3}
+      WORKER_CYCLE_RETRY_BACKOFF_SECONDS: ${WORKER_CYCLE_RETRY_BACKOFF_SECONDS:-3}
+      WORKER_DEGRADED_CONSECUTIVE_CYCLES: ${WORKER_DEGRADED_CONSECUTIVE_CYCLES:-3}
+      WORKER_ROUTE_COOLDOWN_BAD_CYCLES: ${WORKER_ROUTE_COOLDOWN_BAD_CYCLES:-4}
+      WORKER_ROUTE_COOLDOWN_SECONDS: ${WORKER_ROUTE_COOLDOWN_SECONDS:-900}
+      WORKER_PROXY_REUSE_COOLDOWN_SECONDS: ${WORKER_PROXY_REUSE_COOLDOWN_SECONDS:-120}
+      WORKER_PROXY_LEASE_SECONDS: ${WORKER_PROXY_LEASE_SECONDS:-600}
+      IPHONE_FLIPPER_DB_PATH: /app/runtime/worker_1.db
+    volumes:
+      - ../runtime:/app/runtime
+      - ../../price_list.csv:/app/price_list.csv:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker_2:
+    build:
+      context: ../..
+      dockerfile: server/services/worker/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      TZ: ${TZ:-UTC}
+      APP_ENV: ${APP_ENV:-production}
+      LISTING_EVENT_CHANNEL: ${LISTING_EVENT_CHANNEL:-listing_events}
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: ${POSTGRES_DB}
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      WORKER_NAME: worker_2
+      SCRAPE_INTERVAL_SECONDS: ${SCRAPE_INTERVAL_SECONDS_WORKER_2:-${SCRAPE_INTERVAL_SECONDS:-8}}
+      WORKER_HEADLESS: ${WORKER_HEADLESS:-1}
+      WORKER_USER_DATA_DIR: /app/runtime/browser_profile_2
+      SCRAPER_PROXY_SERVER: ${SCRAPER_PROXY_SERVER_2}
+      SCRAPER_PROXY_USERNAME: ${SCRAPER_PROXY_USERNAME_2}
+      SCRAPER_PROXY_PASSWORD: ${SCRAPER_PROXY_PASSWORD_2}
+      SCRAPER_PROXY_MODE: ${SCRAPER_PROXY_MODE_2:-fixed}
+      SCRAPER_PROXY_POOL: ${SCRAPER_PROXY_POOL_2:-}
+      SCRAPER_QUERIES: ${SCRAPER_QUERIES_2:-}
+      WORKER_CYCLE_RETRY_ATTEMPTS: ${WORKER_CYCLE_RETRY_ATTEMPTS:-3}
+      WORKER_CYCLE_RETRY_BACKOFF_SECONDS: ${WORKER_CYCLE_RETRY_BACKOFF_SECONDS:-3}
+      WORKER_DEGRADED_CONSECUTIVE_CYCLES: ${WORKER_DEGRADED_CONSECUTIVE_CYCLES:-3}
+      WORKER_ROUTE_COOLDOWN_BAD_CYCLES: ${WORKER_ROUTE_COOLDOWN_BAD_CYCLES:-4}
+      WORKER_ROUTE_COOLDOWN_SECONDS: ${WORKER_ROUTE_COOLDOWN_SECONDS:-900}
+      WORKER_PROXY_REUSE_COOLDOWN_SECONDS: ${WORKER_PROXY_REUSE_COOLDOWN_SECONDS:-120}
+      WORKER_PROXY_LEASE_SECONDS: ${WORKER_PROXY_LEASE_SECONDS:-600}
+      IPHONE_FLIPPER_DB_PATH: /app/runtime/worker_2.db
+    volumes:
+      - ../runtime:/app/runtime
+      - ../../price_list.csv:/app/price_list.csv:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker_3:
+    build:
+      context: ../..
+      dockerfile: server/services/worker/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      TZ: ${TZ:-UTC}
+      APP_ENV: ${APP_ENV:-production}
+      LISTING_EVENT_CHANNEL: ${LISTING_EVENT_CHANNEL:-listing_events}
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: ${POSTGRES_DB}
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      WORKER_NAME: worker_3
+      SCRAPE_INTERVAL_SECONDS: ${SCRAPE_INTERVAL_SECONDS_WORKER_3:-5}
+      WORKER_HEADLESS: ${WORKER_HEADLESS:-1}
+      WORKER_USER_DATA_DIR: /app/runtime/browser_profile_3
+      # Fast lane: broad newest-first sweep for immediate detections.
+      SCRAPER_PROXY_SERVER: ${SCRAPER_PROXY_SERVER_3}
+      SCRAPER_PROXY_USERNAME: ${SCRAPER_PROXY_USERNAME_3}
+      SCRAPER_PROXY_PASSWORD: ${SCRAPER_PROXY_PASSWORD_3}
+      SCRAPER_PROXY_MODE: ${SCRAPER_PROXY_MODE_3:-fixed}
+      SCRAPER_PROXY_POOL: ${SCRAPER_PROXY_POOL_3:-}
+      SCRAPER_QUERIES: ${SCRAPER_QUERIES_3:-iPhone}
+      WORKER_CYCLE_RETRY_ATTEMPTS: ${WORKER_CYCLE_RETRY_ATTEMPTS:-3}
+      WORKER_CYCLE_RETRY_BACKOFF_SECONDS: ${WORKER_CYCLE_RETRY_BACKOFF_SECONDS:-3}
+      WORKER_DEGRADED_CONSECUTIVE_CYCLES: ${WORKER_DEGRADED_CONSECUTIVE_CYCLES:-3}
+      WORKER_ROUTE_COOLDOWN_BAD_CYCLES: ${WORKER_ROUTE_COOLDOWN_BAD_CYCLES:-4}
+      WORKER_ROUTE_COOLDOWN_SECONDS: ${WORKER_ROUTE_COOLDOWN_SECONDS:-900}
+      WORKER_PROXY_REUSE_COOLDOWN_SECONDS: ${WORKER_PROXY_REUSE_COOLDOWN_SECONDS:-120}
+      WORKER_PROXY_LEASE_SECONDS: ${WORKER_PROXY_LEASE_SECONDS:-600}
+      WORKER_SCROLL_TARGET_CARDS: ${WORKER_SCROLL_TARGET_CARDS_WORKER_3:-100}
+      WORKER_SCROLL_MAX_ROUNDS: ${WORKER_SCROLL_MAX_ROUNDS_WORKER_3:-4}
+      IPHONE_FLIPPER_DB_PATH: /app/runtime/worker_3.db
+    volumes:
+      - ../runtime:/app/runtime
+      - ../../price_list.csv:/app/price_list.csv:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  caddy_data:
+  caddy_config:
+
+# Add more workers by copying the worker service block with:
+# - a unique service name (worker_4, worker_5, ...)
+# - unique WORKER_USER_DATA_DIR and IPHONE_FLIPPER_DB_PATH
+# - account-specific proxy credentials and optional SCRAPER_QUERIES shard

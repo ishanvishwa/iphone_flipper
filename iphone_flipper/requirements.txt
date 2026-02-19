@@ -1,0 +1,24 @@
+# iPhone Flipper - Dependencies
+
+# Web scraping
+playwright>=1.40.0
+beautifulsoup4>=4.12.0
+playwright-stealth>=1.0.6
+
+# AI/LLM - Gemini (primary)
+google-genai>=1.0.0
+
+# AI/LLM - OpenAI (optional fallback)
+openai>=1.0.0
+
+# HTTP requests
+requests>=2.31.0
+pproxy>=2.7.9
+
+# Database (SQLite is built-in, no extra package needed)
+
+# Optional: For scheduling
+# schedule>=1.2.0
+
+# Optional: For better async support
+# aiohttp>=3.9.0

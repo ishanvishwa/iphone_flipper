@@ -1,0 +1,16 @@
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.db
+browser_profile
+browser_profiles
+.git
+.gitignore
+.DS_Store
+data
+logs
+secrets
+runtime
+server/runtime

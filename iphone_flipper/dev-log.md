@@ -1,0 +1,1211 @@
+# iPhone Flipper Development Log
+
+## Log Policy
+This is a living development log tracking:
+- completed implementation work
+- architectural and product decisions
+- roadmap drift (manual/additional features)
+- current status and active risks
+
+Last updated: **2026-02-16**
+Author: Codex implementation/update pass
+
+---
+
+## 1. Current System Snapshot
+
+### Runtime/Project Snapshot
+- Application type: local Python app (CLI + Tkinter GUI)
+- Primary DB: `listings.db` (SQLite)
+- Deployment mode: local app + server migration baseline scaffolded (`server/`), rollout in progress
+- Current listing count: **383** (`new`: 334, `needs_pricing`: 20, `unclassified`: 29)
+- Purchases recorded: **0**
+- Conversations recorded: **0**
+
+### Primary Operational Capabilities
+- Marketplace scraping with persistent browser profile
+- Hybrid listing acquisition (captured Marketplace GraphQL responses + DOM fallback)
+- Model/condition inference and pricing calculations
+- AI negotiation message generation (Gemini/OpenAI)
+- Notification fanout (email/Telegram/Discord)
+- Purchase tracking, patterns, conversion scoring, insights
+- GUI-driven workflows for scrape/analysis/price-sheet edits
+
+---
+
+## 2. Implementation Timeline (Consolidated)
+
+### Milestone A: Core Automation Foundation
+Status: Completed
+- Implemented `main.py` command surface for scrape/monitor/list/respond/analyze/status.
+- Implemented DB bootstrap and scrape ingestion pipeline.
+- Added persistent schema for multi-account/proxy runtime config (`fb_accounts`, `proxies`, `scraper_settings`).
+- Added DB-backed `search_queries` table seeded from default iPhone terms for runtime query registry.
+- Added auth configuration handling for API key and OAuth token formats.
+- Added `auth-status` visibility command with OAuth expiry awareness.
+- Added one-time `auth.json` bootstrap import with source-file cleanup.
+
+### Milestone B: Negotiation + Analytics Engine
+Status: Completed
+- Added AI negotiation module with provider abstraction and conversation persistence.
+- Added purchase recording model and pattern-learning tables.
+- Added conversion score and insights generation pipeline.
+
+### Milestone C: GUI Control Plane
+Status: Completed
+- Added tabbed GUI for listings, negotiation, and deals.
+- Added action buttons for open URL, negotiation flow, and purchase marking.
+- Added analytics access via menu (patterns/history/insights).
+
+### Milestone D: UX and Process Enhancements
+Status: Completed
+- Added `Price Sheet` menu and in-app CSV editor.
+- Added full listing recalculation after price updates.
+- Added scraper run telemetry in GUI (elapsed time + query progress).
+- Added scraper cancellation control.
+- Added listing color flags through context menu (`scam`, `interested`, `not_interested`, clear).
+- Added bulk selection behavior for listings (drag-select range + Cmd/Ctrl multi-select) and right-click bulk actions for mark/clear/delete.
+- Added opened-listing visual state:
+  - new `opened_at` listing field for persistent tracking of listings opened in browser
+  - opening a listing now auto-sets `opened_at`
+  - opened rows render with distinct blue tint unless an explicit user flag color is set
+- Added advanced Listings filters:
+  - multi-select model dropdown (checkable menu)
+  - profit range inputs (`min` / `max`)
+  - minimum price input
+  - all filters are combined in SQL query path and can be cleared via `Clear Filters`
+- Price Sheet editor now de-duplicates models on save (case/spacing-insensitive upsert behavior) to prevent duplicate model rows.
+- Renamed Price Sheet save action button from `Save To CSV` to `Apply Changes` for clearer workflow wording.
+- Added feed-level suppression for non-actionable model rows:
+  - listings where `model` is blank or `Unknown` are hidden from Listings tab and model dropdown
+  - rows are retained in database for audit/debug use
+- Added setup/launch guide panel in GUI.
+
+### Milestone E: Financial and Visibility Corrections
+Status: Completed
+- Corrected profit computation to use listed price vs sell price (with repair costs).
+- Adjusted ingestion/status handling so not only “good/profitable” records are shown.
+- Tightened scraper scope to persist only listings whose detected model exists in current price sheet.
+- Recalculation now purges managed listings whose model is not in price sheet (keeps queue aligned after model deletes).
+- Limited outbound new-listing notifications to profitable subset by default.
+- Added post-purchase resale reconciliation path (`main.py resale` + `update_purchase_resale`).
+- Added on-demand daily operational summary broadcast (`main.py summary`).
+
+### Milestone F: Marketplace Fetch Upgrade (Hybrid Path)
+Status: Completed
+- Added GraphQL response capture during Marketplace search navigation.
+- Added normalized extraction of listing ID/title/price/location/description/seller from GraphQL payloads.
+- Added canonical Marketplace URL normalization (`/marketplace/item/<id>/`) to strip tracking params from stored/opened links.
+- Added DOM fallback merge path so scraping still works when GraphQL extraction is sparse.
+- Added richer listing persistence (`location`, `description`, `seller_name`) for downstream evaluation.
+- Added per-query source visibility (`graphql_found`, `dom_found`) in progress callbacks.
+
+### Milestone G: GUI Connection Settings Manager
+Status: Completed
+- Added `Settings > Connections & Scraper` GUI entry.
+- Added full CRUD interface for Facebook account configurations (status, profile path, user agent, proxy mapping).
+- Added per-account manual login action constrained to SOCKS5 proxy assignment.
+- Added local SOCKS5 auth bridge fallback (`pproxy`) to handle Chromium's SOCKS5-auth limitation.
+- Added account-scoped browser session launcher so operator can manually browse from configured account identity.
+- Added full CRUD interface for proxies (type/host/port/auth/country/status).
+- Added API-driven proxy sync (fetch + parse + upsert) for bulk proxy ingestion.
+- Added GUI-editable scraper settings persisted in DB (monitor interval, monitor jitter, inter-query delay bounds, max queries/run).
+- Added proxy API configuration settings in GUI (URL, key, auth header, timeout, default type/country).
+- Added scraper-tab action button to trigger proxy API import directly from saved API settings.
+- Added Scraper-menu `Worker Queries & Keywords` manager for:
+  - per-worker route query shard updates (`worker_routes.search_queries`)
+  - universal accessory/negative keyword management with VPS runtime sync
+- Wired monitor launch to use persisted interval setting.
+- Wired scraper runtime to use persisted delay bounds and query cap.
+- Wired manual login flow to capture and persist cookies, user agent, proxy-observed IP, and account status.
+- Wired scraper execution to account-only mode (no default shared profile fallback).
+- Added per-run round-robin scraper account rotation across eligible ACTIVE+SOCKS5 accounts using `last_scraper_account_id`.
+- Added rotation-start selector (`active_scraper_account_id`) to anchor first run in the rotation sequence.
+- Extended strict account-only rotation to CLI `scrape` and `monitor` commands with automatic SOCKS5 auth bridge handling.
+- Wired `notify_profitable_only` setting into both GUI and CLI notification dispatch behavior.
+- Added scrape runtime account-health tracking (`failure_count`, `cooldown_until`) with automatic status transitions on run success/failure.
+
+### Milestone H: 24x7 Server + Real-Time Sync Migration Planning
+Status: Completed
+- Added target-state architecture for VPS-hosted worker pool, centralized DB, and event-driven desktop sync.
+- Added operator-side migration checklist (VPS, DB, domain/TLS, secrets, account-profile validation).
+- Added engineering migration sequence (immediate per-listing upsert + event fanout + WebSocket sync).
+- Re-prioritized roadmap toward server migration track before further local-only optimization.
+
+### Milestone I: 24x7 Server Baseline Implementation
+Status: In Progress (Baseline Completed)
+- Refactored `scraper.scrape_marketplace()` ingest path to commit listings immediately per insert (removed run-end batch wait).
+- Added `listing_saved` event emission with full listing payload for downstream realtime consumers.
+- Added server deployment scaffold under `server/`:
+  - `server/infra/docker-compose.yml` (Caddy + Postgres + Redis + API + worker pool)
+  - `server/infra/Caddyfile` (TLS reverse-proxy target for API)
+  - `server/services/api/app/main.py` (`/healthz`, `/listings`, `/ws/listings`)
+  - `server/services/api/sql/001_init.sql` (authoritative listings table + indexes/trigger)
+  - `server/services/worker/worker.py` (continuous scraping + per-listing Postgres upsert + Redis publish)
+  - `server/.env.example`, `server/README.md` (operator runbook)
+- Removed hardcoded worker proxy credentials from compose templates and moved them to env-based settings (`SCRAPER_PROXY_*`, `SCRAPER_PROXY_*_2`).
+- Corrected Postgres persistent volume mapping in compose template to `../runtime/postgres:/var/lib/postgresql/data`.
+- Added Docker build context hardening (`.dockerignore`) to avoid shipping local browser cache/profile artifacts into image build context.
+- Added GUI progress-state support for incremental `listing_saved` counts during active scrape runs.
+
+### Milestone J: Desktop Server-Sync (Incremental Cursor Polling)
+Status: In Progress (Poll Path Completed)
+- Added GUI settings for server-sync controls:
+  - `server_sync_enabled`
+  - `server_api_base_url`
+  - `server_api_token`
+  - `server_sync_poll_seconds`
+  - `server_sync_since_id`
+- Added background GUI sync worker that continuously pulls incremental updates from server `/listings` using `since_id` cursor pagination.
+- Added local SQLite upsert path for server listings with conflict-safe updates and preservation of local `purchased` status.
+- Added cursor persistence in `scraper_settings` so reconnects/backfills continue from last synced watermark.
+- Added GUI startup/shutdown lifecycle hooks to auto-start sync when enabled and cleanly stop thread on app exit.
+- Added GUI VPS activity monitor window with operator actions for:
+  - API health check
+  - worker service status (`docker compose ps`)
+  - worker log tail (`docker compose logs`)
+  - server-side listing count (`psql count(*)`)
+- Added GUI-configurable server monitor SSH settings (`server_ssh_*`) and worker service selector (`server_monitor_worker_services`).
+
+### Milestone K: VPS Scraper Route Control + Pagination/Rotation Hardening
+Status: Completed
+- Added server-side worker route and heartbeat schema (`worker_routes`, `worker_heartbeats`) in `server/services/api/sql/001_init.sql`.
+- Added API endpoints for VPS scraper route control and status:
+  - `GET /worker-routes`
+  - `PUT /worker-routes/{worker_name}/{route_name}`
+  - `DELETE /worker-routes/{worker_name}/{route_name}`
+  - `GET /worker-health`
+- Added worker-side route rotation per cycle:
+  - worker loads enabled routes for its configured `WORKER_NAME`
+  - route selection is round-robin each scrape cycle
+  - route markers update (`last_selected_at`, `last_success_at`, `last_error`)
+  - worker heartbeat updates for `running`/`ok`/`error` states
+- Added GUI **VPS Scrapers** tab for remote route CRUD and heartbeat visibility from desktop.
+- Simplified settings UX to VPS-first single-tab workflow (removed account/proxy multi-tab dependency from primary path).
+- Added VPS-side `Manual Login (SOCKS5)` action with proxy-profile selection to bootstrap new scraper profiles via remote SSH command flow.
+- Updated settings UX per operator request to two-tab structure: `Proxies` + `VPS Scrapers`.
+- Updated VPS route save/manual-login behavior to target active workers for immediate rotation participation (instead of requiring unique worker names).
+- Added worker-route status rendering for rotation context: non-active routes on a healthy worker show `ready` (instead of `unknown`).
+- Migrated existing non-running route `worker_3/profile_3` to active worker rotation as `worker/profile_3`; heartbeat now reports live selection on `worker`.
+- Added automatic profile-dir suggestion/population and VPS-side directory creation bootstrap during manual login trigger.
+- Reworked Marketplace page-depth traversal to progressive scroll loading (target cards + max rounds) and added diagnostics (`page_cards`, `scroll_rounds`).
+- Rotation min-reuse filtering now uses dedicated `last_scrape_started_at` instead of generic account `updated_at`.
+
+### Milestone L: VPS Route Availability Recovery + Runtime Hardening
+Status: Completed
+- Restored missing VPS runtime env file and re-established deploy path after accidental `.env` deletion on server.
+- Redeployed API and validated public endpoint availability for:
+  - `GET /worker-routes`
+  - `GET /worker-health`
+  - `GET /healthz`
+- Seeded current VPS scraper profiles into route registry for immediate UI visibility:
+  - `worker/profile_1`
+  - `worker_2/profile_2`
+- Hardened root `.dockerignore` to exclude runtime/data/log/secrets paths and prevent Docker build-context permission failures on VPS.
+- Removed concurrent trigger/function bootstrap DDL from worker startup to eliminate multi-worker startup race errors.
+- Improved pagination-depth behavior in scraper runtime:
+  - feed-container-aware scroll targeting (not only window scroll)
+  - cumulative DOM snapshot aggregation across scroll rounds for virtualized feeds
+  - increased idle-stall tolerance before stopping scroll rounds
+- Updated VPS manual login execution:
+  - default browser preference now starts with `google-chrome`
+  - credentialed SOCKS5 proxies now run through a temporary local `pproxy` bridge on VPS before launching browser (`--proxy-server=http://127.0.0.1:<port>`)
+  - manual-login command now auto-detects VNC display/Xauthority (`Xtigervnc :1`, `/home/ubuntu/.Xauthority`) and launches directly from SSH-triggered GUI action
+  - manual-login output now includes proxy egress-IP check and pre-launch `facebook.com` `c_user` cookie presence to confirm login-capture state
+  - manual-login preflight now performs best-effort profile ownership/permission repair (`chown/chmod`) and downgrades cookie DB permission-denied probes to non-fatal status output (`unknown (permission denied)`)
+  - hotfix: escaped embedded cookie-check snippet interpolation in GUI manual-login command builder (fixed `NameError: db_path is not defined` on button click)
+  - manual login now auto-saves/upserts VPS route before launch so newly logged-in scraper profile is immediately visible in VPS scraper list
+  - VPS Scrapers settings tab now supports vertical scrolling for smaller-screen usability (all action buttons remain reachable)
+- Added automatic accessory-only suppression for scraped listings:
+  - new heuristic filter drops accessory-only posts (case/cover/protector/charger without handset signals) before listing insert
+  - worker ingest path now applies the same guard so VPS pipeline also rejects accessory-only events
+  - scrape run and financial recalculation now auto-purge previously stored accessory-only rows from managed statuses (`new`, `unclassified`, `needs_pricing`)
+- Added operator-tunable accessory suppression settings in GUI:
+  - VPS Scrapers settings now expose `Accessory Keywords (CSV)` and `Accessory Max Price`
+  - values persist to `scraper_settings` as `accessory_filter_keywords` / `accessory_filter_max_price`
+  - save action performs best-effort SSH sync to VPS `runtime/worker_*.db` scraper settings for server-side worker parity
+- Added desktop sync-side cleanup guard:
+  - server cursor-sync upsert path now calls accessory-only purge on local SQLite each batch, so rows deleted/filtered upstream do not remain stale in GUI
+  - accessory detector now matches plural title variants (`cases`, `covers`) in addition to singular (`case`, `cover`)
+
+### Milestone M: Telegram Listing Card Notifications (VPS Worker Path)
+Status: Completed
+- Upgraded Telegram sender to support optional parse mode and per-message web preview control.
+- Added Telegram listing-card formatter (`build_telegram_listing_card`) with compact fields:
+  - listing title/model/condition
+  - listed price and potential profit
+  - truncated description snippet
+  - direct listing link
+- Updated local notification fanout to send one Telegram card per listing (instead of only a large text dump).
+- Changed notifiable-profit threshold from `> 0` to `>= 0` for new-listing notifications.
+- Added worker-side Telegram dispatch for `listing_created` events where:
+  - Telegram token/chat is configured
+  - listing `potential_profit >= TELEGRAM_NOTIFY_MIN_PROFIT` (default `0`)
+- Added guard to suppress worker Telegram alerts when listing model is blank or `Unknown`.
+- Worker path uses non-blocking thread handoff (`asyncio.to_thread`) so notification HTTP calls do not stall scrape/event loop progress.
+- Added GUI `Send Telegram Test` controls in:
+  - `Connections & Scraper > VPS Scrapers` connection actions
+  - `VPS Scraper Activity Monitor`
+  The action executes over SSH and sends a test message from running VPS worker env to verify real production token/chat settings.
+
+### Milestone N: Worker_3 Fast-Lane + Query Routing Controls
+Status: Completed
+- Added built-in `worker_3` service to compose stack for fast newest-listing sweep behavior.
+- Added worker runtime env overrides for scroll depth:
+  - `WORKER_SCROLL_TARGET_CARDS`
+  - `WORKER_SCROLL_MAX_ROUNDS`
+- Wired `worker_3` defaults to broad `iPhone` query with short cycle interval and medium-depth scroll profile (target cards capped at 100).
+- Updated monitor defaults to include `worker_3` service checks in GUI/DB defaults.
+- Fixed VPS accessory-filter sync script indentation bug in GUI SSH helper (`IndentationError` on `targets = sorted(runtime_dir.glob("worker_*.db"))`).
+- Upgraded VPS Activity Monitor worker logs to live stream mode (`docker compose logs -f`) with `Stop Logs` control and cleanup on window/app close.
+- Hardened VPS accessory-filter sync to update settings via `docker compose exec` inside worker containers, avoiding host-file SQLite permission/read-only failures.
+- Hardened VPS accessory-filter sync failure handling for SQLite readonly states:
+  - detects readonly write failures from container-side sync calls
+  - runs one-time permission repair on target worker runtime DB path (`docker compose exec -u 0 ... chown/chmod`)
+  - retries sync write after repair and reports partial failures per worker service
+  - safety fix: permission repair is now non-recursive (repairs DB dir/file only) to avoid touching unrelated runtime subtrees such as PostgreSQL data
+- Normalized GUI monitor worker-service parsing to accept comma/space-separated values and always enforce required coverage (`worker`, `worker_2`, `worker_3`) so `worker_3` appears in status/log checks even when older saved settings were missing it.
+
+### Milestone O: Feed Recency + Worker Profile Failure Safeguards
+Status: Completed
+- Enforced newest-first Marketplace search ordering (`sortBy=creation_time_descend`) for all query URLs.
+- Updated progressive feed scroll logic to enforce at least one scroll pass before target-card early exit, reducing false "already loaded enough" starts.
+- Added worker-side profile failure detection using `query_result` telemetry:
+  - routes are marked `degraded` when all query results return `page_cards=0`
+  - degraded state is persisted into `worker_heartbeats.last_error/status` for operator visibility
+- Added Telegram profile failure notifications with worker/profile/route context and cooldown control (`WORKER_PROFILE_FAILURE_ALERT_COOLDOWN_SECONDS`).
+- Added GUI main-page VPS worker health strip with three red/green indicators for `worker`, `worker_2`, and `worker_3`, polled from `/worker-health`.
+
+### Milestone P: VPS Deploy Automation + Host Security Hardening
+Status: Completed
+- Added one-command deployment script: `server/scripts/deploy_vps.sh`.
+  - syncs `server/` to VPS via rsync (excluding `.env`/runtime cache artifacts)
+  - runs `docker compose --env-file ../.env up -d --build` for API + worker services
+  - applies SQL bootstrap migration (`001_init.sql`) idempotently
+  - validates local API health and worker heartbeat endpoint after rollout
+- Updated server runbook with script usage and environment override examples (`server/README.md`).
+- Applied VPS host hardening baseline:
+  - enforced SSH key-only access via `/etc/ssh/sshd_config.d/99-codex-hardening.conf`
+  - disabled password/KbdInteractive auth and set conservative SSH auth limits
+  - validated active UFW allowlist (`22`, `80`, `443`)
+  - installed/enabled fail2ban with `sshd` jail
+- Executed controlled profile-failure alert validation:
+  - intentionally injected bad `proxy_server` on `worker_3/profile_3`
+  - observed degraded/cooldown state transitions and retry behavior
+  - verified worker log line `Telegram message sent` for profile-failure alert path
+  - restored original route proxy and cleared cooldown to return `worker_3` to normal route selection
+
+### Milestone Q: Proxy Rotation Concurrency Guard + GUI Auto Assignment
+Status: Completed
+- Added server-side global proxy lease table (`worker_proxy_leases`) with migration wiring in:
+  - `server/services/api/sql/001_init.sql`
+  - `server/services/api/app/main.py`
+  - `server/services/worker/worker.py`
+- Worker proxy selection now acquires DB-backed lease before use:
+  - blocks concurrent use of the same proxy across routes/profiles
+  - enforces auto-rotation proxy reuse cooldown (`WORKER_PROXY_REUSE_COOLDOWN_SECONDS`)
+  - applies lease TTL (`WORKER_PROXY_LEASE_SECONDS`) and explicit release after cycle
+- Updated worker fallback behavior:
+  - if DB routes exist but are unavailable (cooldown/proxy lock), worker waits in cooldown state
+  - avoids silent `env_default` fallback loops that masked route-level failures
+- Updated VPS Scrapers GUI route form:
+  - `Worker Name` can be left blank and is auto-assigned on save
+  - when `proxy_mode=auto_rotation`, proxy profile selection is optional
+  - auto mode now seeds proxy selection randomly from parsed pool/proxy inventory
+- Updated manual-login flow:
+  - blank worker name now auto-assigns
+  - auto-rotation mode can seed login proxy from proxy pool when `proxy_server` is blank
+
+### Milestone R: Worker Lease/Cooldown Visibility in GUI
+Status: Completed
+- Expanded API worker-health payload (`GET /worker-health`) to include:
+  - active lease metadata (`leased_proxy_server`, `leased_proxy_route`, `leased_proxy_until`, `lease_remaining_seconds`)
+  - active route cooldown metadata (`route_cooldown_until`, `cooldown_remaining_seconds`)
+  - convenience booleans (`has_active_lease`, `is_route_in_cooldown`)
+- Updated main Listings worker status strip to include runtime hints per worker:
+  - `lease mm:ss` when proxy is actively leased
+  - `cd mm:ss` when route is waiting in cooldown
+  - `idle` otherwise
+- Updated `Settings > Connections & Scraper > VPS Scrapers` monitoring surfaces:
+  - route table now includes `Lease` and `Cooldown` columns
+  - route details form now includes read-only `Lease Status` and `Cooldown Status`
+  - displays are sourced from `/worker-health` + route cooldown timestamps, so operators can monitor worker activity without tailing logs
+
+### Milestone S: Worker-Scoped Query Manager + Zero-Query Failure Guard
+Status: Completed
+- Updated `Worker Queries & Negative Keywords` UI to worker scope only:
+  - table now shows one row per worker (`worker`, `worker_2`, `worker_3`) instead of worker+route combinations
+  - query shard edits now apply across all routes/profiles under the selected worker
+  - route/profile naming is removed from query-management workflow to match worker-level query ownership
+- Hardened worker profile-failure detection:
+  - scrape cycles with zero executed queries now count as bad cycles
+  - these cycles now participate in degraded/cooldown/alert pipeline instead of silently passing as healthy
+
+### Milestone T: Last-Minute Scrape Throughput Metric
+Status: Completed
+- Added `worker_scrape_events` persistence in worker/API schema (`worker_name`, `route_name`, `scraped_count`, `observed_at`) with worker+time index.
+- Worker runtime now records query-level `found` counts as scrape events (actual scraped volume), separate from `listing_saved`/`new_saved`.
+- Scrape events are persisted at query-result time (not only end-of-cycle) so `listings_scraped_last_minute` remains live during long worker cycles.
+- API `GET /worker-health` now returns `listings_scraped_last_minute` as rolling 60-second sum per worker.
+- GUI monitoring updates:
+  - `Worker Queries & Negative Keywords` worker status table includes `Listings Scraped last minute`.
+  - `Settings > Connections & Scraper > VPS Scrapers` route table includes `Scraped (1m)` and route form includes read-only `Listings Scraped last minute`.
+
+### Milestone U: Worker Scheduling + Capacity-Wait Hardening
+Status: Completed
+- Added worker runtime helper module (`server/services/worker/runtime.py`) for:
+  - `CycleOutcome` / `ErrorCategory` types
+  - runtime-compensated sleep + jitter computation
+  - due-route (`next_run_at`) selection helpers
+  - retry/backoff and bad-cycle counting helpers
+- Replaced in-memory route round-robin with DB-backed due-time scheduling:
+  - `worker_routes.next_run_at` and optional `route_interval_seconds`
+  - route selection now picks earliest due route
+  - worker sleeps until due-time/cooldown windows instead of fixed loops
+- Added first-class non-failure outcomes:
+  - `WAIT_PROXY` when no proxy can be leased
+  - `WAIT_PROFILE_LOCK` when profile runtime lock is unavailable
+  - both outcomes do not increment bad-cycle/degrade/cooldown counters
+- Added profile runtime lock guard:
+  - lock acquisition/release via `worker_proxy_leases` with `PROFILE:` key prefix
+  - prevents concurrent Playwright launches on the same `user_data_dir`
+- Hardened lease lifecycle:
+  - explicit release in cycle `finally` paths retained
+  - `last_used_at` now stamped on release (not on lease acquisition)
+- Added API-side protection against profile contention:
+  - `PUT /worker-routes/{worker}/{route}` now rejects enabled routes reusing another enabled route's `user_data_dir`
+- Added structured worker telemetry logs per cycle:
+  - `cycle_id`, `route_name`, `duration_ms`, `outcome`, `error_category`, `retry_count`
+- Added tests and docs for the new scheduler/outcome behavior:
+  - `server/tests/test_worker_runtime.py`
+  - `server/tests/test_api_profile_validation.py`
+  - `AGENTS.md`, `TESTING.md`
+
+### Milestone V: Route State Machine + Proxy Health + Signal Safeguards
+Status: Completed
+- Added proxy health persistence and scoring:
+  - new `proxy_stats` table with `consecutive_failures`, `last_success_at`, `banned_until`, `avg_latency_ms`
+  - worker now updates proxy health on scrape success/failure and applies exponential temporary bans after repeated failures
+  - proxy candidate selection now prioritizes healthy candidates and excludes currently banned proxies
+- Added explicit route status state machine persistence on `worker_routes`:
+  - `status`, `status_reason`, `status_since`
+  - supported statuses: `ENABLED`, `DEGRADED`, `THROTTLED`, `COOLDOWN`, `NEEDS_LOGIN`, `DISABLED`
+  - degraded/throttled states now drive interval multipliers (`2x`, `4x`) and are updated in worker runtime transitions
+  - expired cooldown windows are auto-released back to `ENABLED` before route selection
+- Added pre-checkpoint soft-signal detection path:
+  - new pure module `server/services/worker/signal_detector.py`
+  - signal analyzer computes risk + recommended action (`continue`, `throttle`, `pause`, `quarantine`)
+  - route EMA baselines persisted via `avg_result_count`, `avg_page_load_ms`, `successful_cycles`
+  - worker now maps high signal risk to proactive throttle/pause/quarantine behavior (`WAIT_SIGNAL_PAUSE` or `NEEDS_LOGIN`)
+- Added cross-worker query-shard deduplication:
+  - worker acquires/releases shard locks using `worker_proxy_leases` (`QUERY_SHARD:*`)
+  - lock contention returns non-failure `WAIT_QUERY_SHARD` outcome (no bad-cycle increment)
+- Added minimum-route resilience enforcement:
+  - API route upsert/delete now returns warnings when a worker has fewer than configured minimum enabled routes (`WORKER_MIN_ENABLED_ROUTES_WARN`)
+  - worker applies mandatory extended rest multiplier (`WORKER_SINGLE_ROUTE_REST_MULTIPLIER`) when running with a single enabled route
+- Expanded tests and telemetry:
+  - extended runtime tests for new classifications/state helpers (`server/tests/test_worker_runtime.py`)
+  - added signal-detector tests (`server/tests/test_signal_detector.py`)
+  - cycle telemetry now includes dynamic `proxy_key`, `query_shard_key`, soft-signal fields where available
+
+### Milestone W: Quarantine Operations + Proxy Binding Validation + Telemetry Rollup
+Status: Completed
+- Added quarantine incident metadata to route state:
+  - new `worker_routes` fields: `quarantined_at`, `quarantine_reason`, `quarantine_evidence`
+  - metadata now populated when worker marks a route `NEEDS_LOGIN`
+  - API/GUI route payloads now surface quarantine fields for operator diagnostics
+- Added manual-login operational recovery controls:
+  - API endpoint `POST /worker-routes/{worker}/{route}/retest` clears manual-login lock and schedules immediate retest cycle
+  - API endpoint `POST /worker-routes/{worker}/bulk-clear-manual-login` clears manual-login lock across a worker in one action
+  - GUI VPS Scrapers now exposes `Retest Route` and `Bulk Clear Login Locks` actions
+- Added Telegram deduplication for manual-login quarantine alerts:
+  - dedupe key uses route + normalized reason
+  - duplicate alerts are suppressed within `WORKER_MANUAL_LOGIN_ALERT_DEDUP_SECONDS` (default 300s)
+- Added proxy binding validation guard in worker cycle path:
+  - scraper now performs optional browser-level IP check (`VERIFY_PROXY_IP`, `PROXY_IP_CHECK_URL`, `PROXY_IP_CHECK_TIMEOUT_MS`)
+  - mismatches are classified as `PROXY_MISMATCH` and mapped to non-failure wait outcome `WAIT_PROXY_MISMATCH`
+  - proxy mismatch waits do not increment route bad-cycle counters
+- Completed telemetry hardening deliverables:
+  - extracted structured telemetry payload builder to `server/services/worker/telemetry.py`
+  - added payload-shape tests (`server/tests/test_telemetry.py`)
+  - added telemetry rollup utility (`server/scripts/telemetry_rollup.py`) for per-route success/wait/fail trend reporting
+
+### Milestone X: Persona Variation + Worker Refactor + Shared Schema Ensure
+Status: Completed
+- Implemented controlled per-cycle browser persona variation using Playwright-native context options:
+  - new module `server/services/worker/persona.py` generates coherent personas (`viewport`, `screen`, `device_scale_factor`, `user_agent`, `timezone_id`, `locale`, `color_scheme`)
+  - worker runtime now enables persona variation by default via `ENABLE_FINGERPRINT_VARIATION=1`
+  - worker passes persona-derived context + `Accept-Language` headers into `scraper.scrape_marketplace()` context creation
+- Extended telemetry/evidence coverage for persona debugging:
+  - cycle telemetry now includes `persona_hash` and sanitized `persona` fields
+  - quarantine evidence now captures persona metadata when present
+  - added persona-focused telemetry assertions in `server/tests/test_telemetry.py`
+- Completed optional worker modularization track:
+  - extracted route mutation writes to `server/services/worker/route_transitions.py`
+  - extracted due-time helpers to `server/services/worker/scheduler.py`
+  - worker now delegates lease functions to `server/services/worker/lease_manager.py`
+- Completed schema ensure consolidation track:
+  - added `server/services/common/schema_ensure.py`
+  - API (`server/services/api/app/main.py`) and worker (`server/services/worker/worker.py`) now share one schema-ensure path
+  - API enables trigger creation (`include_triggers=True`), worker keeps trigger bootstrap disabled (`include_triggers=False`) to avoid multi-worker DDL races
+- Added persona unit tests (`server/tests/test_persona.py`).
+
+---
+
+## 3. Decision Log
+
+### Decision: Profit Formula Shift to Market-Realistic Basis
+- Decision: calculate profit from listing asking price where available.
+- Reason: comparing sell price to max-buy alone overstated opportunity quality.
+- Impact: more realistic opportunity ranking and clearer downside risk.
+
+### Decision: Preserve Unclassified/Needs-Pricing Listings
+- Decision: keep discovered listings even when model/pricing is incomplete.
+- Reason: prevents silent data loss and enables manual remediation.
+- Impact: improved transparency and reviewability.
+
+### Decision: Add User Flags at DB Level
+- Decision: store operator marks (`user_flag`) in `listings`.
+- Reason: manual trust/risk intent should survive refreshes.
+- Impact: supports workflow triage without external notes.
+
+### Decision: Keep Condition Logic Rule-Based for Now
+- Decision: use keyword rules on card text as baseline.
+- Reason: safer and lighter than full detail-page scraping at current ban-risk posture.
+- Impact: lower scrape risk, but accuracy ceiling remains.
+
+### Decision: Auto-Suppress Accessory-Only Listings
+- Decision: reject listings that appear to sell accessories only (e.g., cases) rather than a handset.
+- Reason: accessory noise was polluting listing queue and reducing operator efficiency.
+- Impact: cleaner queue quality, with heuristic tuning still needed over time as listing phrasing evolves.
+
+### Decision: Introduce Hybrid Marketplace Fetch
+- Decision: capture and parse Marketplace GraphQL responses, with DOM extraction as fallback.
+- Reason: GraphQL returns cleaner structured listing fields while fallback preserves resilience when payload formats shift.
+- Impact: improved listing data quality without removing existing browser-safe behavior.
+
+### Decision: Shift to Server-First 24x7 Scraping + Push Sync
+- Decision: migrate scraping runtime from desktop-triggered batch loops to VPS-hosted continuous workers with central persistence and live event streaming.
+- Reason: current local flow cannot meet always-on operation, second-level ingest visibility, or multi-worker throughput goals.
+- Impact: desktop app becomes operator client; ingestion and state authority move to server stack.
+
+### Decision: Treat Capacity Contention as WAIT, Not Failure
+- Decision: classify no-proxy and profile-lock contention as capacity-wait outcomes (`WAIT_PROXY`, `WAIT_PROFILE_LOCK`) instead of route failures.
+- Reason: proxy/profile contention is an infrastructure-capacity condition, not a profile health signal, and should not burn bad-cycle counters.
+- Impact: reduced cooldown cascades during temporary capacity drops; healthier route stability under concurrent worker load.
+
+### Decision: Move Route Scheduling from Round-Robin to Due-Time (`next_run_at`)
+- Decision: replace in-memory round-robin route selection with persisted due-time scheduling using `worker_routes.next_run_at` and optional `route_interval_seconds`.
+- Reason: round-robin produced deterministic cadence, restart hotspotting, and inaccurate interval semantics under variable cycle durations.
+- Impact: stable per-route cadence, reduced deterministic traffic patterns, and better control when route availability changes dynamically.
+
+### Decision: Formalize Route Health as an Explicit State Machine
+- Decision: persist route statuses (`ENABLED`, `DEGRADED`, `THROTTLED`, `COOLDOWN`, `NEEDS_LOGIN`, `DISABLED`) with reason/timestamp metadata and state-based interval multipliers.
+- Reason: ad-hoc boolean/counter interpretation made recovery windows ambiguous and made operator diagnosis difficult.
+- Impact: clearer operator visibility, wider recovery window before cooldown, and deterministic transition behavior in worker runtime.
+
+### Decision: Use Proactive Soft-Signal Detection Before Hard Checkpoints
+- Decision: run pure, post-cycle signal analysis and map elevated risk to proactive throttle/pause/quarantine actions.
+- Reason: waiting for hard checkpoint/login challenges is reactive and burns profile/proxy reputation before mitigation starts.
+- Impact: route cadence can back off earlier, reducing checkpoint incidence risk while preserving non-bypass safety posture.
+
+### Decision: Treat Query-Shard Contention as Coordination WAIT
+- Decision: lock query shards across workers and return `WAIT_QUERY_SHARD` when another worker currently owns the shard.
+- Reason: overlapping query shards from multiple workers increase correlated bot-like traffic patterns and inflate false failures.
+- Impact: reduced duplicate shard traffic and cleaner failure accounting (contention no longer increments bad-cycle counters).
+
+### Decision: Enforce Minimum-Route Resilience with Warning + Runtime Guard
+- Decision: warn via API when enabled routes per worker are below threshold and apply mandatory extended rest in single-route mode.
+- Reason: strict blocking would be disruptive during incidents, but single-route operation needs explicit pacing protection.
+- Impact: operators retain flexibility while runtime still avoids aggressive no-rotation scrape cadence.
+
+### Decision: Add Quarantine Metadata + Operational Recovery Actions
+- Decision: persist quarantine evidence (`quarantined_at`, `quarantine_reason`, `quarantine_evidence`) and expose retest/bulk-clear actions in API + GUI.
+- Reason: boolean-only manual-login locks were operationally sticky and hard to audit/recover during multi-route incidents.
+- Impact: faster operator recovery for shared failures and clearer incident context per route.
+
+### Decision: Use Controlled Persona Variation with Native Playwright Options
+- Decision: enable per-cycle persona variation using Playwright context options only (`viewport`, `screen`, `device_scale_factor`, `user_agent`, `timezone_id`, `locale`, `color_scheme`), without external stealth/evasion libraries.
+- Reason: static context fingerprints across rotating proxies increase correlation risk and reduce route resilience during sustained operation.
+- Impact: route cycles now carry coherent persona context and telemetry evidence (`persona_hash`) while keeping implementation bounded to native browser configuration APIs.
+
+---
+
+## 4. Roadmap Drift Audit (Manual/Additional Features)
+The following were detected in implementation and added to roadmap because they were not explicitly captured in original baseline planning:
+
+1. In-app price sheet editor with CSV write-back and recalculation trigger.
+2. GUI scraper cancellation with progress callback plumbing.
+3. Listing row color coding and persistence via `user_flag`.
+4. Expanded listing state handling (`new`, `needs_pricing`, `unclassified`).
+5. Profit recalculation logic tied to current listing price.
+6. “Help > Setup & Launch Guide” in GUI for operational onboarding.
+7. Hybrid GraphQL + DOM listing acquisition pipeline in scraper runtime.
+8. Auth bootstrap hardening (`auth.json` auto-import + cleanup) and explicit auth health command.
+9. Resale reconciliation and daily summary commands for operational lifecycle completeness.
+10. GUI-managed multi-account and proxy configuration with persisted runtime settings.
+11. Proxy API integration for on-demand high-volume proxy import.
+12. SOCKS5-only manual account login workflow from GUI with persisted login artifacts.
+13. Scraper account pool round-robin rotation with strict ACTIVE+SOCKS5 eligibility enforcement.
+14. CLI monitor/scrape parity with GUI account rotation and proxy routing controls.
+15. DB-backed search query registry (`search_queries`) with per-query `last_polled` tracking.
+16. Runtime account health counters/cooldown tracking with auto exclusion of active cooldown windows.
+17. Proxy quick-import workflow from pasted cURL/proxy strings in settings UI.
+18. Proxy supplier payload normalization across mixed response shapes and plain-text endpoint lines.
+19. Model identification coverage extended to iPhone 16 family names.
+20. Account browse-session closure now persists refreshed cookies and user-agent metadata.
+21. VPS worker route management + heartbeat APIs with GUI CRUD/status view.
+22. Progressive page-depth scrolling and telemetry to avoid first-batch-only listing capture.
+23. Rotation reuse gating shifted to dedicated `last_scrape_started_at` tracking.
+24. VPS API route recovery/redeploy flow documented and validated after production `404 /worker-routes` failure.
+25. VPS build-context hardening to avoid runtime/data permission errors during worker image rebuilds.
+26. Virtualized-feed-safe DOM snapshot aggregation plus feed-container-aware scrolling for deeper listing capture.
+
+Action taken: all above are now documented in `roadmap.md` as completed scope.
+
+---
+
+## 5. Process Enhancements Across the System
+
+### Scraping Process
+- Added query-level progress events for operator observability.
+- Added cooperative stop behavior to avoid hard-kill instability.
+- Improved listing card extraction and candidate selection scoring.
+- Added GraphQL feed-response parsing with automatic fallback to DOM card extraction.
+- Relaxed GraphQL request gating so feed capture is not dropped by strict request-body keyword checks.
+- Added source-level count telemetry for GraphQL vs DOM extraction coverage.
+- Replaced shallow fixed scroll behavior with progressive page-depth scrolling (target cards + max rounds).
+- Added page-depth telemetry (`page_cards`, `scroll_rounds`) to query diagnostics and runtime logging.
+- Added DB-backed active query loading from `search_queries` with fallback defaults.
+- Added per-query `last_polled` updates on each processed query.
+- Hardened price parsing for mixed marketplace formats (`$300`, `300 AU$`, `1.000 AU$`) to reduce null-price ingestion.
+- Added currency-aware fallback extraction from title/description when structured price field is missing in feed payloads.
+- Added shorthand-thousands (`k`) price parsing support (`$1.4k`, `A$1.65k`) for structured and text-derived price values.
+- Tightened string price parsing to prefer currency-tagged tokens and avoid model-number false positives.
+- Expanded model matcher to include iPhone 16 family labels for forward compatibility.
+
+### Evaluation Process
+- Recalculation path allows backfilling all listings when price sheet changes.
+- Status normalization avoids hiding unresolved listings.
+- Added richer listing context persistence (`location`, `description`, `seller_name`) for better downstream reasoning.
+
+### Operator Workflow Process
+- Added menu-level access to price-sheet and analytics workflows.
+- Added visual triage markers in listings table.
+- Hid `Unknown`/blank model rows from default listings feed to keep operator queue focused.
+- Improved button behaviors by normalizing selected/focused listing retrieval.
+- Added quick triage filters in GUI (`All`, `New`, `High Profit`, `iPhone 14+`).
+- Added a centralized settings manager for account/proxy setup without manual DB edits.
+- Added browser-session persistence flow so account cookies/user-agent can be refreshed via operator browsing.
+
+### Auth and Credential Process
+- Added normalized auth provider detection (Gemini/OpenAI) and token-expiry checks.
+- Added one-time raw credential import flow with cleanup of bootstrap auth file.
+
+### Notification Process
+- Reduced noise by notifying only listings with non-negative potential profit (default threshold `>= 0`).
+- Added Telegram per-listing summary card format including link + price + description snippet for faster triage.
+- Added explicit daily summary trigger for operator-level reporting.
+
+### Connection and Runtime Control Process
+- Added structured account lifecycle states (`ACTIVE`, `COOLDOWN`, `NEEDS_LOGIN`, `BANNED`) in GUI.
+- Added explicit proxy inventory with assignment visibility to accounts.
+- Added persisted runtime controls for scraper pacing and query volume from GUI.
+- Added monitor jitter runtime control (`monitor_jitter_seconds`) and wired CLI monitor sleeps to randomized intervals.
+- Added minimum account reuse control (`account_min_reuse_seconds`) in account rotation selection for GUI and CLI runs.
+- Rotation reuse timing now keys off `last_scrape_started_at` to avoid false reuse filtering from unrelated account updates.
+- Added runtime account failure counters with automatic transitions:
+  - `NEEDS_LOGIN` on auth-like failures
+  - `COOLDOWN` on rate-limit-like failures or repeated generic failures
+  - reset back to `ACTIVE` on successful scrape runs
+- Added proxy supplier API ingestion path to keep proxy pool refreshed without manual entry.
+- Added proxy ingestion parser support for mixed provider payload schemas and plaintext endpoint responses.
+- Added operator quick-import for pasted cURL/proxy lines to accelerate bulk onboarding.
+- Added operator file import path for SOCKS5 proxy lists from TXT/CSV in the Proxies settings tab.
+- Added manual proxied login process with timeout-based cookie detection (`c_user`) and automated account status updates.
+- Added automatic SOCKS5-auth bridge bootstrap/teardown around manual login for account isolation.
+- Added strict scraper-account reservation and round-robin account rotation so each run uses a configured account proxy/profile pair.
+- Added GUI-managed VPS scraper route CRUD/status using server API (`worker_routes`, `worker_heartbeats`) to reduce manual server edits.
+- Added VPS route-level proxy mode controls (`fixed` / `auto_rotation`) with optional proxy-pool import from TXT/CSV.
+- Added shared runtime context builder in scraper layer to enforce proxy/account routing consistently in CLI monitor and one-shot scrape.
+- Added selector logic to include expired cooldown accounts while excluding active cooldown windows.
+- Added recalculation-time price backfill for legacy rows with missing prices using currency-aware text inference.
+- Added server worker retry policy for transient scrape failures plus configurable degraded gating by consecutive bad cycles.
+- Added server worker auto-cooldown for repeatedly failing routes/profiles and automatic fallback to the next available route in rotation.
+- Added checkpoint/login-challenge detection in scraper runtime and surfaced it as a manual-login-required error signal.
+- Added worker quarantine behavior for checkpointed profiles: mark route `manual_login_required`, remove it from rotation eligibility, and persist reason/timestamp.
+- Added Telegram alert for manual-login-required quarantine with worker/profile/route context so operator can intervene quickly.
+- Added VPS Scrapers route form fields to view/override `manual_login_required` state and reason from GUI.
+- Added VPS Scrapers connection controls for default proxy rotation and profile rotation periods, with automated VPS `.env` apply + worker restart action.
+- Separated scrape frequency controls by worker in VPS Scrapers connection settings:
+  - `Worker 1 Scrape Frequency (seconds)` -> `SCRAPE_INTERVAL_SECONDS`
+  - `Worker 2 Scrape Frequency (seconds)` -> `SCRAPE_INTERVAL_SECONDS_WORKER_2`
+  - `Worker 3 Scrape Frequency (seconds)` -> `SCRAPE_INTERVAL_SECONDS_WORKER_3`
+- Added compose/env support for worker_2 interval override key (`SCRAPE_INTERVAL_SECONDS_WORKER_2`) and kept compatibility fallback behavior for existing deployments.
+- Added worker runtime cadence controls:
+  - `SCRAPE_INTERVAL_JITTER_PCT`
+  - `WORKER_WAIT_BACKOFF_SECONDS`
+  - `WORKER_MAX_BACKOFF_MULTIPLIER`
+  - `WORKER_CYCLE_RETRY_BACKOFF_MAX_SECONDS`
+- Worker scheduling now persists next-run timestamps (`next_run_at`) and honors route-level interval overrides (`route_interval_seconds`).
+- Worker cycle error handling now uses category-aware retries with exponential backoff for transient classes only.
+- Added API validation to block duplicate enabled route `user_data_dir` assignments and prevent runtime profile collisions.
+- Added query-shard deduplication locks with non-failure `WAIT_QUERY_SHARD` outcomes for cross-worker shard overlap.
+- Added pre-checkpoint soft-signal detector with risk-scored actions (`throttle`, `pause`, `quarantine`) and route baseline tracking (`avg_result_count`, `avg_page_load_ms`).
+- Added route status-state persistence and transitions (`ENABLED`/`DEGRADED`/`THROTTLED`/`COOLDOWN`/`NEEDS_LOGIN`/`DISABLED`) plus interval multipliers for degraded states.
+- Added proxy health memory table (`proxy_stats`) and candidate scoring/ban logic to avoid repeated use of recently failing proxies.
+- Added API-level `<2 enabled routes` warnings and worker-side single-route extended-rest enforcement to reduce no-rotation ban risk.
+
+---
+
+## 6. Titan Spec Audit Delta (2026-02-09)
+
+Audit reference: `/Users/ishanrathnayaka/Downloads/Titan_Scraper_Ultimate_Spec.md`
+
+Implemented immediately from audit:
+- Added anti-pattern fix for price extraction where feed/title strings include `amount + currency` format (`300 AU$...`) instead of structured price fields.
+- Added support for thousand-separator dot format (`1.000 AU$`) in parser normalization.
+- Added support for shorthand-thousands suffix parsing (`1.4k`, `1.65k`) during ingestion.
+- Added recomputation/backfill path so legacy rows with null prices can be repaired through financial recalculation.
+- Added randomized monitor jitter control to avoid perfectly periodic polling cadence.
+- Added minimum account-reuse delay control to reduce rapid identity reuse in rotation.
+- Added DB-backed `search_queries` registry and per-query `last_polled` state updates during scrape runs.
+- Added runtime account health counters (`failure_count`, `cooldown_until`) with automatic cooldown/login state transitions.
+
+Still out of current local-app scope (documented, not removed):
+- Distributed service split (Manager/Worker/Harvester/Notifier as separate deployable services).
+- Redis queue + pub/sub transport layer.
+- PostgreSQL multi-tenant schema with users/search_queries ownership model.
+- Direct GraphQL POST worker via `curl_cffi` with captured `doc_id/fb_dtsg/lsd` payload orchestration.
+
+---
+
+## 7. Current Risks and Gaps
+
+1. Condition inference is still keyword/rule-based and can miss nuance even with better listing metadata.
+2. No condition confidence signal yet to gate automation decisions.
+3. Automated coverage is still limited (runtime scheduling helpers covered, but broader scraper/API integration tests and CI are still missing).
+4. Browser profile and auth artifacts require stronger operational security guidance.
+5. Structured cycle telemetry rollup script exists, but no always-on dashboard or automated report delivery pipeline is wired yet.
+6. Desktop GUI server-sync is currently cursor-poll based; direct WebSocket consumer path is still pending.
+7. Dedicated server-side notifier consumer is still pending; current VPS path sends Telegram directly from worker runtime for qualifying new listings.
+8. Query-shard lock deduplication is implemented, but higher-level shard planning/validation (conflict prevention at config time, load-balancing heuristics) still needs hardening.
+9. Persona variation currently covers native context-level traits only; deeper browser-surface controls (e.g., strict geo-IP datasets and broader persona QA) still need hardening and monitoring.
+
+---
+
+## 8. Active Work Queue (Aligned to Roadmap)
+
+### Priority 1
+- Complete Phase 5A desktop sync integration by adding direct WebSocket apply on top of the shipped cursor-poll baseline.
+- Implement `condition_confidence` tiers and manual-review routing.
+- Add selective detail-page enrichment for low-confidence/high-value listings.
+- Extend GUI-managed remote worker control from route assignment/status to full deploy/restart lifecycle actions.
+
+### Priority 2
+- Add automated tests for pricing/condition/scoring logic.
+- Add automated telemetry rollup scheduling/report delivery (dashboard or periodic artifacts) on top of current CLI script.
+- Add worker health metrics and reconnect-safe desktop catch-up cursor.
+
+### Priority 3
+- Add advanced GUI filters (confidence/manual-review/user-flag presets).
+- Add backup/export flows for DB and operational snapshots.
+
+---
+
+## 9. Operator-Side Migration Checklist (Approved)
+1. Provision VPS host and secure SSH-only administration.
+2. Provision PostgreSQL and generate least-privilege app credentials.
+3. Provision domain + TLS endpoint for API/WebSocket traffic.
+4. Prepare server secret storage for proxy credentials, notification tokens, and AI keys.
+5. Validate each account/profile + SOCKS5 proxy pair on server environment.
+6. Confirm desired parallelism/pacing policy before enabling continuous workers.
+7. Keep desktop environment ready to maintain outbound HTTPS connectivity to server (`443`), with WebSocket support reserved for next sync stage.
+
+---
+
+## 10. Next Update Protocol
+For each future update, append:
+- date/time
+- change summary
+- files touched
+- decision/rationale (if behavior changed)
+- validation performed
+- unresolved follow-ups
+
+This keeps `dev-log.md` actionable for both engineering and operations.
+
+---
+
+## 11. 2026-02-16 Hotfix: Worker Scrape Invocation + Deploy Sync Gap
+
+- Date/time: 2026-02-16
+- Change summary:
+  - fixed worker compatibility so `server/services/worker/worker.py` only passes scraper kwargs supported by the current `scrape_marketplace` signature (prevents `unexpected keyword argument 'verify_proxy_ip'` crash loops)
+  - fixed deployment drift in `server/scripts/deploy_vps.sh` by syncing root runtime files (`scraper.py`, `notifications.py`, `requirements.txt`, `.dockerignore`) in addition to `/server`
+  - added GUI operator controls to start/stop worker services and exposed VPS timing controls (`Proxy Reuse Cooldown`, `Proxy Lease TTL`, per-route `Route Interval`)
+- Files touched:
+  - `server/services/worker/worker.py`
+  - `server/scripts/deploy_vps.sh`
+  - `gui.py`
+- Decision/rationale:
+  - remote workers were importing stale `/app/scraper.py` after deploy (script synced only `/server`), causing repeated fail cycles that incremented `proxy_stats.consecutive_failures` and banned all auto-rotation proxies
+  - compatibility layer and deploy sync close both immediate failure and recurrence vectors
+- Validation performed:
+  - local `py_compile` for modified modules
+  - VPS redeploy completed successfully
+  - verified running worker imports now show updated `scrape_marketplace` signature including proxy verification args
+  - cleared proxy bans (`proxy_stats`) and observed workers resume real query execution in logs
+- Unresolved follow-ups:
+  - add explicit GUI/API action to reset proxy health bans without direct SQL
+
+---
+
+## 12. 2026-02-16 Hotfix: Proxy Ban Controls + Route List Resilience
+
+- Date/time: 2026-02-16
+- Change summary:
+  - added API proxy-health operator endpoints:
+    - `GET /proxy-stats` (ban/failure visibility)
+    - `POST /proxy-stats/reset` (clear selected proxy ban, optionally reset failures)
+  - updated Proxies tab to show server-side proxy health columns (`Failures`, `Banned`, `Ban Until`)
+  - added Proxies tab operator actions:
+    - `Refresh Proxy Stats`
+    - `Reset Selected Proxy Ban`
+  - hardened VPS route-table rendering to avoid one duplicate/dirty row key breaking visibility of other routes
+  - switched route-action identity resolution (`delete`, `retest`, `bulk clear`) to row payload identity rather than fragile tree key parsing
+- Files touched:
+  - `server/services/api/app/main.py`
+  - `server/tests/test_api_proxy_stats.py`
+  - `gui.py`
+  - `architecture.md`
+  - `roadmap.md`
+  - `dev-log.md`
+- Decision/rationale:
+  - operators needed direct in-UI proxy-ban control after no-proxy-available waves
+  - ban state belongs in the Proxies control surface (proxy inventory/operations), not mixed into VPS route editing
+  - route visibility must be resilient even when upstream data includes duplicate/dirty route keys
+- Validation performed:
+  - local compile check: `python3 -m compileall gui.py server/services/api/app/main.py`
+  - unit test check (environment without FastAPI deps): `python3 -m unittest server/tests/test_api_proxy_stats.py` (tests skipped as designed)
+- Unresolved follow-ups:
+  - deploy latest API container to VPS so desktop can consume `/proxy-stats` and `/proxy-stats/reset` immediately
+
+---
+
+## 13. 2026-02-16 Hotfix: Worker Status Offline + VPS Route List Truncation
+
+- Date/time: 2026-02-16
+- Change summary:
+  - fixed `_compact_proxy_host()` to handle non-standard lease endpoints (`query-shard://...`) without raising `ValueError` on non-numeric pseudo-port segments
+  - added per-route defensive handling in VPS route-table refresh loop so one malformed row cannot abort rendering of all remaining routes
+- Root cause:
+  - `/worker-health` lease rows can include query-shard lock identifiers (not real proxy host:port), and prior host-compaction logic assumed numeric ports
+  - resulting exception interrupted both:
+    - main worker-pill refresh loop (left strip showing offline)
+    - VPS route-table refresh loop (stopped after early rows, showing only ~2 routes)
+- Files touched:
+  - `gui.py`
+  - `architecture.md`
+  - `roadmap.md`
+  - `dev-log.md`
+- Validation performed:
+  - verified live API currently returns `worker-routes.count=10` and `worker-health.count=3` (workers `worker`, `worker_2`, `worker_3`)
+  - local compile check: `python3 -m compileall gui.py`
+
+---
+
+## 14. 2026-02-16 Enforcement Update: Sticky Proxy Pairing + Hard Session Lease Rules
+
+- Date/time: 2026-02-16
+- Change summary:
+  - added route-level sticky proxy memory fields:
+    - `worker_routes.preferred_proxy_key`
+    - `worker_routes.preferred_proxy_updated_at`
+  - worker now persists preferred proxy key on successful cycles and uses preferred-first selection on next cycle
+  - preferred proxy is skipped only when unavailable, banned, or unhealthy (near-ban failure threshold)
+  - added active lease keepalive for:
+    - proxy lease
+    - profile lock lease
+    - query-shard lock lease
+  - scrape cycle now aborts into wait-proxy path if active lease is lost during session, preventing silent overlap
+  - API route payloads now include sticky preference metadata for operator visibility (`GET /worker-routes`, upsert/retest responses)
+- Files touched:
+  - `server/services/worker/worker.py`
+  - `server/services/worker/lease_manager.py`
+  - `server/services/common/schema_ensure.py`
+  - `server/services/api/sql/001_init.sql`
+  - `server/services/api/app/main.py`
+  - `architecture.md`
+  - `roadmap.md`
+  - `dev-log.md`
+- Decision/rationale:
+  - enforce non-negotiable rule: one proxy per active session/profile with no concurrent sharing
+  - keep profile behavior realistic and stable via sticky route-to-proxy affinity while preserving graceful fallback on degraded proxies
+- Validation performed:
+  - local compile checks:
+    - `python3 -m compileall server/services/worker/worker.py`
+    - `python3 -m compileall server/services/worker/lease_manager.py`
+    - `python3 -m compileall server/services/api/app/main.py`
+    - `python3 -m compileall server/services/common/schema_ensure.py`
+
+---
+
+## 15. 2026-02-16 VPS Rollout: Sticky/Lease Enforcement Activated
+
+- Date/time: 2026-02-16
+- Change summary:
+  - deployed latest API + worker images to VPS using `server/scripts/deploy_vps.sh`
+  - applied SQL bootstrap/migrations on VPS Postgres during deploy
+  - restarted runtime services (`api`, `worker`, `worker_2`, `worker_3`) under compose
+- Validation performed:
+  - API health check passed: `GET /healthz` => `{"ok":true,"db":true,"redis":true}`
+  - worker health check passed: `GET /worker-health` returned 3 live workers
+  - route inventory check passed: `GET /worker-routes` returned `count=9` (`worker`, `worker_2`, `worker_3`)
+  - compose status healthy for `api`, `postgres`, `redis`, `worker`, `worker_2`, `worker_3`
+  - recent service logs contain no `ImportError`, `ModuleNotFoundError`, or traceback startup failures
+- Follow-up resolution:
+  - closes prior unresolved follow-up from section 12 ("deploy latest API container to VPS")
+
+---
+
+## 16. 2026-02-16 Hotfix: Manual Login Route Save 500 (worker-routes upsert)
+
+- Date/time: 2026-02-16
+- Incident:
+  - manual login flow failed when saving route (`PUT /worker-routes/worker/profile_1`) with `500 Internal Server Error`
+  - API traceback: `asyncpg.exceptions.PostgresSyntaxError: INSERT has more target columns than expressions`
+- Root cause:
+  - `worker_routes` upsert SQL in API had target/value mismatch after sticky fields (`preferred_proxy_key`, `preferred_proxy_updated_at`) were added to insert columns
+- Fix:
+  - corrected insert `VALUES` list to explicitly set sticky fields as server-managed (`NULL, NULL`) while preserving existing parameter mapping for operator payload fields
+  - this prevents column-count mismatch and avoids accidental client override of sticky preference fields
+- Files touched:
+  - `server/services/api/app/main.py`
+  - `dev-log.md`
+  - `roadmap.md`
+  - `architecture.md`
+- Validation performed:
+  - local compile check: `python3 -m compileall server/services/api/app/main.py`
+  - test suite check: `python3 -m unittest discover -s server/tests -p 'test_*.py'`
+  - VPS deploy: `DEPLOY_SERVICES=api ./server/scripts/deploy_vps.sh`
+  - live endpoint retest: `PUT /worker-routes/worker/profile_1` now returns `200` with updated route payload
+
+---
+
+## 17. 2026-02-16 UX Hardening: VPS Route Save Error Diagnostics
+
+- Date/time: 2026-02-16
+- Change summary:
+  - improved VPS scraper route save error handling in GUI to show:
+    - HTTP status code
+    - API `detail` field when present
+    - response body snippet fallback
+- Why:
+  - operators were seeing generic save-failure popups without enough context to distinguish `401`, `409`, and server-side `500` regressions
+- Files touched:
+  - `gui.py`
+  - `dev-log.md`
+  - `roadmap.md`
+  - `architecture.md`
+- Validation performed:
+  - local compile check: `python3 -m compileall gui.py`
+  - live API verification: public `PUT /worker-routes/{worker}/{route}` returns `200` for all current routes (`failed=0`)
+
+---
+
+## 18. 2026-02-16 Hotfix: Repeated Profile-Failure Alerts Not Entering Cooldown Fast Enough
+
+- Date/time: 2026-02-16
+- Incident:
+  - repeated Telegram profile-failure alerts were observed for:
+    - `worker_3/profile_11`
+    - `worker_2/profile_5`
+  - routes remained in `DEGRADED`/`THROTTLED` without entering cooldown as expected by configured policy.
+- Root cause:
+  - worker startup logic forced:
+    - `WORKER_ROUTE_COOLDOWN_BAD_CYCLES >= WORKER_THROTTLED_CONSECUTIVE_CYCLES + 1`
+  - this silently overrode operator-set cooldown thresholds (for example configured `4` effectively became `6` when throttled threshold was `5`).
+  - in-memory bad-cycle tracker also started from `0` after worker restart, ignoring persisted DB `consecutive_failures`.
+- Fix:
+  - made cooldown threshold independently operator-configurable:
+    - `WORKER_ROUTE_COOLDOWN_BAD_CYCLES` now honors env value directly (minimum `1`), defaulting to `throttled_after + 1` only when unset.
+  - added DB-seeded bad-cycle initialization:
+    - if in-memory counter is missing, worker seeds from route `consecutive_failures` so restart does not erase failure progression.
+  - applied immediate operational mitigation by setting cooldown on affected routes:
+    - `worker_2/profile_5`
+    - `worker_3/profile_11`
+- Files touched:
+  - `server/services/worker/worker.py`
+  - `dev-log.md`
+  - `roadmap.md`
+  - `architecture.md`
+- Validation performed:
+  - local compile check: `python3 -m compileall server/services/worker/worker.py`
+  - test suite check: `python3 -m unittest discover -s server/tests -p 'test_*.py'`
+  - VPS worker rollout: `DEPLOY_SERVICES=\"worker worker_2 worker_3\" ./server/scripts/deploy_vps.sh`
+  - runtime startup logs now show configured threshold being honored:
+    - `cooldown_after=4` on `worker`, `worker_2`, and `worker_3`
+
+---
+
+## 19. 2026-02-17 Feature: Global Proxy Concurrency Cap (Provider Limit Protection)
+
+- Date/time: 2026-02-17
+- Change summary:
+  - added global proxy session cap setting:
+    - env/runtime key: `MAX_CONCURRENT_PROXY_CONNECTIONS` (default `5`)
+  - enforced cap inside lease acquisition path (`try_acquire_proxy_lease`) with transaction-scoped advisory lock to prevent race oversubscription across workers
+  - cap counts only active real proxy leases and excludes synthetic profile/query-shard locks:
+    - excludes `PROFILE:*`
+    - excludes `QUERY_SHARD:*`
+  - added VPS Scrapers UI field:
+    - `Max Concurrent Proxy Connections`
+  - Save VPS Connection now persists and applies this value to server `.env`, then restarts worker services.
+- Behavior:
+  - when active proxy leases reach cap, new lease acquisition returns `None`
+  - route naturally falls into existing `WAIT_PROXY` path (no failure counting, no cooldown penalty)
+- Files touched:
+  - `scraper.py`
+  - `server/services/worker/lease_manager.py`
+  - `server/services/worker/worker.py`
+  - `server/infra/docker-compose.yml`
+  - `server/.env.example`
+  - `gui.py`
+  - `architecture.md`
+  - `roadmap.md`
+  - `dev-log.md`
+- Validation performed:
+  - local compile checks:
+    - `python3 -m compileall server/services/worker/lease_manager.py`
+    - `python3 -m compileall server/services/worker/worker.py`
+    - `python3 -m compileall gui.py`
+  - test suite:
+    - `python3 -m unittest discover -s server/tests -p 'test_*.py'`
+  - VPS rollout:
+    - `DEPLOY_SERVICES=\"worker worker_2 worker_3\" ./server/scripts/deploy_vps.sh`
+- runtime verification:
+  - worker startup log now includes `max_proxy_connections=5` for `worker`, `worker_2`, and `worker_3`
+
+---
+
+## 20. 2026-02-17 Hotfix: Provider Limit Pressure Recheck (Socket Fan-Out + Manual-Login Loop)
+
+- Date/time: 2026-02-17
+- Incident:
+  - operator still observed large provider-side "Limit Reached" counts after enabling `MAX_CONCURRENT_PROXY_CONNECTIONS=5`.
+- Findings:
+  - live worker logs showed no direct `limit reached`, `too many connections`, `429`, or `rate limit` strings in recent runtime output.
+  - live socket sampling inside worker containers showed one active profile session opening many concurrent proxy sockets:
+    - `worker`: `165.49.210.38:12324` had `12` established sockets
+    - `worker_2`: `92.71.71.248:6442` had `13` established sockets
+  - scraper query loop was continuing across all remaining queries even after `MANUAL_LOGIN_REQUIRED` was detected on the first failed query, inflating unnecessary proxy traffic.
+  - worker heuristic `_is_profile_failed` treated `query_count > 0` + `query_result_count = 0` as non-failure, allowing bad cycles to be misclassified as `ok`.
+- Fix:
+  - scraper now terminates the cycle immediately when a `MANUAL_LOGIN_REQUIRED` query error appears and raises the error to worker runtime.
+  - added browser-level connection fan-out guardrails in scraper launch:
+    - `BROWSER_MAX_CONNECTIONS_PER_PROXY` (default `1`)
+    - `BROWSER_MAX_CONNECTIONS_PER_HOST` (default `1`)
+    - `BROWSER_BLOCK_RESOURCE_TYPES` (default `image,media,font,websocket,manifest`)
+    - transport guardrails: `--disable-quic`, `--disable-http2`
+  - updated worker profile-failure heuristic to fail cycles when queries started but zero query results were produced.
+- Files touched:
+  - `scraper.py`
+  - `server/services/worker/worker.py`
+  - `server/.env.example`
+  - `architecture.md`
+  - `roadmap.md`
+  - `dev-log.md`
+- Validation performed:
+  - local compile checks:
+    - `python3 -m compileall scraper.py`
+    - `python3 -m compileall server/services/worker/worker.py`
+    - `python3 -m compileall gui.py`
+  - test suite:
+    - `python3 -m unittest discover -s server/tests -p 'test_*.py'`
+  - live runtime diagnostics:
+    - confirmed active real proxy lease set and lease cap config on VPS
+    - confirmed high per-session socket fan-out in running worker containers before this patch
+- Remaining operational constraint:
+  - provider-side "5 concurrent connections" is below observed browser-session fan-out in some cycles (single active browser can still spike above `5` concurrent upstream sockets), so residual provider limit events may still occur until provider connection allowance is increased or scraping transport is moved off full-browser mode.
+
+---
+
+## 21. 2026-02-17 Feature: Strict Local Proxy Bridge Limiter (Queue + Hard Cap)
+
+- Date/time: 2026-02-17
+- Change summary:
+  - replaced ad-hoc auth-only SOCKS bridge path with a dedicated local SOCKS5 bridge implementation that enforces:
+    - hard upstream socket cap per active browser session
+    - queued waits with timeout when cap is reached
+  - worker proxy path now forces SOCKS5 routes through local bridge by default (`WORKER_FORCE_LOCAL_PROXY_BRIDGE=1`)
+  - added worker bridge controls:
+    - `WORKER_PROXY_BRIDGE_MAX_UPSTREAM_CONNECTIONS` (default `1`)
+    - `WORKER_PROXY_BRIDGE_QUEUE_TIMEOUT_SECONDS` (default `30`)
+    - `WORKER_PROXY_BRIDGE_CONNECT_TIMEOUT_SECONDS` (default `15`)
+  - added VPS Scrapers connection fields to persist/apply bridge controls to server `.env` from GUI.
+- Rule impact:
+  - existing hard rules remain intact and unchanged:
+    - one proxy per session/profile
+    - sticky proxy-profile preference
+    - no simultaneous proxy sharing
+  - limiter is additive: it constrains per-session upstream proxy socket fan-out, it does not alter lease/sticky routing behavior.
+- Files touched:
+  - `scraper.py`
+  - `server/services/worker/worker.py`
+  - `server/infra/docker-compose.yml`
+  - `server/.env.example`
+  - `gui.py`
+  - `architecture.md`
+  - `roadmap.md`
+  - `dev-log.md`
+- Validation performed:
+  - local compile checks:
+    - `python3 -m compileall scraper.py`
+    - `python3 -m compileall server/services/worker/worker.py`
+    - `python3 -m compileall gui.py`
+  - test suite:
+    - `python3 -m unittest discover -s server/tests -p 'test_*.py'`
+- VPS rollout:
+  - `DEPLOY_SERVICES=\"worker worker_2 worker_3\" ./server/scripts/deploy_vps.sh`
+
+---
+
+## 22. 2026-02-17 Hotfix: Proxy-Pressure Stabilization + False Manual-Login Reduction
+
+- Date/time: 2026-02-17
+- Incident report:
+  - provider realtime usage endpoint showed high cumulative thread-cap failures (`threadLimitReachedErrors`), with low relative successful connection volume.
+  - operator observed zero-scrape cycles and multiple manual-login-required quarantines after aggressive proxy-limiter settings rollout.
+- Root cause analysis:
+  - global cap (`MAX_CONCURRENT_PROXY_CONNECTIONS`) was enforced as *lease/session count* only, not estimated upstream proxy-thread budget.
+  - strict transport defaults (`bridge cap=1`, browser per-proxy/per-host cap `1`) over-constrained Marketplace page loading and increased transport failure pressure.
+  - manual-login classification accepted broad generic phrases, which could over-classify non-auth errors during high transport contention.
+- Fixes implemented:
+  - lease manager now applies weighted capacity checks:
+    - new lease check uses `active_leases * estimated_connections_per_lease`
+    - acquisition waits (`WAIT_PROXY`) when projected total would exceed `MAX_CONCURRENT_PROXY_CONNECTIONS`
+    - same worker+route owner can now reacquire its own active proxy lease after restart (no forced wait for old TTL expiry)
+  - worker now passes bridge-aware estimate (`WORKER_PROXY_CONNECTIONS_PER_LEASE_ESTIMATE`) into lease acquisition.
+  - tightened manual-login markers/classification to favor explicit checkpoint/manual-login signatures instead of broad generic wording.
+  - VPS settings save path now enforces safer bridge minimum when local bridge is enabled:
+    - `WORKER_PROXY_BRIDGE_MAX_UPSTREAM_CONNECTIONS >= 2`
+  - local SOCKS5 bridge now enforces idle tunnel recycling (`WORKER_PROXY_BRIDGE_IDLE_TIMEOUT_SECONDS`, default `8`) to prevent slot starvation from long-lived keepalive sockets.
+  - profile/query-shard lock acquisition now allows same worker+route owner reacquisition while lock is still active, preventing post-restart lock-stall loops.
+  - runtime template defaults updated for safer Marketplace operation:
+    - `WORKER_PROXY_BRIDGE_MAX_UPSTREAM_CONNECTIONS=2`
+    - `WORKER_PROXY_BRIDGE_IDLE_TIMEOUT_SECONDS=8`
+    - `BROWSER_MAX_CONNECTIONS_PER_PROXY=2`
+    - `BROWSER_MAX_CONNECTIONS_PER_HOST=2`
+- Files touched:
+  - `server/services/worker/lease_manager.py`
+  - `server/services/worker/worker.py`
+  - `server/services/worker/runtime.py`
+  - `gui.py`
+  - `server/infra/docker-compose.yml`
+  - `server/.env.example`
+  - `architecture.md`
+  - `roadmap.md`
+  - `dev-log.md`
+- Validation performed:
+  - compile checks:
+    - `python3 -m py_compile server/services/worker/lease_manager.py server/services/worker/worker.py server/services/worker/runtime.py gui.py`
+  - test suite:
+    - `python3 -m unittest discover -s server/tests -p 'test_*.py'`
+
+---
+
+## 23. 2026-02-17 Throughput Profile: Keep worker_3 Active Under 5-Thread Provider Cap
+
+- Date/time: 2026-02-17
+- Goal:
+  - maximize throughput under strict provider concurrent-thread limit (`5`) while keeping `worker_3` fast-lane continuously serviceable.
+- Change summary:
+  - added worker_3-specific bridge-cap override:
+    - `WORKER_3_PROXY_BRIDGE_MAX_UPSTREAM_CONNECTIONS` (default `1`)
+  - added worker_3 reservation control:
+    - `WORKER_3_RESERVED_PROXY_CONNECTIONS` (default `1`)
+  - lease-manager capacity logic now supports priority reservation:
+    - non-priority workers (`worker`, `worker_2`) cannot consume reserved capacity needed by `worker_3`
+    - reservation is adaptive to current `worker_3` usage and remains bounded by global max
+  - wired these controls to VPS Scrapers save/apply flow and server `.env` updates.
+- Operational target configuration:
+  - `MAX_CONCURRENT_PROXY_CONNECTIONS=5`
+  - `WORKER_PROXY_BRIDGE_MAX_UPSTREAM_CONNECTIONS=2` (worker/worker_2)
+  - `WORKER_3_PROXY_BRIDGE_MAX_UPSTREAM_CONNECTIONS=1` (worker_3)
+  - `WORKER_3_RESERVED_PROXY_CONNECTIONS=1`
+- Files touched:
+  - `server/services/worker/lease_manager.py`
+  - `server/services/worker/worker.py`
+  - `server/infra/docker-compose.yml`
+  - `server/.env.example`
+  - `gui.py`
+  - `architecture.md`
+  - `roadmap.md`
+  - `dev-log.md`
+- Validation performed:
+  - compile checks:
+    - `python3 -m py_compile server/services/worker/lease_manager.py server/services/worker/worker.py gui.py scraper.py`
+  - test suite:
+    - `python3 -m unittest discover -s server/tests -p 'test_*.py'`
+
+---
+
+## 24. 2026-02-17 Throughput Hardening: Fast Query Cycles + Effective Shard Deduping
+
+- Date/time: 2026-02-17
+- Incident context:
+  - provider realtime usage sampled repeatedly at runtime showed low active threads (`threadsConnected` mostly `0-1`) while workers were still scraping.
+  - workers were spending long time inside single route cycles (`~19 queries` per cycle in logs), increasing freshness latency.
+- Root causes identified:
+  - long per-route query loops monopolized each worker before route rotation.
+  - query-shard dedupe key was derived from route `search_queries` only; routes with blank route-level queries could bypass shard dedupe despite using fallback query sets at runtime.
+- Fixes implemented:
+  - worker now resolves effective query list per cycle in this order:
+    - route `search_queries`
+    - worker `SCRAPER_QUERIES`
+    - worker runtime DB active queries (`load_active_search_queries`)
+  - added bounded per-cycle query batching with round-robin route coverage:
+    - `WORKER_MAX_QUERIES_PER_CYCLE` (default `4`)
+    - each cycle processes only a slice of effective queries, then rotates to next slice next cycle.
+  - query-shard lock key now applies to the effective cycle query set, closing dedupe bypass for blank route-level query rows.
+  - added VPS Scrapers UI controls (save + apply to server `.env`) for:
+    - `WORKER_MAX_QUERIES_PER_CYCLE`
+    - `WORKER_SCROLL_TARGET_CARDS`
+    - `WORKER_SCROLL_MAX_ROUNDS`
+  - docker compose defaults now pass these values to worker containers for consistent runtime behavior.
+- Files touched:
+  - `server/services/worker/worker.py`
+  - `server/infra/docker-compose.yml`
+  - `server/.env.example`
+  - `gui.py`
+  - `architecture.md`
+  - `roadmap.md`
+  - `dev-log.md`
+
+---
+
+## 25. 2026-02-17 Rollback: Revert Post-Proxy-Cap Iterations (Back To Pre-19 Baseline)
+
+- Date/time: 2026-02-17
+- Operator request:
+  - rollback to state before the `MAX_CONCURRENT_PROXY_CONNECTIONS` feature request.
+- Rollback scope applied:
+  - reverted lease-manager global proxy-cap/weighted-capacity/reservation logic.
+  - removed worker runtime controls tied to post-19 changes:
+    - global cap / bridge limiter / worker_3 reservation / query-batch caps.
+  - reverted worker proxy path to pre-bridge-limiter behavior (auth bridge only when credentials are present).
+  - reverted VPS Scrapers connection form and save/apply flow by removing post-19 controls.
+  - reverted compose/env templates by removing post-19 proxy-cap/bridge/query-batch variables.
+  - reverted post-19 architecture/roadmap statements so docs match active code.
+  - restored non-restrictive browser transport defaults and removed immediate manual-login early-break loop behavior.
+- Files touched:
+  - `server/services/worker/lease_manager.py`
+  - `server/services/worker/worker.py`
+  - `scraper.py`
+  - `gui.py`
+  - `server/infra/docker-compose.yml`
+  - `server/.env.example`
+  - `architecture.md`
+  - `roadmap.md`
+  - `dev-log.md`

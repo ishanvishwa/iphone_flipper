@@ -1,0 +1,18 @@
+Model,Buying Price,Selling Price,Backglass repair cost,Screen repair cost,Battery repair cost,Camera lens repair cost
+iPhone 11 Pro Max,50,150,10,100,35,5
+iPhone 12,60,200,10,100,35,5
+iPhone 12 Mini,60,150,10,100,35,5
+iPhone 12 Pro,60,250,10,100,35,5
+iPhone 12 Pro Max,100,300,10,100,35,5
+iPhone 13,100,300,10,100,35,5
+iPhone 13 Mini,65,250,10,100,35,5
+iPhone 13 Pro,150,350,10,100,35,5
+iPhone 13 Pro Max,250,450,10,100,35,5
+iPhone 14,200,350,30,100,35,5
+iPhone 14 Plus,250,400,30,100,35,5
+iPhone 14 Pro,350,550,10,150,35,5
+iPhone 14 Pro Max,400,600,10,150,35,5
+iPhone 15,300,450,30,120,35,5
+iPhone 15 Plus,350,500,30,120,35,5
+iPhone 15 Pro,500,700,30,150,35,5
+iPhone 15 Pro Max,550,750,30,150,35,5
