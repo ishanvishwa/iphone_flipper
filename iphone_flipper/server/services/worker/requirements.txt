@@ -1,3 +1,4 @@
 asyncpg==0.30.0
 redis==6.2.0
 playwright-stealth>=1.0.6
+aiohttp==3.9.3

@@ -93,9 +93,12 @@ services:
       context: ../..
       dockerfile: server/services/worker/Dockerfile
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     env_file:
       - ../.env
     environment:
+      DOLPHIN_API_URL: http://host.docker.internal:3001/v1.0
       TZ: ${TZ:-UTC}
       APP_ENV: ${APP_ENV:-production}
       LISTING_EVENT_CHANNEL: ${LISTING_EVENT_CHANNEL:-listing_events}
@@ -139,9 +142,12 @@ services:
       context: ../..
       dockerfile: server/services/worker/Dockerfile
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     env_file:
       - ../.env
     environment:
+      DOLPHIN_API_URL: http://host.docker.internal:3001/v1.0
       TZ: ${TZ:-UTC}
       APP_ENV: ${APP_ENV:-production}
       LISTING_EVENT_CHANNEL: ${LISTING_EVENT_CHANNEL:-listing_events}
@@ -185,9 +191,12 @@ services:
       context: ../..
       dockerfile: server/services/worker/Dockerfile
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     env_file:
       - ../.env
     environment:
+      DOLPHIN_API_URL: http://host.docker.internal:3001/v1.0
       TZ: ${TZ:-UTC}
       APP_ENV: ${APP_ENV:-production}
       LISTING_EVENT_CHANNEL: ${LISTING_EVENT_CHANNEL:-listing_events}

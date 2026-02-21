@@ -1,13 +1,15 @@
 # iPhone Flipper Development Log
 
 ## Log Policy
+
 This is a living development log tracking:
+
 - completed implementation work
 - architectural and product decisions
 - roadmap drift (manual/additional features)
 - current status and active risks
 
-Last updated: **2026-02-16**
+Last updated: **2026-02-20**
 Author: Codex implementation/update pass
 
 ---
@@ -15,6 +17,7 @@ Author: Codex implementation/update pass
 ## 1. Current System Snapshot
 
 ### Runtime/Project Snapshot
+
 - Application type: local Python app (CLI + Tkinter GUI)
 - Primary DB: `listings.db` (SQLite)
 - Deployment mode: local app + server migration baseline scaffolded (`server/`), rollout in progress
@@ -23,6 +26,7 @@ Author: Codex implementation/update pass
 - Conversations recorded: **0**
 
 ### Primary Operational Capabilities
+
 - Marketplace scraping with persistent browser profile
 - Hybrid listing acquisition (captured Marketplace GraphQL responses + DOM fallback)
 - Model/condition inference and pricing calculations
@@ -36,7 +40,9 @@ Author: Codex implementation/update pass
 ## 2. Implementation Timeline (Consolidated)
 
 ### Milestone A: Core Automation Foundation
+
 Status: Completed
+
 - Implemented `main.py` command surface for scrape/monitor/list/respond/analyze/status.
 - Implemented DB bootstrap and scrape ingestion pipeline.
 - Added persistent schema for multi-account/proxy runtime config (`fb_accounts`, `proxies`, `scraper_settings`).
@@ -46,19 +52,25 @@ Status: Completed
 - Added one-time `auth.json` bootstrap import with source-file cleanup.
 
 ### Milestone B: Negotiation + Analytics Engine
+
 Status: Completed
+
 - Added AI negotiation module with provider abstraction and conversation persistence.
 - Added purchase recording model and pattern-learning tables.
 - Added conversion score and insights generation pipeline.
 
 ### Milestone C: GUI Control Plane
+
 Status: Completed
+
 - Added tabbed GUI for listings, negotiation, and deals.
 - Added action buttons for open URL, negotiation flow, and purchase marking.
 - Added analytics access via menu (patterns/history/insights).
 
 ### Milestone D: UX and Process Enhancements
+
 Status: Completed
+
 - Added `Price Sheet` menu and in-app CSV editor.
 - Added full listing recalculation after price updates.
 - Added scraper run telemetry in GUI (elapsed time + query progress).
@@ -82,7 +94,9 @@ Status: Completed
 - Added setup/launch guide panel in GUI.
 
 ### Milestone E: Financial and Visibility Corrections
+
 Status: Completed
+
 - Corrected profit computation to use listed price vs sell price (with repair costs).
 - Adjusted ingestion/status handling so not only “good/profitable” records are shown.
 - Tightened scraper scope to persist only listings whose detected model exists in current price sheet.
@@ -92,7 +106,9 @@ Status: Completed
 - Added on-demand daily operational summary broadcast (`main.py summary`).
 
 ### Milestone F: Marketplace Fetch Upgrade (Hybrid Path)
+
 Status: Completed
+
 - Added GraphQL response capture during Marketplace search navigation.
 - Added normalized extraction of listing ID/title/price/location/description/seller from GraphQL payloads.
 - Added canonical Marketplace URL normalization (`/marketplace/item/<id>/`) to strip tracking params from stored/opened links.
@@ -101,7 +117,9 @@ Status: Completed
 - Added per-query source visibility (`graphql_found`, `dom_found`) in progress callbacks.
 
 ### Milestone G: GUI Connection Settings Manager
+
 Status: Completed
+
 - Added `Settings > Connections & Scraper` GUI entry.
 - Added full CRUD interface for Facebook account configurations (status, profile path, user agent, proxy mapping).
 - Added per-account manual login action constrained to SOCKS5 proxy assignment.
@@ -126,14 +144,18 @@ Status: Completed
 - Added scrape runtime account-health tracking (`failure_count`, `cooldown_until`) with automatic status transitions on run success/failure.
 
 ### Milestone H: 24x7 Server + Real-Time Sync Migration Planning
+
 Status: Completed
+
 - Added target-state architecture for VPS-hosted worker pool, centralized DB, and event-driven desktop sync.
 - Added operator-side migration checklist (VPS, DB, domain/TLS, secrets, account-profile validation).
 - Added engineering migration sequence (immediate per-listing upsert + event fanout + WebSocket sync).
 - Re-prioritized roadmap toward server migration track before further local-only optimization.
 
 ### Milestone I: 24x7 Server Baseline Implementation
+
 Status: In Progress (Baseline Completed)
+
 - Refactored `scraper.scrape_marketplace()` ingest path to commit listings immediately per insert (removed run-end batch wait).
 - Added `listing_saved` event emission with full listing payload for downstream realtime consumers.
 - Added server deployment scaffold under `server/`:
@@ -149,7 +171,9 @@ Status: In Progress (Baseline Completed)
 - Added GUI progress-state support for incremental `listing_saved` counts during active scrape runs.
 
 ### Milestone J: Desktop Server-Sync (Incremental Cursor Polling)
+
 Status: In Progress (Poll Path Completed)
+
 - Added GUI settings for server-sync controls:
   - `server_sync_enabled`
   - `server_api_base_url`
@@ -168,7 +192,9 @@ Status: In Progress (Poll Path Completed)
 - Added GUI-configurable server monitor SSH settings (`server_ssh_*`) and worker service selector (`server_monitor_worker_services`).
 
 ### Milestone K: VPS Scraper Route Control + Pagination/Rotation Hardening
+
 Status: Completed
+
 - Added server-side worker route and heartbeat schema (`worker_routes`, `worker_heartbeats`) in `server/services/api/sql/001_init.sql`.
 - Added API endpoints for VPS scraper route control and status:
   - `GET /worker-routes`
@@ -192,7 +218,9 @@ Status: Completed
 - Rotation min-reuse filtering now uses dedicated `last_scrape_started_at` instead of generic account `updated_at`.
 
 ### Milestone L: VPS Route Availability Recovery + Runtime Hardening
+
 Status: Completed
+
 - Restored missing VPS runtime env file and re-established deploy path after accidental `.env` deletion on server.
 - Redeployed API and validated public endpoint availability for:
   - `GET /worker-routes`
@@ -229,7 +257,9 @@ Status: Completed
   - accessory detector now matches plural title variants (`cases`, `covers`) in addition to singular (`case`, `cover`)
 
 ### Milestone M: Telegram Listing Card Notifications (VPS Worker Path)
+
 Status: Completed
+
 - Upgraded Telegram sender to support optional parse mode and per-message web preview control.
 - Added Telegram listing-card formatter (`build_telegram_listing_card`) with compact fields:
   - listing title/model/condition
@@ -249,7 +279,9 @@ Status: Completed
   The action executes over SSH and sends a test message from running VPS worker env to verify real production token/chat settings.
 
 ### Milestone N: Worker_3 Fast-Lane + Query Routing Controls
+
 Status: Completed
+
 - Added built-in `worker_3` service to compose stack for fast newest-listing sweep behavior.
 - Added worker runtime env overrides for scroll depth:
   - `WORKER_SCROLL_TARGET_CARDS`
@@ -267,7 +299,9 @@ Status: Completed
 - Normalized GUI monitor worker-service parsing to accept comma/space-separated values and always enforce required coverage (`worker`, `worker_2`, `worker_3`) so `worker_3` appears in status/log checks even when older saved settings were missing it.
 
 ### Milestone O: Feed Recency + Worker Profile Failure Safeguards
+
 Status: Completed
+
 - Enforced newest-first Marketplace search ordering (`sortBy=creation_time_descend`) for all query URLs.
 - Updated progressive feed scroll logic to enforce at least one scroll pass before target-card early exit, reducing false "already loaded enough" starts.
 - Added worker-side profile failure detection using `query_result` telemetry:
@@ -277,7 +311,9 @@ Status: Completed
 - Added GUI main-page VPS worker health strip with three red/green indicators for `worker`, `worker_2`, and `worker_3`, polled from `/worker-health`.
 
 ### Milestone P: VPS Deploy Automation + Host Security Hardening
+
 Status: Completed
+
 - Added one-command deployment script: `server/scripts/deploy_vps.sh`.
   - syncs `server/` to VPS via rsync (excluding `.env`/runtime cache artifacts)
   - runs `docker compose --env-file ../.env up -d --build` for API + worker services
@@ -296,7 +332,9 @@ Status: Completed
   - restored original route proxy and cleared cooldown to return `worker_3` to normal route selection
 
 ### Milestone Q: Proxy Rotation Concurrency Guard + GUI Auto Assignment
+
 Status: Completed
+
 - Added server-side global proxy lease table (`worker_proxy_leases`) with migration wiring in:
   - `server/services/api/sql/001_init.sql`
   - `server/services/api/app/main.py`
@@ -317,7 +355,9 @@ Status: Completed
   - auto-rotation mode can seed login proxy from proxy pool when `proxy_server` is blank
 
 ### Milestone R: Worker Lease/Cooldown Visibility in GUI
+
 Status: Completed
+
 - Expanded API worker-health payload (`GET /worker-health`) to include:
   - active lease metadata (`leased_proxy_server`, `leased_proxy_route`, `leased_proxy_until`, `lease_remaining_seconds`)
   - active route cooldown metadata (`route_cooldown_until`, `cooldown_remaining_seconds`)
@@ -332,7 +372,9 @@ Status: Completed
   - displays are sourced from `/worker-health` + route cooldown timestamps, so operators can monitor worker activity without tailing logs
 
 ### Milestone S: Worker-Scoped Query Manager + Zero-Query Failure Guard
+
 Status: Completed
+
 - Updated `Worker Queries & Negative Keywords` UI to worker scope only:
   - table now shows one row per worker (`worker`, `worker_2`, `worker_3`) instead of worker+route combinations
   - query shard edits now apply across all routes/profiles under the selected worker
@@ -342,7 +384,9 @@ Status: Completed
   - these cycles now participate in degraded/cooldown/alert pipeline instead of silently passing as healthy
 
 ### Milestone T: Last-Minute Scrape Throughput Metric
+
 Status: Completed
+
 - Added `worker_scrape_events` persistence in worker/API schema (`worker_name`, `route_name`, `scraped_count`, `observed_at`) with worker+time index.
 - Worker runtime now records query-level `found` counts as scrape events (actual scraped volume), separate from `listing_saved`/`new_saved`.
 - Scrape events are persisted at query-result time (not only end-of-cycle) so `listings_scraped_last_minute` remains live during long worker cycles.
@@ -352,7 +396,9 @@ Status: Completed
   - `Settings > Connections & Scraper > VPS Scrapers` route table includes `Scraped (1m)` and route form includes read-only `Listings Scraped last minute`.
 
 ### Milestone U: Worker Scheduling + Capacity-Wait Hardening
+
 Status: Completed
+
 - Added worker runtime helper module (`server/services/worker/runtime.py`) for:
   - `CycleOutcome` / `ErrorCategory` types
   - runtime-compensated sleep + jitter computation
@@ -382,7 +428,9 @@ Status: Completed
   - `AGENTS.md`, `TESTING.md`
 
 ### Milestone V: Route State Machine + Proxy Health + Signal Safeguards
+
 Status: Completed
+
 - Added proxy health persistence and scoring:
   - new `proxy_stats` table with `consecutive_failures`, `last_success_at`, `banned_until`, `avg_latency_ms`
   - worker now updates proxy health on scrape success/failure and applies exponential temporary bans after repeated failures
@@ -409,7 +457,9 @@ Status: Completed
   - cycle telemetry now includes dynamic `proxy_key`, `query_shard_key`, soft-signal fields where available
 
 ### Milestone W: Quarantine Operations + Proxy Binding Validation + Telemetry Rollup
+
 Status: Completed
+
 - Added quarantine incident metadata to route state:
   - new `worker_routes` fields: `quarantined_at`, `quarantine_reason`, `quarantine_evidence`
   - metadata now populated when worker marks a route `NEEDS_LOGIN`
@@ -431,7 +481,9 @@ Status: Completed
   - added telemetry rollup utility (`server/scripts/telemetry_rollup.py`) for per-route success/wait/fail trend reporting
 
 ### Milestone X: Persona Variation + Worker Refactor + Shared Schema Ensure
+
 Status: Completed
+
 - Implemented controlled per-cycle browser persona variation using Playwright-native context options:
   - new module `server/services/worker/persona.py` generates coherent personas (`viewport`, `screen`, `device_scale_factor`, `user_agent`, `timezone_id`, `locale`, `color_scheme`)
   - worker runtime now enables persona variation by default via `ENABLE_FINGERPRINT_VARIATION=1`
@@ -450,81 +502,158 @@ Status: Completed
   - API enables trigger creation (`include_triggers=True`), worker keeps trigger bootstrap disabled (`include_triggers=False`) to avoid multi-worker DDL races
 - Added persona unit tests (`server/tests/test_persona.py`).
 
+### Milestone Y: Scraper Module Refactoring Into Package
+
+Status: Completed
+
+- Refactored monolithic `scraper.py` (~3000+ lines) into a structured Python package at `scraper/`:
+  - `scraper/__init__.py` — backward-compatible re-export surface preserving all existing imports
+  - `scraper/config.py` — constants, environment variable parsing, configuration definitions
+  - `scraper/storage.py` — database operations (init, save, load, account/query/setting persistence)
+  - `scraper/parsers.py` — model identification, condition assessment, price parsing, profit calculation, accessory detection
+  - `scraper/proxy.py` — proxy bridge management, Playwright proxy config builder, runtime context assembly
+  - `scraper/browser.py` — stealth scripts, browser context launcher, `random_delay`
+  - `scraper/core.py` — main `scrape_marketplace()` entry point, financial recalculation, accessory purge
+- Original `scraper.py` retained as thin compatibility shim
+- Sub-module boundaries follow logical domain separation (config/storage/parsing/proxy/browser/core)
+- Zero downstream import breakage across `gui.py`, `main.py`, `worker.py`, and tests
+
+### Milestone Z: Event-Driven Notification Worker + Proxy Provider Health Monitor
+
+Status: Completed
+
+- Added standalone event-driven notification worker (`server/services/worker/notification_worker.py`, 519 lines):
+  - subscribes to Redis `listing_events` pub/sub for sub-second delivery latency
+  - priority-tier dispatch (instant ≥ $50 profit, fast-batch ≥ $0, suppressed < $0)
+  - Telegram delivery with MarkdownV2 listing card formatting
+  - Firebase Cloud Messaging (FCM) push for iOS/Android devices via topic-based delivery (`FCM_TOPIC`)
+  - sliding-window rate limiter (`NOTIFY_MAX_PER_MINUTE`) and deduplication (`NOTIFY_DEDUP_WINDOW_SECONDS`)
+  - data model: `ListingEvent` dataclass with full listing context fields
+  - operational statistics tracking (`NotificationStats`) for monitoring
+- Added proxy provider real-time health monitor (`server/services/worker/proxy_monitor.py`, 329 lines):
+  - async background polling of proxy gateway utilization API
+  - health snapshot (`ProxyProviderHealth`) with threads/utilization/error-rate/bandwidth tracking
+  - pacing multiplier computation based on provider saturation thresholds (1.0x / 1.5x / 2.5x)
+  - stale-data detection (3x poll interval)
+  - Telegram degradation alerts with 5-minute cooldown deduplication
+  - integration-ready: `get_proxy_health()` for worker pacing decisions
+- Added proxy provider health tests (`server/tests/test_proxy_provider_runtime.py`)
+
+### Milestone AA: Dolphin Anty Profile Management + API Key Integration
+
+Status: Completed
+
+- Added Dolphin Anty profile management tab in GUI Settings (`Connections & Scraper > Dolphin Profiles`):
+  - Treeview table with profile columns (ID, Name, Status, Browser, Tags, Memory)
+  - `Fetch Profiles` button: queries Dolphin Anty Cloud API (`GET https://anty-api.com/browser_profiles`) to bypass local VPS auth constraints
+  - `Start Selected` button: starts selected profiles using local API URL
+  - `Stop Selected` button: stops selected profiles using local API URL
+- Added Dolphin Anty API Key & URL integration:
+  - `dolphin_api_key` and `dolphin_api_url` settings added to defaults and save logic
+  - Masked entry field (`show="*"`) for API Key, and text entry for API URL (defaults to `http://localhost:3001`)
+- `_dolphin_auth_headers()` helper generates `Authorization: Bearer <API_KEY>` headers
+  - API methods automatically enforce SSH tunneling to the VPS for local API commands (Start/Stop)
+
+### Milestone AB: V2.2 GUI Fixes and Dolphin Anty Refinement
+
+Status: Completed
+
+- Fixed "Start Selected" button in `Dolphin Profiles` tab to catch connection errors and display explicit error alerts (`messagebox.showerror`) instead of swallowing exceptions silently.
+- Dropped legacy local scraping UI actions ("Run Scraper", "Stop Scraper") to enforce 24x7 server execution model.
+- Fixed VPS "Worker Logs (Live)" stream not updating in real-time by adding `-tt` to SSH command to force pseudo-terminal allocation and prevent pipe buffering.
+- Audited and cleared old local sqlite routes (`fb_account_...`) from `listings.db` to prevent synchronization of legacy routes to the VPS database.
+- Confirmed VPS `worker_routes` utilizes PostgreSQL, and successfully cleaned up legacy configurations to mitigate worker quarantine logs.
+
 ---
 
 ## 3. Decision Log
 
 ### Decision: Profit Formula Shift to Market-Realistic Basis
+
 - Decision: calculate profit from listing asking price where available.
 - Reason: comparing sell price to max-buy alone overstated opportunity quality.
 - Impact: more realistic opportunity ranking and clearer downside risk.
 
 ### Decision: Preserve Unclassified/Needs-Pricing Listings
+
 - Decision: keep discovered listings even when model/pricing is incomplete.
 - Reason: prevents silent data loss and enables manual remediation.
 - Impact: improved transparency and reviewability.
 
 ### Decision: Add User Flags at DB Level
+
 - Decision: store operator marks (`user_flag`) in `listings`.
 - Reason: manual trust/risk intent should survive refreshes.
 - Impact: supports workflow triage without external notes.
 
 ### Decision: Keep Condition Logic Rule-Based for Now
+
 - Decision: use keyword rules on card text as baseline.
 - Reason: safer and lighter than full detail-page scraping at current ban-risk posture.
 - Impact: lower scrape risk, but accuracy ceiling remains.
 
 ### Decision: Auto-Suppress Accessory-Only Listings
+
 - Decision: reject listings that appear to sell accessories only (e.g., cases) rather than a handset.
 - Reason: accessory noise was polluting listing queue and reducing operator efficiency.
 - Impact: cleaner queue quality, with heuristic tuning still needed over time as listing phrasing evolves.
 
 ### Decision: Introduce Hybrid Marketplace Fetch
+
 - Decision: capture and parse Marketplace GraphQL responses, with DOM extraction as fallback.
 - Reason: GraphQL returns cleaner structured listing fields while fallback preserves resilience when payload formats shift.
 - Impact: improved listing data quality without removing existing browser-safe behavior.
 
 ### Decision: Shift to Server-First 24x7 Scraping + Push Sync
+
 - Decision: migrate scraping runtime from desktop-triggered batch loops to VPS-hosted continuous workers with central persistence and live event streaming.
 - Reason: current local flow cannot meet always-on operation, second-level ingest visibility, or multi-worker throughput goals.
 - Impact: desktop app becomes operator client; ingestion and state authority move to server stack.
 
 ### Decision: Treat Capacity Contention as WAIT, Not Failure
+
 - Decision: classify no-proxy and profile-lock contention as capacity-wait outcomes (`WAIT_PROXY`, `WAIT_PROFILE_LOCK`) instead of route failures.
 - Reason: proxy/profile contention is an infrastructure-capacity condition, not a profile health signal, and should not burn bad-cycle counters.
 - Impact: reduced cooldown cascades during temporary capacity drops; healthier route stability under concurrent worker load.
 
 ### Decision: Move Route Scheduling from Round-Robin to Due-Time (`next_run_at`)
+
 - Decision: replace in-memory round-robin route selection with persisted due-time scheduling using `worker_routes.next_run_at` and optional `route_interval_seconds`.
 - Reason: round-robin produced deterministic cadence, restart hotspotting, and inaccurate interval semantics under variable cycle durations.
 - Impact: stable per-route cadence, reduced deterministic traffic patterns, and better control when route availability changes dynamically.
 
 ### Decision: Formalize Route Health as an Explicit State Machine
+
 - Decision: persist route statuses (`ENABLED`, `DEGRADED`, `THROTTLED`, `COOLDOWN`, `NEEDS_LOGIN`, `DISABLED`) with reason/timestamp metadata and state-based interval multipliers.
 - Reason: ad-hoc boolean/counter interpretation made recovery windows ambiguous and made operator diagnosis difficult.
 - Impact: clearer operator visibility, wider recovery window before cooldown, and deterministic transition behavior in worker runtime.
 
 ### Decision: Use Proactive Soft-Signal Detection Before Hard Checkpoints
+
 - Decision: run pure, post-cycle signal analysis and map elevated risk to proactive throttle/pause/quarantine actions.
 - Reason: waiting for hard checkpoint/login challenges is reactive and burns profile/proxy reputation before mitigation starts.
 - Impact: route cadence can back off earlier, reducing checkpoint incidence risk while preserving non-bypass safety posture.
 
 ### Decision: Treat Query-Shard Contention as Coordination WAIT
+
 - Decision: lock query shards across workers and return `WAIT_QUERY_SHARD` when another worker currently owns the shard.
 - Reason: overlapping query shards from multiple workers increase correlated bot-like traffic patterns and inflate false failures.
 - Impact: reduced duplicate shard traffic and cleaner failure accounting (contention no longer increments bad-cycle counters).
 
 ### Decision: Enforce Minimum-Route Resilience with Warning + Runtime Guard
+
 - Decision: warn via API when enabled routes per worker are below threshold and apply mandatory extended rest in single-route mode.
 - Reason: strict blocking would be disruptive during incidents, but single-route operation needs explicit pacing protection.
 - Impact: operators retain flexibility while runtime still avoids aggressive no-rotation scrape cadence.
 
 ### Decision: Add Quarantine Metadata + Operational Recovery Actions
+
 - Decision: persist quarantine evidence (`quarantined_at`, `quarantine_reason`, `quarantine_evidence`) and expose retest/bulk-clear actions in API + GUI.
 - Reason: boolean-only manual-login locks were operationally sticky and hard to audit/recover during multi-route incidents.
 - Impact: faster operator recovery for shared failures and clearer incident context per route.
 
 ### Decision: Use Controlled Persona Variation with Native Playwright Options
+
 - Decision: enable per-cycle persona variation using Playwright context options only (`viewport`, `screen`, `device_scale_factor`, `user_agent`, `timezone_id`, `locale`, `color_scheme`), without external stealth/evasion libraries.
 - Reason: static context fingerprints across rotating proxies increase correlation risk and reduce route resilience during sustained operation.
 - Impact: route cycles now carry coherent persona context and telemetry evidence (`persona_hash`) while keeping implementation bounded to native browser configuration APIs.
@@ -532,6 +661,7 @@ Status: Completed
 ---
 
 ## 4. Roadmap Drift Audit (Manual/Additional Features)
+
 The following were detected in implementation and added to roadmap because they were not explicitly captured in original baseline planning:
 
 1. In-app price sheet editor with CSV write-back and recalculation trigger.
@@ -561,6 +691,11 @@ The following were detected in implementation and added to roadmap because they 
 25. VPS build-context hardening to avoid runtime/data permission errors during worker image rebuilds.
 26. Virtualized-feed-safe DOM snapshot aggregation plus feed-container-aware scrolling for deeper listing capture.
 
+27. Scraper module refactored from monolithic `scraper.py` into structured package (`scraper/`) with config/storage/parsers/proxy/browser/core sub-modules and backward-compatible `__init__.py` re-exports.
+28. Standalone event-driven notification worker (`notification_worker.py`) with Redis pub/sub, priority-tier dispatch, FCM push, rate limiting, and deduplication.
+29. Proxy provider real-time health monitor (`proxy_monitor.py`) with async polling, utilization tracking, pacing multiplier computation, and Telegram degradation alerts.
+30. Dolphin Anty profile management GUI tab with Fetch/Start/Stop controls and API key integration (`dolphin_api_key` setting + Bearer auth headers on all requests).
+
 Action taken: all above are now documented in `roadmap.md` as completed scope.
 
 ---
@@ -568,6 +703,7 @@ Action taken: all above are now documented in `roadmap.md` as completed scope.
 ## 5. Process Enhancements Across the System
 
 ### Scraping Process
+
 - Added query-level progress events for operator observability.
 - Added cooperative stop behavior to avoid hard-kill instability.
 - Improved listing card extraction and candidate selection scoring.
@@ -585,11 +721,13 @@ Action taken: all above are now documented in `roadmap.md` as completed scope.
 - Expanded model matcher to include iPhone 16 family labels for forward compatibility.
 
 ### Evaluation Process
+
 - Recalculation path allows backfilling all listings when price sheet changes.
 - Status normalization avoids hiding unresolved listings.
 - Added richer listing context persistence (`location`, `description`, `seller_name`) for better downstream reasoning.
 
 ### Operator Workflow Process
+
 - Added menu-level access to price-sheet and analytics workflows.
 - Added visual triage markers in listings table.
 - Hid `Unknown`/blank model rows from default listings feed to keep operator queue focused.
@@ -599,15 +737,18 @@ Action taken: all above are now documented in `roadmap.md` as completed scope.
 - Added browser-session persistence flow so account cookies/user-agent can be refreshed via operator browsing.
 
 ### Auth and Credential Process
+
 - Added normalized auth provider detection (Gemini/OpenAI) and token-expiry checks.
 - Added one-time raw credential import flow with cleanup of bootstrap auth file.
 
 ### Notification Process
+
 - Reduced noise by notifying only listings with non-negative potential profit (default threshold `>= 0`).
 - Added Telegram per-listing summary card format including link + price + description snippet for faster triage.
 - Added explicit daily summary trigger for operator-level reporting.
 
 ### Connection and Runtime Control Process
+
 - Added structured account lifecycle states (`ACTIVE`, `COOLDOWN`, `NEEDS_LOGIN`, `BANNED`) in GUI.
 - Added explicit proxy inventory with assignment visibility to accounts.
 - Added persisted runtime controls for scraper pacing and query volume from GUI.
@@ -655,6 +796,29 @@ Action taken: all above are now documented in `roadmap.md` as completed scope.
 - Added route status-state persistence and transitions (`ENABLED`/`DEGRADED`/`THROTTLED`/`COOLDOWN`/`NEEDS_LOGIN`/`DISABLED`) plus interval multipliers for degraded states.
 - Added proxy health memory table (`proxy_stats`) and candidate scoring/ban logic to avoid repeated use of recently failing proxies.
 - Added API-level `<2 enabled routes` warnings and worker-side single-route extended-rest enforcement to reduce no-rotation ban risk.
+- Added Dolphin Anty profile management in GUI (`Dolphin Profiles` tab) with Fetch/Start/Stop profile controls and authenticated Bearer-token API requests.
+
+### Code Quality and Maintainability Process
+
+- Refactored monolithic scraper module into Python package with clean domain separation.
+- Backward-compatible re-export surface ensures zero downstream breakage.
+
+### Notification Process (Enhanced)
+
+- Added standalone event-driven notification worker consuming Redis events for sub-second push delivery.
+- Added Firebase Cloud Messaging (FCM) push path for native iOS/Android notifications.
+- Added priority-tier notification dispatch (instant/batch/suppressed) to reduce operator notification fatigue.
+- Added sliding-window rate limiting and deduplication in notification delivery pipeline.
+
+### Proxy Provider Monitoring Process
+
+- Added real-time proxy gateway utilization/error-rate polling with pacing multiplier integration.
+- Added automated Telegram alerts for proxy provider degradation events.
+
+### Dolphin Anty Integration Process
+
+- Added GUI-managed Dolphin profile lifecycle controls (fetch/start/stop) with tabular profile visibility.
+- Added secure API key management with masked entry, SQLite persistence, and automatic Bearer-token injection.
 
 ---
 
@@ -663,6 +827,7 @@ Action taken: all above are now documented in `roadmap.md` as completed scope.
 Audit reference: `/Users/ishanrathnayaka/Downloads/Titan_Scraper_Ultimate_Spec.md`
 
 Implemented immediately from audit:
+
 - Added anti-pattern fix for price extraction where feed/title strings include `amount + currency` format (`300 AU$...`) instead of structured price fields.
 - Added support for thousand-separator dot format (`1.000 AU$`) in parser normalization.
 - Added support for shorthand-thousands suffix parsing (`1.4k`, `1.65k`) during ingestion.
@@ -673,6 +838,7 @@ Implemented immediately from audit:
 - Added runtime account health counters (`failure_count`, `cooldown_until`) with automatic cooldown/login state transitions.
 
 Still out of current local-app scope (documented, not removed):
+
 - Distributed service split (Manager/Worker/Harvester/Notifier as separate deployable services).
 - Redis queue + pub/sub transport layer.
 - PostgreSQL multi-tenant schema with users/search_queries ownership model.
@@ -684,36 +850,42 @@ Still out of current local-app scope (documented, not removed):
 
 1. Condition inference is still keyword/rule-based and can miss nuance even with better listing metadata.
 2. No condition confidence signal yet to gate automation decisions.
-3. Automated coverage is still limited (runtime scheduling helpers covered, but broader scraper/API integration tests and CI are still missing).
+3. Automated coverage is still limited (runtime scheduling helpers covered, but broader scraper/API integration coverage and CI are still missing).
 4. Browser profile and auth artifacts require stronger operational security guidance.
 5. Structured cycle telemetry rollup script exists, but no always-on dashboard or automated report delivery pipeline is wired yet.
 6. Desktop GUI server-sync is currently cursor-poll based; direct WebSocket consumer path is still pending.
-7. Dedicated server-side notifier consumer is still pending; current VPS path sends Telegram directly from worker runtime for qualifying new listings.
+7. Notification worker (`notification_worker.py`) is implemented but requires compose service entry and deployment wiring to run as production container.
 8. Query-shard lock deduplication is implemented, but higher-level shard planning/validation (conflict prevention at config time, load-balancing heuristics) still needs hardening.
 9. Persona variation currently covers native context-level traits only; deeper browser-surface controls (e.g., strict geo-IP datasets and broader persona QA) still need hardening and monitoring.
+10. Dolphin Anty installation on VPS is pending; GUI profile management is ready but requires Dolphin app running on port 3001.
+11. Proxy provider monitor (`proxy_monitor.py`) pacing multiplier is computed but not yet wired into worker scrape-interval adjustment flow.
 
 ---
 
 ## 8. Active Work Queue (Aligned to Roadmap)
 
 ### Priority 1
+
 - Complete Phase 5A desktop sync integration by adding direct WebSocket apply on top of the shipped cursor-poll baseline.
 - Implement `condition_confidence` tiers and manual-review routing.
 - Add selective detail-page enrichment for low-confidence/high-value listings.
 - Extend GUI-managed remote worker control from route assignment/status to full deploy/restart lifecycle actions.
 
 ### Priority 2
+
 - Add automated tests for pricing/condition/scoring logic.
 - Add automated telemetry rollup scheduling/report delivery (dashboard or periodic artifacts) on top of current CLI script.
 - Add worker health metrics and reconnect-safe desktop catch-up cursor.
 
 ### Priority 3
+
 - Add advanced GUI filters (confidence/manual-review/user-flag presets).
 - Add backup/export flows for DB and operational snapshots.
 
 ---
 
 ## 9. Operator-Side Migration Checklist (Approved)
+
 1. Provision VPS host and secure SSH-only administration.
 2. Provision PostgreSQL and generate least-privilege app credentials.
 3. Provision domain + TLS endpoint for API/WebSocket traffic.
@@ -725,7 +897,9 @@ Still out of current local-app scope (documented, not removed):
 ---
 
 ## 10. Next Update Protocol
+
 For each future update, append:
+
 - date/time
 - change summary
 - files touched
@@ -1209,3 +1383,146 @@ This keeps `dev-log.md` actionable for both engineering and operations.
   - `architecture.md`
   - `roadmap.md`
   - `dev-log.md`
+
+---
+
+## 26. 2026-02-17 Feature: Scraper Module Refactoring Into Package
+
+- Date/time: 2026-02-17
+- Change summary:
+  - refactored monolithic `scraper.py` (~3000+ lines) into a well-organized Python package (`scraper/`):
+    - `scraper/__init__.py` — backward-compatible re-export surface so existing imports (`from scraper import X`) continue to work
+    - `scraper/config.py` — all constants, environment variable parsing, default values, and configuration definitions
+    - `scraper/storage.py` — database operations: `init_db`, `save_listing`, `load_price_list`, account/query/setting persistence, `reserve_next_scraper_account_for_run`
+    - `scraper/parsers.py` — model identification, condition assessment, price parsing, profit calculation, accessory detection
+    - `scraper/proxy.py` — proxy bridge management, auth-bridge spawning, Playwright proxy configuration builder, runtime context assembly
+    - `scraper/browser.py` — stealth scripts, browser context launcher, `random_delay` utility
+    - `scraper/core.py` — main `scrape_marketplace()` entry point, `recalculate_listing_financials`, `purge_accessory_only_listings`
+  - original `scraper.py` retained as a thin compatibility layer pointing to the package
+- Design rationale:
+  - monolithic file exceeded maintainability thresholds
+  - sub-module boundaries follow logical domain separation (config/storage/parsing/proxy/browser/core)
+  - backward compatibility ensures zero downstream import breakage in `gui.py`, `main.py`, `worker.py`, and test files
+- Files touched:
+  - `scraper/__init__.py` [NEW]
+  - `scraper/config.py` [NEW]
+  - `scraper/storage.py` [NEW]
+  - `scraper/parsers.py` [NEW]
+  - `scraper/proxy.py` [NEW]
+  - `scraper/browser.py` [NEW]
+  - `scraper/core.py` [NEW]
+- Validation performed:
+  - syntax check: `python3 -c "import ast; ast.parse(open('scraper/__init__.py').read())"`
+  - import compatibility verified: existing `from scraper import scrape_marketplace` continues to resolve
+
+---
+
+## 27. 2026-02-20 Feature: Event-Driven Notification Worker (FCM + Priority Tiers)
+
+- Date/time: 2026-02-20
+- Change summary:
+  - added standalone notification worker service (`server/services/worker/notification_worker.py`, 519 lines):
+    - subscribes to Redis `listing_events` pub/sub channel for sub-second notification delivery
+    - implements priority-tier dispatch:
+      - **Instant tier**: listings with `potential_profit >= $50` are sent immediately via Telegram + FCM
+      - **Fast-batch tier**: listings with `potential_profit >= $0` are queued and flushed every 10 seconds
+      - **Suppressed tier**: negative-profit listings are silently dropped
+    - Telegram delivery via Bot API with MarkdownV2 card formatting
+    - Firebase Cloud Messaging (FCM) push notification delivery:
+      - topic-based push to subscribed iOS/Android devices (`FCM_TOPIC`, default `new_iphones`)
+      - data payloads include model, price, profit, URL for deep-link handling
+      - Firebase Admin SDK initialization from service account credentials or Application Default Credentials
+    - rate limiter with sliding 60-second window (`NOTIFY_MAX_PER_MINUTE`, default `30`)
+    - in-memory deduplication with configurable TTL window (`NOTIFY_DEDUP_WINDOW_SECONDS`, default `60`)
+    - operational statistics tracking (`NotificationStats` dataclass) for received/sent/deduped/rate-limited/errored counts
+    - health endpoint and stats API can be integrated into the main API service
+  - data model: `ListingEvent` dataclass parsed from Redis JSON payloads
+    - fields: `event_type`, `listing_id`, `model`, `price`, `profit`, `url`, `condition`, `description`, `source`, `worker_name`, `route_name`, `timestamp`
+  - configurable environment variables:
+    - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
+    - `FCM_CREDENTIALS_PATH`, `FCM_TOPIC`
+    - `NOTIFY_INSTANT_PROFIT_THRESHOLD`, `NOTIFY_BATCH_INTERVAL_SECONDS`
+    - `NOTIFY_MAX_PER_MINUTE`, `NOTIFY_DEDUP_WINDOW_SECONDS`
+- Decision/rationale:
+  - decouples notification delivery from worker scraping runtime
+  - event-driven architecture enables sub-second push latency for high-value listings
+  - FCM integration enables native iOS push notifications for the companion mobile app
+- Files touched:
+  - `server/services/worker/notification_worker.py` [NEW]
+
+---
+
+## 28. 2026-02-20 Feature: Proxy Provider Real-Time Health Monitor
+
+- Date/time: 2026-02-20
+- Change summary:
+  - added proxy provider health monitoring module (`server/services/worker/proxy_monitor.py`, 329 lines):
+    - background async polling loop (`start_monitor` / `stop_monitor`) with configurable interval (`PROXY_PROVIDER_POLL_INTERVAL_SECONDS`, default `15s`)
+    - polls proxy gateway realtime-usage API (`https://api.proxyrotator.com/proxy-gateways/realtime-usage`)
+    - health snapshot dataclass (`ProxyProviderHealth`) tracking:
+      - `threads_connected` / `threads_total` / `utilization_ratio`
+      - `success_count` / `thread_limit_errors` / `error_rate`
+      - `bandwidth_used_mb`
+      - computed fields: `is_saturated`, `should_back_off`, `pacing_multiplier`
+    - pacing multiplier calculation based on utilization and error-rate thresholds:
+      - `< 60%` utilization + `< 50%` error rate → `1.0x` (normal)
+      - `60-80%` utilization or `50-80%` error rate → `1.5x` (warning)
+      - `> 80%` utilization or `> 80%` error rate → `2.5x` (high/saturated)
+    - stale-data detection (health is stale if older than `3x` poll interval)
+    - Telegram degradation alerts with cooldown deduplication (at most once per 5 minutes)
+    - integration-ready: worker can call `get_proxy_health()` to apply pacing multipliers to scrape intervals
+  - added tests: `server/tests/test_proxy_provider_runtime.py`
+- Decision/rationale:
+  - provider-side thread-limit failures were invisible until manual API checks
+  - real-time health visibility enables proactive worker pacing before proxy saturation causes upstream failures
+- Files touched:
+  - `server/services/worker/proxy_monitor.py` [NEW]
+  - `server/tests/test_proxy_provider_runtime.py` [NEW]
+
+---
+
+## 29. 2026-02-20 Feature: Dolphin Anty Profile Management + API Key Integration
+
+- Date/time: 2026-02-20
+- Change summary:
+  - added Dolphin Anty profile management tab in `Settings > Connections & Scraper`:
+    - new `Dolphin Profiles` tab in settings notebook
+    - Treeview table with columns: ID, Name, Status, Browser, Tags, Memory
+    - `Fetch Profiles` button: calls Dolphin Anty API (`GET {dolphin_api_url}/v1.0/browser_profiles`) and populates the profile table
+    - `Start Selected` button: starts selected profiles via `GET {dolphin_api_url}/v1.0/browser_profiles/{id}/start?automation=1` and displays running port in Status column
+    - `Stop Selected` button: stops selected profiles via `GET {dolphin_api_url}/v1.0/browser_profiles/{id}/stop`
+  - added Dolphin Anty API Key and URL integration:
+    - `dolphin_api_key` and `dolphin_api_url` added to `scraper_settings` defaults and save logic
+    - dedicated API configuration parameters in the Dolphin Profiles tab
+    - one-click `Save Key` button that persists the API key to SQLite via `_set_scraper_setting()`
+    - new helper method `_dolphin_auth_headers()` generates `Authorization: Bearer <API_KEY>` headers
+    - all three Dolphin API methods (`_refresh_dolphin_profiles`, `_start_selected_dolphin_profiles`, `_stop_selected_dolphin_profiles`) now inject the Bearer auth header via `headers=self._dolphin_auth_headers()`
+  - **Headless VPS Autostart**: Configured TigerVNC (`vncserver@.service`) and Dolphin Anty (`dolphin-anty.service`) as `systemd` autostart services on the VPS to ensure the Dolphin API (port 3001) is available immediately after server restarts without requiring manual GUI login.
+  - security: API key masked in GUI, persisted in SQLite, and transmitted only in Authorization headers
+  - **Troubleshooting Connection Refused**: If a `Failed to contact Dolphin Anty API` or `Connection refused` error occurs, ensure that the Dolphin Anty desktop application is actively running on the target machine (local or VPS). The API server is only exposed when the application is open.
+- Files touched:
+  - `gui.py`
+- Validation performed:
+  - syntax check: `python3 -c "import ast; ast.parse(open('gui.py').read())"` → `Syntax OK`
+
+---
+
+## 30. 2026-02-20 Code Audit Features: Stealth Scripts & Enhanced Soft-Signals
+
+- Date/time: 2026-02-20
+- Change summary:
+  - discovered previously undocumented stealth script fingerprint randomization:
+    - randomizes `hardwareConcurrency`, `deviceMemory`, `platform`, and `webgl_renderer` via JS injection
+    - adds missing standard properties like `window.chrome` and specific plugins
+    - strengthens the crawler's anti-detection posture against platform fingerprinting
+  - discovered new enhanced soft-signals in the signal detector (`server/services/worker/signal_detector.py`):
+    - `CONSECUTIVE_EMPTY_RESULTS`: proactive pause signal triggered when multiple consecutive empty responses are encountered (threshold >= 3)
+    - `SESSION_TOO_LONG`: signal emitted when session duration exceeds maximum allowed time, triggering safe cycle resets
+- Decision/rationale:
+  - these features were added to further harden the system against silent bot bans and excessive cycle durations
+  - officially documenting these features ensures visibility for ongoing risk/pacing calibrations
+- Validation performed:
+  - reviewed tests for stealth scripts (`server/tests/test_stealth_scripts.py`)
+  - reviewed tests for enhanced signals (`server/tests/test_signal_detector_new.py`)
+
+---

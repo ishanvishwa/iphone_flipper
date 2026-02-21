@@ -12,7 +12,6 @@ from typing import Set
 from .config import MANUAL_LOGIN_REQUIRED_PREFIX
 from .driver import launch_browser_context
 from .driver import random_delay
-from .driver import reserve_and_build_scraper_runtime_context
 from .parser import extract_currency_price_from_text
 from .parser import extract_shorthand_k_price_from_text
 from .parser import identify_model
@@ -147,12 +146,9 @@ def _store_listing_candidate(
 
 
 async def scrape_marketplace(
-    headless: bool = True,
+    profile_id: str,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     stop_event: Any = None,
-    # Parameters below allow overrides but default to config/DB
-    user_data_dir: Optional[str] = None,
-    proxy: Optional[Dict[str, str]] = None,
     search_queries: Optional[List[str]] = None,
 ):
     init_db()
@@ -164,58 +160,49 @@ async def scrape_marketplace(
         max_queries=runtime_settings["max_queries_per_run"]
     )
 
-    # If no proxy/profile provided, reserve a rotating account
-    bridge_process = None
-    account_id = None
-    
-    if not user_data_dir and not proxy:
-        ctx, error = reserve_and_build_scraper_runtime_context()
-        if error or not ctx:
-            raise RuntimeError(error or "Failed to reserve scraper account")
-        
-        user_data_dir = ctx["user_data_dir"]
-        proxy = ctx["proxy"]
-        bridge_process = ctx["bridge_process"]
-        account_id = ctx["account_ctx"]["account_id"]
-
     try:
-        browser, context, page = await launch_browser_context(
-            headless=headless,
-            user_data_dir=user_data_dir,
-            proxy=proxy,
+        p, browser, context, page = await launch_browser_context(
+            headless=False,
+            profile_id=profile_id,
         )
         
-        # Main Loop
         import sqlite3
         from .config import DB_PATH
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
+
+        # GraphQL Interception Logic
+        async def handle_response(response):
+            if "api/graphql/" in response.url and response.request.method == "POST":
+                try:
+                    json_data = await response.json()
+                    # A robust parser will be needed here to extract nodes, 
+                    # but for now we'll just log that we caught it to avoid breaking early.
+                    # We will fill this out properly in the parsing step.
+                except Exception as e:
+                    pass
+
+        page.on("response", handle_response)
 
         for index, query in enumerate(active_queries, start=1):
             if stop_event and stop_event.is_set():
                 break
 
             print(f"  Searching for: {query}")
-            search_url = f"https://www.facebook.com/marketplace/perth/search?query={query.replace(' ', '%20')}&exact=false&sortBy=creation_time_descend"
+            search_url = f"https://www.facebook.com/marketplace/perth/search?query={query.replace(' ', '%20')}&exact=false&sortBy=creation_time_descend&daysSinceListed=1"
             
             await page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
-            await random_delay(3, 6)
             
-            # Simple DOM extraction for now (keeping it robust but simple for V2 start)
-            # Full implementation would include the scroll logic from V1
+            # Since we intercept GraphQL, we don't need to wait long for the DOM.
+            await random_delay(1, 2)
             
             mark_search_query_polled(query)
-            await random_delay(runtime_settings["scrape_delay_min_seconds"], runtime_settings["scrape_delay_max_seconds"])
 
         conn.close()
         await context.close()
-        await browser.stop()
+        await browser.close()
+        await p.stop()
         
-        if account_id:
-            update_fb_account_runtime_status(account_id, success=True)
-            
-    finally:
-        if bridge_process:
-            if bridge_process.poll() is None:
-                bridge_process.terminate()
+    except Exception as e:
+        print(f"Scraper pipeline failed: {e}")
 

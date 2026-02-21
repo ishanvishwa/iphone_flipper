@@ -34,6 +34,9 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
+FCM_SERVICE_ACCOUNT_PATH = os.getenv("FCM_SERVICE_ACCOUNT_PATH", "firebase-adminsdk.json")
+FCM_TOPIC = os.getenv("FCM_TOPIC", "new_iphones")
+
 NOTIFY_INSTANT_PROFIT_THRESHOLD = float(
     os.getenv("NOTIFY_INSTANT_PROFIT_THRESHOLD", "50")
 )
@@ -74,13 +77,16 @@ def _parse_listing_event(raw: str) -> ListingEvent | None:
     try:
         data = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
-        logger.warning("Failed to parse listing event: %s", raw[:200])
+        safe_raw = str(raw) if raw else ""
+        logger.warning("Failed to parse listing event: %s", safe_raw[0:200])
         return None
 
     event_type = str(data.get("event") or data.get("event_type") or "").strip()
     if not event_type:
         return None
 
+    desc_raw = str(data.get("description") or "")
+    
     return ListingEvent(
         event_type=event_type,
         listing_id=data.get("listing_id") or data.get("id") or "",
@@ -89,7 +95,7 @@ def _parse_listing_event(raw: str) -> ListingEvent | None:
         profit=float(data.get("profit") or data.get("estimated_profit") or 0),
         url=str(data.get("url") or data.get("link") or ""),
         condition=str(data.get("condition") or ""),
-        description=str(data.get("description") or "")[:200],
+        description=desc_raw[0:200],
         source=str(data.get("source") or ""),
         worker_name=str(data.get("worker_name") or ""),
         route_name=str(data.get("route_name") or ""),
@@ -160,7 +166,88 @@ async def _send_telegram(message: str) -> bool:
                     return False
                 return True
     except Exception as exc:
-        logger.warning("Telegram send failed: %s", str(exc)[:200])
+        err_msg = str(exc)
+        logger.warning("Telegram send failed: %s", err_msg[0:200])
+        return False
+
+# ---------------------------------------------------------------------------
+# Firebase Cloud Messaging Delivery
+# ---------------------------------------------------------------------------
+
+_firebase_initialized = False
+
+def _init_firebase() -> bool:
+    global _firebase_initialized
+    if _firebase_initialized:
+        return True
+    
+    try:
+        import firebase_admin
+        from firebase_admin import credentials
+    except ImportError:
+        logger.warning("firebase_admin not installed, FCM push disabled")
+        return False
+        
+    if not os.path.exists(FCM_SERVICE_ACCOUNT_PATH):
+        logger.warning(
+            "FCM credentials not found at %s. To enable push, place service account JSON here.", 
+            FCM_SERVICE_ACCOUNT_PATH
+        )
+        return False
+
+    try:
+        if not firebase_admin._apps:
+            cred = credentials.Certificate(FCM_SERVICE_ACCOUNT_PATH)
+            firebase_admin.initialize_app(cred)
+        _firebase_initialized = True
+        logger.info("Firebase Admin SDK initialized successfully.")
+        return True
+    except Exception as e:
+        logger.warning("Failed to initialize Firebase Admin SDK: %s", e)
+        return False
+
+async def _send_fcm_push(event: ListingEvent) -> bool:
+    """Send a push notification via Firebase Cloud Messaging."""
+    if not _init_firebase():
+        return False
+        
+    try:
+        from firebase_admin import messaging
+    except ImportError:
+        return False
+
+    # Send a high-priority robust data message rather than a generic notification.
+    # The client app can intercept this in the background and show a rich local notification.
+    message = messaging.Message(
+        data={
+            "notification_type": "new_listing",
+            "listing_id": str(event.listing_id),
+            "model": event.model,
+            "price": str(event.price),
+            "profit": str(event.profit),
+            "url": event.url,
+            "condition": event.condition,
+            "source": event.source,
+            "timestamp": event.timestamp,
+        },
+        topic=FCM_TOPIC,
+        android=messaging.AndroidConfig(priority='high'),
+        apns=messaging.APNSConfig(
+            headers={'apns-priority': '10'},
+            payload=messaging.APNSPayload(
+                aps=messaging.Aps(content_available=True)
+            )
+        )
+    )
+
+    try:
+        # Run sync method in executor
+        loop = asyncio.get_running_loop()
+        message_id = await loop.run_in_executor(None, messaging.send, message)
+        logger.debug("Successfully sent FCM message: %s", message_id)
+        return True
+    except Exception as e:
+        logger.warning("FCM push failed: %s", e)
         return False
 
 
@@ -293,8 +380,10 @@ class NotificationDispatcher:
             return
 
         card = _build_telegram_card(event)
-        success = await _send_telegram(card)
-        if success:
+        success_tg = await _send_telegram(card)
+        success_fcm = await _send_fcm_push(event)
+        
+        if success_tg or success_fcm:
             self.stats.notifications_sent += 1
             logger.info(
                 "Instant notification sent for listing %s (profit=$%.0f)",
@@ -328,8 +417,10 @@ class NotificationDispatcher:
                 self.stats.rate_limited += 1
                 continue
             card = _build_telegram_card(event)
-            success = await _send_telegram(card)
-            if success:
+            success_tg = await _send_telegram(card)
+            success_fcm = await _send_fcm_push(event)
+            
+            if success_tg or success_fcm:
                 self.stats.notifications_sent += 1
             else:
                 self.stats.errors += 1
@@ -372,10 +463,10 @@ async def run_notification_worker() -> None:
 
     try:
         async for message in pubsub.listen():
-            if message["type"] != "message":
+            if isinstance(message, dict) and message.get("type") != "message":
                 continue
 
-            raw_data = str(message.get("data") or "")
+            raw_data = str(message.get("data") if isinstance(message, dict) else "")
             if not raw_data:
                 continue
 

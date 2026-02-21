@@ -11,6 +11,7 @@ import webbrowser
 import threading
 import asyncio
 import csv
+import queue
 from pathlib import Path
 from datetime import datetime
 import subprocess
@@ -257,20 +258,7 @@ class iPhoneFlipperGUI:
         )
         self.refresh_listings_button.pack(side=tk.RIGHT, padx=5)
 
-        self.cancel_scraper_button = ttk.Button(
-            controls_frame,
-            text="⏹ Stop Scraper",
-            command=self.cancel_scraper,
-            state=tk.DISABLED,
-        )
-        self.cancel_scraper_button.pack(side=tk.RIGHT, padx=5)
 
-        self.run_scraper_button = ttk.Button(
-            controls_frame,
-            text="🕷 Run Scraper",
-            command=self.run_scraper,
-        )
-        self.run_scraper_button.pack(side=tk.RIGHT, padx=5)
 
         worker_status_frame = ttk.Frame(self.listings_frame)
         worker_status_frame.pack(fill=tk.X, padx=10, pady=(0, 6))
@@ -920,10 +908,25 @@ class iPhoneFlipperGUI:
                 continue
             healthy = self._worker_status_is_healthy(raw_status)
             _, _, strip_hint = self._worker_runtime_summary(payload)
+            
+            # Enhancing status info based on user request for v2.2 profiling
+            route = payload.get("route_name") or ""
+            route_str = f" [{route}]" if route else ""
+            scraped = payload.get("listings_scraped_last_minute", 0)
+            last_err = str(payload.get("last_error") or "")
+            
+            if raw_status == "manual_login_required":
+                extra_info = "MANUAL_LOGIN_REQUIRED"
+                healthy = False
+            else:
+                extra_info = f"{scraped}/min"
+                
+            status_text = f"{raw_status}{route_str} ({extra_info}) ({strip_hint})"
+            
             self._set_worker_status_indicator(
                 worker_name,
-                healthy=healthy,
-                status_text=f"{raw_status} | {strip_hint}",
+                healthy,
+                status_text
             )
 
     def _fetch_vps_worker_health(self):
@@ -1010,6 +1013,15 @@ class iPhoneFlipperGUI:
         if self.server_monitor_text and self.server_monitor_text.winfo_exists():
             self.server_monitor_text.config(state=tk.NORMAL)
             self.server_monitor_text.insert(tk.END, text)
+            
+            # Prevent Tkinter text overflow freeze on MacOS
+            try:
+                line_count = int(self.server_monitor_text.index('end-1c').split('.')[0])
+                if line_count > 5000:
+                    self.server_monitor_text.delete("1.0", f"{line_count - 5000}.0")
+            except Exception:
+                pass
+                
             self.server_monitor_text.see(tk.END)
             self.server_monitor_text.config(state=tk.DISABLED)
 
@@ -1116,14 +1128,16 @@ class iPhoneFlipperGUI:
         self.server_log_stream_process = None
 
         if proc and proc.poll() is None:
-            try:
-                proc.terminate()
-                proc.wait(timeout=3)
-            except Exception:
+            def kill_bg():
                 try:
-                    proc.kill()
+                    proc.terminate()
+                    proc.wait(timeout=3)
                 except Exception:
-                    pass
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            threading.Thread(target=kill_bg, daemon=True).start()
 
         self.server_log_stream_thread = None
         if update_status:
@@ -1140,43 +1154,38 @@ class iPhoneFlipperGUI:
 
         services = self._get_server_monitor_services()
         project_q = shlex.quote(ctx["project_dir"])
-        remote_cmd = f"cd {project_q}/infra && docker compose --env-file ../.env logs -f --tail=120 {services}"
+        remote_cmd = f"cd {project_q}/infra && docker compose --env-file ../.env logs -f --tail=5 {services}"
         ssh_target = f"{ctx['user']}@{ctx['host']}"
-        ssh_cmd = ["ssh", "-o", "BatchMode=yes", ssh_target, remote_cmd]
+        ssh_cmd = ["ssh", "-o", "BatchMode=yes", "-tt", ssh_target, remote_cmd]
 
         self._append_server_monitor_output(self._server_monitor_banner("Worker Logs (live)"))
         self.status_bar.config(text="Streaming worker logs live...")
 
+        log_queue = queue.Queue()
+
         def worker():
             proc = None
             try:
+                # Use binary unbuffered reading from pipe
                 proc = subprocess.Popen(
                     ssh_cmd,
                     cwd=Path(__file__).parent,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
+                    bufsize=0,
                 )
                 self.server_log_stream_process = proc
                 if proc.stdout is not None:
-                    for line in proc.stdout:
-                        self.root.after(0, lambda chunk=line: self._append_server_monitor_output(chunk))
+                    # Read byte chunks as they arrive to avoid any line-buffering blocks
+                    for chunk in iter(lambda: proc.stdout.read(1024), b""):
+                        text_chunk = chunk.decode(errors="replace")
+                        log_queue.put(text_chunk)
+                        
                 exit_code = proc.wait(timeout=3)
-                if exit_code not in (0, -15):
-                    self.root.after(
-                        0,
-                        lambda code=exit_code: self._append_server_monitor_output(
-                            f"(live log stream exited with code {code})\n"
-                        ),
-                    )
+                if exit_code not in (0, -15, 255):  # 255 is SSH generic exit
+                    log_queue.put(f"(live log stream exited with code {code})\n")
             except Exception as exc:
-                self.root.after(
-                    0,
-                    lambda msg=str(exc): self._append_server_monitor_output(
-                        f"Live log stream error: {msg}\n"
-                    ),
-                )
+                log_queue.put(f"Live log stream error: {exc}\n")
             finally:
                 self.server_log_stream_process = None
                 self.server_log_stream_thread = None
@@ -1185,6 +1194,24 @@ class iPhoneFlipperGUI:
         thread = threading.Thread(target=worker, daemon=True, name="server-worker-live-logs")
         self.server_log_stream_thread = thread
         thread.start()
+
+        def pump_gui_queue():
+            if not self.server_log_stream_thread and log_queue.empty():
+                return
+            buf = []
+            max_chunks = 15  # Avoid freezing the UI tick by capping chunks string concatenation
+            while not log_queue.empty() and len(buf) < max_chunks:
+                try:
+                    buf.append(log_queue.get_nowait())
+                except queue.Empty:
+                    break
+            if buf:
+                self._append_server_monitor_output("".join(buf))
+            # Schedule the next pump
+            self.root.after(100, pump_gui_queue)
+
+        # Start pumping the logs into the UI
+        self.root.after(100, pump_gui_queue)
 
     def _sync_accessory_filter_settings_to_vps(self, keywords_csv: str, max_price_text: str):
         ctx, error = self._get_server_ssh_context()
@@ -2310,19 +2337,10 @@ PY
 
                 values = (
                     worker_name,
-                    route_name,
-                    str(route.get("route_interval_seconds") or ""),
-                    enabled_display,
-                    status,
-                    "yes" if manual_login_required else "no",
-                    str(max(0, self._safe_int(health.get("listings_scraped_last_minute"), 0))) if is_active_route else "-",
-                    lease_display,
-                    cooldown_display,
-                    last_run_display,
                     str(route.get("user_data_dir") or ""),
-                    str(route.get("proxy_mode") or "fixed"),
-                    str(route.get("proxy_server") or ""),
-                    str(route.get("search_queries") or ""),
+                    status,
+                    str(max(0, self._safe_int(health.get("listings_scraped_last_minute"), 0))) if is_active_route else "-",
+                    last_run_display,
                 )
                 try:
                     self.vps_scraper_tree.insert("", tk.END, iid=key, values=values)
@@ -2628,6 +2646,46 @@ PY
         self.selected_vps_scraper_key = f"{worker_name}::{route_name}"
         self._refresh_vps_scraper_tree(preserve_selection=True)
         self.status_bar.config(text=f"Saved VPS route {worker_name}/{route_name}")
+        return True
+
+    def _delete_vps_scraper_route(self):
+        worker_name = self.vps_scraper_form_vars["worker_name"].get().strip()
+        route_name = self.vps_scraper_form_vars["route_name"].get().strip()
+        
+        if not worker_name or not route_name:
+            messagebox.showwarning("Delete Failed", "Cannot delete. Worker Name and Route Name must be specified.")
+            return False
+
+        if not messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete route '{route_name}' on worker '{worker_name}'?"):
+            return False
+
+        ctx, error = self._get_server_api_context()
+        if error:
+            messagebox.showwarning("VPS Scrapers", error)
+            return False
+
+        try:
+            response = requests.delete(
+                f"{ctx['base_url']}/worker-routes/{worker_name}/{route_name}",
+                headers=ctx["headers"],
+                timeout=(8, 30),
+            )
+            if response.status_code == 401:
+                raise RuntimeError("Unauthorized (check Server API Token).")
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            messagebox.showerror("Delete Failed", f"Failed to delete VPS scraper route:\n{exc}")
+            self.status_bar.config(text=f"Failed to delete VPS scraper route {worker_name}/{route_name}")
+            return False
+        except Exception as exc:
+            messagebox.showerror("Delete Failed", f"Failed to delete VPS scraper route:\n{exc}")
+            self.status_bar.config(text=f"Failed to delete VPS scraper route {worker_name}/{route_name}")
+            return False
+
+        self.selected_vps_scraper_key = None
+        self._clear_vps_scraper_form()
+        self._refresh_vps_scraper_tree(preserve_selection=False)
+        self.status_bar.config(text=f"Deleted VPS route {worker_name}/{route_name}")
         return True
 
     def _delete_selected_vps_scraper_route(self):
@@ -6024,6 +6082,7 @@ PY
             "max_queries_per_run": str(len(SEARCH_QUERIES)),
             "accessory_filter_keywords": self._default_accessory_keyword_csv(),
             "accessory_filter_max_price": "120",
+            "dolphin_api_key": "",
             "proxy_api_url": "",
             "proxy_api_key": "",
             "proxy_api_auth_header": "Authorization",
@@ -6112,6 +6171,7 @@ PY
             "max_queries_per_run": str(max_queries),
             "accessory_filter_keywords": accessory_keywords_csv,
             "accessory_filter_max_price": accessory_max_price_text,
+            "dolphin_api_key": self.scraper_setting_vars["dolphin_api_key"].get().strip(),
             "proxy_api_url": self.scraper_setting_vars["proxy_api_url"].get().strip(),
             "proxy_api_key": self.scraper_setting_vars["proxy_api_key"].get().strip(),
             "proxy_api_auth_header": self.scraper_setting_vars["proxy_api_auth_header"].get().strip() or "Authorization",
@@ -6254,108 +6314,6 @@ PY
         notebook = ttk.Notebook(window)
         notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        proxies_tab = ttk.Frame(notebook)
-        notebook.add(proxies_tab, text="Proxies")
-        proxies_tab.columnconfigure(0, weight=3)
-        proxies_tab.columnconfigure(1, weight=2)
-        proxies_tab.rowconfigure(0, weight=1)
-
-        proxy_table_frame = ttk.Frame(proxies_tab)
-        proxy_table_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        proxy_table_frame.rowconfigure(0, weight=1)
-        proxy_table_frame.columnconfigure(0, weight=1)
-
-        self.proxy_tree = ttk.Treeview(
-            proxy_table_frame,
-            columns=("ID", "Name", "Type", "Endpoint", "Status", "Country", "Assigned", "Failures", "Banned", "Ban Until"),
-            show="headings",
-            selectmode="browse",
-        )
-        for col, width in [
-            ("ID", 60),
-            ("Name", 140),
-            ("Type", 90),
-            ("Endpoint", 210),
-            ("Status", 90),
-            ("Country", 90),
-            ("Assigned", 80),
-            ("Failures", 80),
-            ("Banned", 75),
-            ("Ban Until", 160),
-        ]:
-            self.proxy_tree.heading(col, text=col)
-            self.proxy_tree.column(col, width=width, anchor=tk.W)
-        proxy_vsb = ttk.Scrollbar(proxy_table_frame, orient="vertical", command=self.proxy_tree.yview)
-        proxy_hsb = ttk.Scrollbar(proxy_table_frame, orient="horizontal", command=self.proxy_tree.xview)
-        self.proxy_tree.configure(yscrollcommand=proxy_vsb.set, xscrollcommand=proxy_hsb.set)
-        self.proxy_tree.grid(row=0, column=0, sticky="nsew")
-        proxy_vsb.grid(row=0, column=1, sticky="ns")
-        proxy_hsb.grid(row=1, column=0, sticky="ew")
-        self.proxy_tree.bind("<<TreeviewSelect>>", self._on_proxy_selected)
-
-        proxy_form = ttk.LabelFrame(proxies_tab, text="Proxy Details")
-        proxy_form.grid(row=0, column=1, sticky="nsew")
-        proxy_form.columnconfigure(1, weight=1)
-
-        proxy_labels = [
-            ("Name", "name"),
-            ("Type", "proxy_type"),
-            ("Host", "host"),
-            ("Port", "port"),
-            ("Username", "username"),
-            ("Password", "password"),
-            ("Country", "country"),
-            ("Status", "status"),
-            ("Notes", "notes"),
-        ]
-        row = 0
-        for text, key in proxy_labels:
-            ttk.Label(proxy_form, text=f"{text}:").grid(row=row, column=0, sticky="w", padx=8, pady=6)
-            if key == "proxy_type":
-                widget = ttk.Combobox(
-                    proxy_form,
-                    textvariable=self.proxy_form_vars[key],
-                    values=["http", "https", "socks5"],
-                    state="readonly",
-                )
-            elif key == "status":
-                widget = ttk.Combobox(
-                    proxy_form,
-                    textvariable=self.proxy_form_vars[key],
-                    values=["active", "cooldown", "banned"],
-                    state="readonly",
-                )
-            elif key == "password":
-                widget = ttk.Entry(proxy_form, textvariable=self.proxy_form_vars[key], show="*")
-            else:
-                widget = ttk.Entry(proxy_form, textvariable=self.proxy_form_vars[key])
-            widget.grid(row=row, column=1, sticky="ew", padx=8, pady=6)
-            row += 1
-
-        proxy_buttons = ttk.Frame(proxy_form)
-        proxy_buttons.grid(row=row, column=0, columnspan=2, sticky="ew", padx=8, pady=10)
-        proxy_buttons.columnconfigure(0, weight=1)
-        proxy_buttons.columnconfigure(1, weight=1)
-
-        ttk.Button(proxy_buttons, text="New / Clear", command=self._clear_proxy_form).grid(row=0, column=0, sticky="ew", padx=4)
-        ttk.Button(proxy_buttons, text="Save Proxy", command=self._save_proxy).grid(row=0, column=1, sticky="ew", padx=4)
-        ttk.Button(proxy_buttons, text="Delete Proxy", command=self._delete_selected_proxy).grid(row=1, column=0, columnspan=2, sticky="ew", padx=4, pady=(8, 0))
-        ttk.Button(proxy_buttons, text="Fetch From API", command=self._fetch_proxies_from_api).grid(
-            row=2, column=0, columnspan=2, sticky="ew", padx=4, pady=(8, 0)
-        )
-        ttk.Button(proxy_buttons, text="Paste cURL / Proxy", command=self._import_proxies_from_text_prompt).grid(
-            row=3, column=0, columnspan=2, sticky="ew", padx=4, pady=(8, 0)
-        )
-        ttk.Button(proxy_buttons, text="Import TXT/CSV (SOCKS5)", command=self._import_proxies_from_file_prompt).grid(
-            row=4, column=0, columnspan=2, sticky="ew", padx=4, pady=(8, 0)
-        )
-        ttk.Button(proxy_buttons, text="Refresh Proxy Stats", command=lambda: self._refresh_proxy_tree(show_proxy_stats_error=True)).grid(
-            row=5, column=0, sticky="ew", padx=4, pady=(8, 0)
-        )
-        ttk.Button(proxy_buttons, text="Reset Selected Proxy Ban", command=self._reset_selected_proxy_ban).grid(
-            row=5, column=1, sticky="ew", padx=4, pady=(8, 0)
-        )
-
         vps_tab = ttk.Frame(notebook)
         notebook.add(vps_tab, text="VPS Scrapers")
         vps_tab.columnconfigure(0, weight=1)
@@ -6451,6 +6409,78 @@ PY
         ttk.Button(conn_actions, text="Stop Scrapers", command=self.stop_server_scrapers).grid(
             row=0, column=4, sticky="ew", padx=4
         )
+        ttk.Button(conn_actions, text="Add/Edit Route", command=self._show_vps_route_editor).grid(
+            row=0, column=5, sticky="ew", padx=4
+        )
+
+        # -----------------------------
+        # Dolphin Profiles Tab
+        # -----------------------------
+        dolphin_tab = ttk.Frame(notebook)
+        notebook.add(dolphin_tab, text="Dolphin Profiles")
+        dolphin_tab.columnconfigure(0, weight=1)
+        dolphin_tab.rowconfigure(0, weight=1)
+
+        dolphin_table_frame = ttk.Frame(dolphin_tab)
+        dolphin_table_frame.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        dolphin_table_frame.rowconfigure(0, weight=1)
+        dolphin_table_frame.columnconfigure(0, weight=1)
+
+        self.dolphin_tree = ttk.Treeview(
+            dolphin_table_frame,
+            columns=("ID", "Name", "Intervention Req", "Status", "Browser", "Tags", "Memory"),
+            show="headings",
+            selectmode="extended",
+        )
+        for col, width in [
+            ("ID", 80),
+            ("Name", 180),
+            ("Intervention Req", 120),
+            ("Status", 100),
+            ("Browser", 120),
+            ("Tags", 150),
+            ("Memory", 80),
+        ]:
+            self.dolphin_tree.heading(col, text=col)
+            self.dolphin_tree.column(col, width=width, anchor=tk.W)
+            
+        dolphin_vsb = ttk.Scrollbar(dolphin_table_frame, orient="vertical", command=self.dolphin_tree.yview)
+        dolphin_hsb = ttk.Scrollbar(dolphin_table_frame, orient="horizontal", command=self.dolphin_tree.xview)
+        self.dolphin_tree.configure(yscrollcommand=dolphin_vsb.set, xscrollcommand=dolphin_hsb.set)
+        self.dolphin_tree.grid(row=0, column=0, sticky="nsew")
+        dolphin_vsb.grid(row=0, column=1, sticky="ns")
+        dolphin_hsb.grid(row=1, column=0, sticky="ew")
+
+        # Dolphin Anty API Configuration
+        dolphin_key_frame = ttk.LabelFrame(dolphin_tab, text="Dolphin Anty API Configuration")
+        dolphin_key_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
+        dolphin_key_frame.columnconfigure(1, weight=1)
+        dolphin_key_frame.columnconfigure(3, weight=1)
+        
+        ttk.Label(dolphin_key_frame, text="API Key:").grid(row=0, column=0, sticky="w", padx=8, pady=6)
+        dolphin_key_entry = ttk.Entry(dolphin_key_frame, textvariable=self.scraper_setting_vars.setdefault("dolphin_api_key", tk.StringVar(value=self._get_scraper_setting("dolphin_api_key", ""))), show="*")
+        dolphin_key_entry.grid(row=0, column=1, sticky="ew", padx=8, pady=6)
+
+        ttk.Label(dolphin_key_frame, text="API URL:").grid(row=0, column=2, sticky="w", padx=8, pady=6)
+        dolphin_url_entry = ttk.Entry(dolphin_key_frame, textvariable=self.scraper_setting_vars.setdefault("dolphin_api_url", tk.StringVar(value=self._get_scraper_setting("dolphin_api_url", "http://localhost:3001"))))
+        dolphin_url_entry.grid(row=0, column=3, sticky="ew", padx=8, pady=6)
+
+        ttk.Button(
+            dolphin_key_frame,
+            text="Save Settings",
+            command=lambda: [
+                self._set_scraper_setting("dolphin_api_key", self.scraper_setting_vars["dolphin_api_key"].get().strip()),
+                self._set_scraper_setting("dolphin_api_url", self.scraper_setting_vars["dolphin_api_url"].get().strip() or "http://localhost:3001"),
+                self.status_bar.config(text="Dolphin API settings saved.")
+            ]
+        ).grid(row=0, column=4, sticky="e", padx=8, pady=6)
+
+        dolphin_buttons = ttk.Frame(dolphin_tab)
+        dolphin_buttons.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
+        
+        ttk.Button(dolphin_buttons, text="Fetch Profiles", command=self._refresh_dolphin_profiles).pack(side=tk.LEFT, padx=5)
+        ttk.Button(dolphin_buttons, text="Start Selected", command=self._start_selected_dolphin_profiles).pack(side=tk.LEFT, padx=5)
+        ttk.Button(dolphin_buttons, text="Stop Selected", command=self._stop_selected_dolphin_profiles).pack(side=tk.LEFT, padx=5)
 
         accessory_frame = ttk.LabelFrame(vps_inner, text="Accessory Filter (Auto Exclusion)")
         accessory_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
@@ -6493,56 +6523,20 @@ PY
             table_frame,
             columns=(
                 "Worker",
-                "Route",
-                "Interval(s)",
-                "Enabled",
-                "Status",
-                "Login Req",
-                "Scraped (1m)",
-                "Lease",
-                "Cooldown",
-                "Last Run",
                 "Profile",
-                "Proxy Mode",
-                "Proxy",
-                "Queries",
+                "Status",
+                "Scraped (1m)",
+                "Last run",
             ),
             show="headings",
             selectmode="browse",
         )
-        self.vps_scraper_tree.configure(
-            displaycolumns=(
-                "Worker",
-                "Route",
-                "Interval(s)",
-                "Profile",
-                "Proxy Mode",
-                "Proxy",
-                "Queries",
-                "Enabled",
-                "Status",
-                "Login Req",
-                "Scraped (1m)",
-                "Lease",
-                "Cooldown",
-                "Last Run",
-            )
-        )
         for col, width in [
-            ("Worker", 110),
-            ("Route", 120),
-            ("Interval(s)", 95),
-            ("Enabled", 70),
-            ("Status", 90),
-            ("Login Req", 85),
-            ("Scraped (1m)", 110),
-            ("Lease", 220),
-            ("Cooldown", 140),
-            ("Last Run", 150),
-            ("Profile", 190),
-            ("Proxy Mode", 110),
-            ("Proxy", 210),
-            ("Queries", 220),
+            ("Worker", 160),
+            ("Profile", 260),
+            ("Status", 180),
+            ("Scraped (1m)", 140),
+            ("Last run", 180),
         ]:
             self.vps_scraper_tree.heading(col, text=col)
             self.vps_scraper_tree.column(col, width=width, anchor=tk.W)
@@ -6554,85 +6548,81 @@ PY
         vps_hsb.grid(row=1, column=0, sticky="ew")
         self.vps_scraper_tree.bind("<<TreeviewSelect>>", self._on_vps_scraper_selected)
 
-        form = ttk.LabelFrame(content, text="VPS Scraper Route")
-        form.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
-        form.columnconfigure(1, weight=1)
-
-        route_fields = [
-            ("Worker Name (optional, auto)", "worker_name"),
-            ("Route Name", "route_name"),
-            ("Route Interval (seconds, optional)", "route_interval_seconds"),
-            ("Profile Dir", "user_data_dir"),
-            ("Proxy Profile", "proxy_profile"),
-            ("Proxy Mode", "proxy_mode"),
-            ("Proxy Server", "proxy_server"),
-            ("Proxy Username", "proxy_username"),
-            ("Proxy Password", "proxy_password"),
-            ("Proxy Pool (CSV/Newline)", "proxy_pool"),
-            ("Query Shard CSV (optional)", "search_queries"),
-            ("Enabled (1/0)", "is_enabled"),
-            ("Priority", "priority"),
-            ("Manual Login Required (1/0)", "manual_login_required"),
-        ]
-        for row, (label, key) in enumerate(route_fields):
-            ttk.Label(form, text=f"{label}:").grid(row=row, column=0, sticky="w", padx=8, pady=6)
-            if key == "proxy_profile":
-                widget = ttk.Combobox(form, textvariable=self.vps_scraper_form_vars[key], state="readonly")
-                self.vps_scraper_form_vars["proxy_profile_widget"] = widget
-                widget.bind("<<ComboboxSelected>>", self._on_vps_proxy_profile_selected)
-            elif key == "proxy_mode":
-                widget = ttk.Combobox(
-                    form,
-                    textvariable=self.vps_scraper_form_vars[key],
-                    values=["fixed", "auto_rotation"],
-                    state="readonly",
-                )
-            elif key == "proxy_password":
-                widget = ttk.Entry(form, textvariable=self.vps_scraper_form_vars[key], show="*")
-            else:
-                widget = ttk.Entry(form, textvariable=self.vps_scraper_form_vars[key])
-                if key == "worker_name":
-                    widget.bind("<FocusOut>", self._on_vps_worker_name_focus_out)
-            widget.grid(row=row, column=1, sticky="ew", padx=8, pady=6)
-
-        actions = ttk.Frame(form)
-        actions.grid(row=len(route_fields), column=0, columnspan=2, sticky="ew", padx=8, pady=10)
-        actions.columnconfigure(0, weight=1)
-        actions.columnconfigure(1, weight=1)
-        actions.columnconfigure(2, weight=1)
-
-        ttk.Button(actions, text="New / Clear", command=self._clear_vps_scraper_form).grid(row=0, column=0, sticky="ew", padx=4)
-        ttk.Button(actions, text="Save Route", command=self._save_vps_scraper_route).grid(row=0, column=1, sticky="ew", padx=4)
-        ttk.Button(actions, text="Delete Route", command=self._delete_selected_vps_scraper_route).grid(row=0, column=2, sticky="ew", padx=4)
-        ttk.Button(actions, text="Apply Proxy Profile", command=self._apply_selected_proxy_profile).grid(
-            row=1, column=0, sticky="ew", padx=4, pady=(8, 0)
-        )
-        ttk.Button(actions, text="Import Pool TXT/CSV", command=self._import_proxy_pool_from_file_prompt).grid(
-            row=1, column=1, sticky="ew", padx=4, pady=(8, 0)
-        )
-        ttk.Button(actions, text="Manual Login (SOCKS5)", command=self._start_vps_manual_login).grid(
-            row=1, column=2, sticky="ew", padx=4, pady=(8, 0)
-        )
-        ttk.Button(actions, text="Retest Route", command=self._request_vps_route_retest).grid(
-            row=2, column=0, sticky="ew", padx=4, pady=(8, 0)
-        )
-        ttk.Button(actions, text="Bulk Clear Login Locks", command=self._bulk_clear_vps_worker_manual_login).grid(
-            row=2, column=1, columnspan=2, sticky="ew", padx=4, pady=(8, 0)
-        )
-
-        ttk.Label(
-            form,
-            text=(
-                "Routes are loaded from API. Leave Worker Name blank for automatic assignment. "
-                "Use auto_rotation with proxy pool or fixed with a single proxy server."
-            ),
-            wraplength=700,
-        ).grid(row=len(route_fields) + 1, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 0))
-
-        self._refresh_proxy_tree()
-        self._clear_proxy_form()
         self._refresh_vps_scraper_tree(preserve_selection=False)
+        self._refresh_dolphin_profiles()
         self._clear_vps_scraper_form()
+
+    def _show_vps_route_editor(self, event=None):
+        """Open a modal popup to add or edit a VPS Scraper route."""
+        editor = tk.Toplevel(self.settings_window)
+        editor.title("VPS Route Settings")
+        editor.geometry("450x640")
+        editor.grab_set()
+
+        form_frame = ttk.Frame(editor, padding=10)
+        form_frame.pack(fill=tk.BOTH, expand=True)
+
+        fields = [
+            ("Worker Name (e.g., worker_1)", "worker_name"),
+            ("Profile Name/ID (e.g., profile_29)", "user_data_dir"),
+            ("Route Name (Identifier)", "route_name"),
+            ("Scrape Search Queries (CSV)", "search_queries"),
+        ]
+
+        # Use defaults if nothing is selected
+        if not self.selected_vps_scraper_key:
+            self._clear_vps_scraper_form()
+
+        # Generate inputs
+        for idx, (label, key) in enumerate(fields):
+            ttk.Label(form_frame, text=label + ":").pack(anchor="w", pady=(8, 2))
+            ttk.Entry(form_frame, textvariable=self.vps_scraper_form_vars[key]).pack(fill="x")
+
+        ttk.Label(form_frame, text="Proxy Profile:").pack(anchor="w", pady=(8, 2))
+        proxy_dropdown = ttk.Combobox(
+            form_frame,
+            textvariable=self.vps_scraper_form_vars["proxy_profile"],
+            state="readonly",
+        )
+        proxy_dropdown["values"] = list(self.vps_proxy_profile_options.keys()) + ["Custom (manual proxy)"]
+        proxy_dropdown.pack(fill="x")
+
+        # Custom Proxy Overrides
+        custom_frame = ttk.LabelFrame(form_frame, text="Custom Proxy Override (IP:PORT)")
+        custom_frame.pack(fill="x", pady=(10, 0), ipady=5)
+        ttk.Entry(custom_frame, textvariable=self.vps_scraper_form_vars["proxy_server"]).pack(fill="x", padx=5, pady=5)
+        
+        ttk.Checkbutton(
+            form_frame,
+            text="Enable Route",
+            variable=self.vps_scraper_form_vars["is_enabled"],
+            onvalue="1",
+            offvalue="0"
+        ).pack(anchor="w", pady=(10, 0))
+
+        ttk.Checkbutton(
+            form_frame,
+            text="Force Manual Login Required",
+            variable=self.vps_scraper_form_vars["manual_login_required"],
+            onvalue="1",
+            offvalue="0"
+        ).pack(anchor="w", pady=(5, 0))
+
+        # Actions
+        btn_frame = ttk.Frame(form_frame)
+        btn_frame.pack(fill="x", pady=20)
+        
+        def save_and_close():
+            self._save_vps_scraper_route(allow_remap=True)
+            editor.destroy()
+            
+        def delete_and_close():
+            self._delete_vps_scraper_route()
+            editor.destroy()
+
+        ttk.Button(btn_frame, text="Save Route", command=save_and_close).pack(side=tk.LEFT, expand=True, padx=2)
+        ttk.Button(btn_frame, text="Delete Route", command=delete_and_close).pack(side=tk.LEFT, expand=True, padx=2)
+        ttk.Button(btn_frame, text="Cancel", command=editor.destroy).pack(side=tk.LEFT, expand=True, padx=2)
 
     # ===== Price Sheet Functions =====
 
@@ -6951,6 +6941,300 @@ PY
         text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         text.insert(1.0, guide_text)
         text.config(state=tk.DISABLED)
+
+    def _get_dolphin_api_key(self) -> str:
+        """Get the dolphin API key, preferring the live GUI value."""
+        if hasattr(self, "scraper_setting_vars") and "dolphin_api_key" in self.scraper_setting_vars:
+            return self.scraper_setting_vars["dolphin_api_key"].get().strip()
+        return self._get_scraper_setting("dolphin_api_key", "").strip()
+
+    def _dolphin_auth_headers(self) -> dict:
+        """Build the Authorization header for Dolphin Anty API requests."""
+        api_key = self._get_dolphin_api_key()
+        if api_key:
+            return {"Authorization": f"Bearer {api_key}"}
+        return {}
+
+    def _ensure_dolphin_logged_in(self) -> bool:
+        """Log in to the Dolphin Anty local API using login-with-token.
+        
+        The Dolphin Anty desktop app exposes a local API that requires a
+        session login via POST /v1.0/auth/login-with-token before it will
+        accept other API calls.  This method performs that login and waits
+        a moment for the app to establish its session.
+        Returns True on success, False on failure.
+        """
+        api_url = self._get_dolphin_api_url()
+        api_key = self._get_dolphin_api_key()
+        
+        if not api_key:
+            return True  # No key configured, let the request fail naturally
+        
+        # Quick check: does the API already accept requests?
+        try:
+            probe = requests.get(f"{api_url}/v1.0/browser_profiles", headers=self._dolphin_auth_headers(), timeout=5)
+            if probe.status_code == 200:
+                return True  # Already logged in
+        except Exception:
+            pass
+        
+        # Not logged in — call login-with-token
+        self.status_bar.config(text="Logging in to Dolphin Anty…")
+        self.root.update_idletasks()
+        
+        try:
+            login_resp = requests.post(
+                f"{api_url}/v1.0/auth/login-with-token",
+                json={"token": api_key},
+                timeout=10,
+            )
+            login_data = login_resp.json() if login_resp.status_code == 200 else {}
+            
+            if login_data.get("success"):
+                import time
+                time.sleep(3)  # Give the app time to establish the session
+                self.status_bar.config(text="Dolphin Anty login successful ✓")
+                return True
+            else:
+                err = login_data.get("error", f"HTTP {login_resp.status_code}")
+                self.status_bar.config(text=f"Dolphin login failed: {err}")
+                return False
+        except Exception as e:
+            self.status_bar.config(text=f"Dolphin login error: {e}")
+            return False
+        
+    def _get_dolphin_api_url(self) -> str:
+        """Get the base Dolphin Anty API URL, defaulting to localhost:3001 if empty."""
+        # Prefer live GUI value if available, else fallback to DB
+        if hasattr(self, "scraper_setting_vars") and "dolphin_api_url" in self.scraper_setting_vars:
+            url = self.scraper_setting_vars["dolphin_api_url"].get().strip()
+        else:
+            url = self._get_scraper_setting("dolphin_api_url", "http://localhost:3001").strip()
+            
+        url = url.rstrip("/")
+        if not url:
+            url = "http://localhost:3001"
+            
+        if not url.startswith("http"):
+            url = "http://" + url
+            
+        return url
+
+    def _ensure_dolphin_ssh_tunnel(self) -> bool:
+        """Ensure an SSH tunnel is open for Dolphin Anty API access.
+        
+        If the configured Dolphin API URL targets localhost:3001 and port 3001
+        is not reachable, automatically create an SSH tunnel to the VPS.
+        Returns True if the API should be reachable, False if tunnel setup failed.
+        """
+        import socket
+        
+        api_url = self._get_dolphin_api_url()
+        
+        # Only auto-tunnel when targeting localhost:3001
+        if "localhost:3001" not in api_url and "127.0.0.1:3001" not in api_url:
+            return True
+        
+        # Quick check: is port 3001 already reachable?
+        try:
+            with socket.create_connection(("127.0.0.1", 3001), timeout=1):
+                return True
+        except (ConnectionRefusedError, OSError, socket.timeout):
+            pass
+        
+        # Port not reachable — try to create SSH tunnel
+        ssh_host = self._get_scraper_setting("server_ssh_host", "").strip()
+        ssh_user = self._get_scraper_setting("server_ssh_user", "ubuntu").strip()
+        
+        if not ssh_host:
+            self.status_bar.config(text="⚠ No SSH host configured. Set server_ssh_host in Settings.")
+            return False
+        
+        self.status_bar.config(text=f"Opening SSH tunnel to {ssh_host}:3001…")
+        self.root.update_idletasks()
+        
+        try:
+            proc = subprocess.Popen(
+                [
+                    "ssh",
+                    "-L", "3001:127.0.0.1:3001",
+                    f"{ssh_user}@{ssh_host}",
+                    "-N",                       # no remote command
+                    "-f",                        # go to background
+                    "-o", "StrictHostKeyChecking=no",
+                    "-o", "ConnectTimeout=8",
+                    "-o", "ExitOnForwardFailure=yes",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            _, stderr = proc.communicate(timeout=12)
+            
+            if proc.returncode != 0:
+                err_msg = stderr.decode(errors="replace").strip()
+                self.status_bar.config(text=f"SSH tunnel failed: {err_msg}")
+                return False
+            
+            # Give the tunnel a moment to become ready
+            import time
+            for _ in range(5):
+                try:
+                    with socket.create_connection(("127.0.0.1", 3001), timeout=1):
+                        self.status_bar.config(text="SSH tunnel established ✓")
+                        return True
+                except (ConnectionRefusedError, OSError, socket.timeout):
+                    time.sleep(0.5)
+            
+            self.status_bar.config(text="SSH tunnel started but port 3001 not yet reachable.")
+            return True  # Let the actual API call try anyway
+            
+        except subprocess.TimeoutExpired:
+            self.status_bar.config(text="SSH tunnel timed out.")
+            return False
+        except FileNotFoundError:
+            self.status_bar.config(text="SSH not found. Install OpenSSH.")
+            return False
+        except Exception as e:
+            self.status_bar.config(text=f"SSH tunnel error: {e}")
+            return False
+
+    def _refresh_dolphin_profiles(self):
+        """Fetch profiles from the Dolphin Anty Cloud API and populate the tree."""
+        if not hasattr(self, "dolphin_tree") or not self.dolphin_tree:
+            return
+        
+        # Cloud API is used for listing profiles (no SSH tunnel needed)
+        CLOUD_API = "https://anty-api.com"
+            
+        try:
+            headers = self._dolphin_auth_headers()
+            if not headers:
+                messagebox.showerror("Error", "No Dolphin API Key configured. Enter your API key in Settings.")
+                return
+            
+            resp = requests.get(f"{CLOUD_API}/browser_profiles", headers=headers, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                profiles = data.get("data", [])
+                
+                # Clear existing
+                for row_id in self.dolphin_tree.get_children():
+                    self.dolphin_tree.delete(row_id)
+                
+                for p in profiles:
+                    pid = p.get("id")
+                    name = p.get("name", "")
+                    tags = ", ".join(p.get("tags", []))
+                    browser_type = p.get("browserType", "")
+                    memory = p.get("memory", {}).get("value", "")
+                    
+                    # Extract status from profile data
+                    status_info = p.get("status", {})
+                    status = status_info.get("name", "Ready") if isinstance(status_info, dict) else "Ready"
+                    
+                    intervention_req = "Yes" if "MANUAL" in name.upper() or "LOGIN" in name.upper() else "No"
+                    
+                    self.dolphin_tree.insert(
+                        "",
+                        tk.END,
+                        iid=str(pid),
+                        text=str(pid),
+                        values=(pid, name, intervention_req, status, browser_type, tags, memory)
+                    )
+                
+                self.status_bar.config(text=f"Fetched {len(profiles)} Dolphin profiles.")
+            elif resp.status_code == 401:
+                messagebox.showerror("Error", "Invalid API Key. Go to Dolphin Anty → API section to get a valid token.")
+            else:
+                messagebox.showerror("Error", f"Failed to fetch profiles. Status: {resp.status_code}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to contact Dolphin Anty Cloud API.\n\nDetails: {e}")
+
+    def _start_selected_dolphin_profiles(self):
+        """Start the selected Dolphin Anty profiles on the local machine."""
+        if not hasattr(self, "dolphin_tree") or not self.dolphin_tree:
+            return
+        
+        if not self._ensure_dolphin_ssh_tunnel():
+            return
+            
+        selected = self.dolphin_tree.selection()
+        if not selected:
+            messagebox.showinfo("Info", "No profiles selected.")
+            return
+            
+        started = 0
+        errors = []
+        for item_id in selected:
+            profile_id = self.dolphin_tree.item(item_id, "values")[0]
+            try:
+                api_url = self._get_dolphin_api_url()
+                resp = requests.get(f"{api_url}/v1.0/browser_profiles/{profile_id}/start?automation=1", headers=self._dolphin_auth_headers(), timeout=15)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("success"):
+                        started += 1
+                        # Update status in tree if successful
+                        current_values = list(self.dolphin_tree.item(item_id, "values"))
+                        current_values[2] = f"Running (Port: {data.get('automation', {}).get('port', 'Unknown')})"
+                        self.dolphin_tree.item(item_id, values=current_values)
+                    else:
+                        errors.append(f"Profile {profile_id}: {data.get('msg', 'Unknown error')}")
+                else:
+                    errors.append(f"Profile {profile_id}: HTTP {resp.status_code}")
+            except Exception as e:
+                errors.append(f"Profile {profile_id}: {e}")
+                
+        if errors:
+            error_msg = "\n".join(errors[:5])
+            if len(errors) > 5:
+                error_msg += f"\n... and {len(errors) - 5} more."
+            messagebox.showerror("Dolphin Start Errors", f"Failed to start some profiles:\n{error_msg}")
+            
+        self.status_bar.config(text=f"Sent start command to {started} profiles.")
+
+    def _stop_selected_dolphin_profiles(self):
+        """Stop the selected Dolphin Anty profiles."""
+        if not hasattr(self, "dolphin_tree") or not self.dolphin_tree:
+            return
+        
+        if not self._ensure_dolphin_ssh_tunnel():
+            return
+            
+        selected = self.dolphin_tree.selection()
+        if not selected:
+            messagebox.showinfo("Info", "No profiles selected.")
+            return
+            
+        stopped = 0
+        errors = []
+        for item_id in selected:
+            profile_id = self.dolphin_tree.item(item_id, "values")[0]
+            try:
+                api_url = self._get_dolphin_api_url()
+                resp = requests.get(f"{api_url}/v1.0/browser_profiles/{profile_id}/stop", headers=self._dolphin_auth_headers(), timeout=15)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("success"):
+                        stopped += 1
+                        # Update status in tree
+                        current_values = list(self.dolphin_tree.item(item_id, "values"))
+                        current_values[2] = "Stopped"
+                        self.dolphin_tree.item(item_id, values=current_values)
+                    else:
+                        errors.append(f"Profile {profile_id}: {data.get('msg', 'Unknown error')}")
+                else:
+                    errors.append(f"Profile {profile_id}: HTTP {resp.status_code}")
+            except Exception as e:
+                errors.append(f"Profile {profile_id}: {e}")
+                
+        if errors:
+            error_msg = "\n".join(errors[:5])
+            if len(errors) > 5:
+                error_msg += f"\n... and {len(errors) - 5} more."
+            messagebox.showerror("Dolphin Stop Errors", f"Failed to stop some profiles:\n{error_msg}")
+                
+        self.status_bar.config(text=f"Sent stop command to {stopped} profiles.")
 
 
 def main():

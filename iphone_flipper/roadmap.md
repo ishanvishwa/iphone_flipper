@@ -1,16 +1,19 @@
 # iPhone Flipper Roadmap
 
 ## Document Intent
+
 This roadmap is a comprehensive implementation plan that combines:
+
 - Baseline product goals
 - Completed work already delivered in code
 - Additional/manual enhancements discovered during code audit
 - Remaining work needed for stability, condition accuracy, and safe automation
 
 Audit date: **2026-02-10**
-Last implementation update: **2026-02-16**
+Last implementation update: **2026-02-20**
 
 ## Roadmap Structure
+
 - Phase 0: Foundation and Stabilization
 - Phase 1: Discovery and Evaluation Engine
 - Phase 2: Negotiation and Conversion Intelligence
@@ -25,10 +28,12 @@ Last implementation update: **2026-02-16**
 ## Phase 0: Foundation and Stabilization
 
 ### Goals
+
 - Ensure local-first workflow is runnable and understandable
 - Establish persistent data model and auth setup flow
 
 ### Completed
+
 - [x] Core CLI entrypoint with command suite (`main.py`)
 - [x] SQLite initialization and schema migrations (`scraper.py`, `deal_tracker.py`)
 - [x] Persistence schema for multi-account/proxy operations (`fb_accounts`, `proxies`, `scraper_settings`)
@@ -39,6 +44,7 @@ Last implementation update: **2026-02-16**
 - [x] Launch entrypoint for GUI (`run_gui.py`)
 
 ### Remaining
+
 - [ ] Add startup diagnostics check (DB writable, price sheet valid, auth present)
 - [ ] Add schema version table for explicit DB migration tracking
 
@@ -47,10 +53,12 @@ Last implementation update: **2026-02-16**
 ## Phase 1: Discovery and Evaluation Engine
 
 ### Goals
+
 - Find relevant listings reliably
 - Estimate model/condition/profit quickly
 
 ### Completed
+
 - [x] Playwright persistent profile scraping with anti-detection behaviors
 - [x] Query expansion for iPhone 12–15 + damage terms
 - [x] Dedupe across query runs by listing ID
@@ -73,6 +81,7 @@ Last implementation update: **2026-02-16**
 - [x] Scraper query source moved to DB-backed active `search_queries` with fallback defaults
 
 ### Additional Implemented (Audit-Detected, previously not in original roadmap)
+
 - [x] More inclusive persistence of non-profitable/unclassified listings instead of dropping them
 - [x] Scraper progress event stream for query-level UI telemetry
 - [x] Cooperative stop/cancel mechanism for long scrape runs
@@ -83,8 +92,16 @@ Last implementation update: **2026-02-16**
 - [x] Progressive scroll-depth loading to move beyond initial card batch (configurable target cards + max rounds)
 - [x] Virtualized-feed-safe DOM accumulation across scroll snapshots (not only final viewport extraction)
 - [x] Marketplace feed container-aware scrolling fallback (feed scroller + mouse-wheel) for deeper page traversal
+- [x] Scraper module refactored from monolithic `scraper.py` into structured package (`scraper/`) with backward-compatible re-exports:
+  - [x] `scraper/config.py` — constants and environment variable parsing
+  - [x] `scraper/storage.py` — database operations and persistence
+  - [x] `scraper/parsers.py` — model/condition/price parsing and accessory detection
+  - [x] `scraper/proxy.py` — proxy bridge and Playwright proxy configuration
+  - [x] `scraper/browser.py` — stealth scripts and browser context launcher
+  - [x] `scraper/core.py` — `scrape_marketplace()`, financial recalculation, accessory purge
 
 ### Remaining
+
 - [ ] Add detail-page selective fetch for low-confidence listings
 - [ ] Add pricing anomaly detector (too-low/too-high outliers)
 - [ ] Add duplicate URL fingerprinting beyond listing ID (future-proofing)
@@ -96,10 +113,12 @@ Last implementation update: **2026-02-16**
 ## Phase 2: Negotiation and Conversion Intelligence
 
 ### Goals
+
 - Assist operator with high-quality replies
 - Learn from actual outcomes
 
 ### Completed
+
 - [x] Negotiation generation (initial, response, offer)
 - [x] Provider abstraction (Gemini/OpenAI)
 - [x] Conversation persistence and analysis flow
@@ -110,6 +129,7 @@ Last implementation update: **2026-02-16**
 - [x] Daily summary broadcast command (`summary`) for operational reporting
 
 ### Remaining
+
 - [ ] Add explicit negotiation state machine transitions (deterministic)
 - [ ] Add guardrails to block unsafe suggestions at runtime
 - [ ] Add confidence-weighted conversion score components
@@ -119,10 +139,12 @@ Last implementation update: **2026-02-16**
 ## Phase 3: GUI and Operator Experience
 
 ### Goals
+
 - Provide complete control plane via GUI
 - Remove dependency on CLI for daily operations
 
 ### Completed
+
 - [x] Multi-tab GUI (Listings, Negotiation, Deals)
 - [x] Menu architecture (File, Scraper, Analytics, Price Sheet, Help)
 - [x] Settings menu with GUI manager for:
@@ -159,6 +181,7 @@ Last implementation update: **2026-02-16**
 - [x] In-app launch guide/help flow
 
 ### Additional Implemented (Audit-Detected, previously not in original roadmap)
+
 - [x] Default notification mode constrained to profitable subset (configurable via `notify_profitable_only`)
 - [x] Telegram listing notifications now support per-listing compact cards (title/model/price/profit/description/link)
 - [x] Scraper monitor launch from GUI (`main.py monitor` subprocess)
@@ -205,8 +228,21 @@ Last implementation update: **2026-02-16**
 - [x] Fixed API route upsert regression causing manual-login route save failures (`PUT /worker-routes/...` 500 after sticky-field schema expansion).
 - [x] Improved GUI VPS route-save diagnostics to surface HTTP status and API `detail` text for operator triage.
 - [x] Fixed worker cooldown-threshold enforcement to honor configured `WORKER_ROUTE_COOLDOWN_BAD_CYCLES` (no silent clamp) and seed bad-cycle tracking from DB `consecutive_failures` after restart.
+- [x] Added Dolphin Anty profile management tab in GUI Settings (`Connections & Scraper > Dolphin Profiles`):
+  - [x] Treeview table with profile columns (ID, Name, Status, Browser, Tags, Memory)
+  - [x] `Fetch Profiles` button queries Dolphin Anty local API and populates table
+  - [x] `Start Selected` / `Stop Selected` buttons for profile lifecycle control
+- [x] Added Dolphin Anty API Key integration:
+  - [x] `dolphin_api_key` setting with masked entry field and instant save
+  - [x] `_dolphin_auth_headers()` generates `Authorization: Bearer <key>` headers
+  - [x] All Dolphin API methods inject Bearer token automatically
+- [x] Added configurable Dolphin Anty API URL:
+  - [x] `dolphin_api_url` setting with default to `http://localhost:3001`
+  - [x] Profile fetching explicitly uses Cloud API (`https://anty-api.com`) to resolve VPS 401 auth issues
+  - [x] Start/Stop operations use the local `dolphin_api_url` via automatic SSH tunnel (`_ensure_dolphin_ssh_tunnel`)
 
 ### Remaining
+
 - [ ] Add explicit “Manual Review Queue” filter based on confidence/flags
 - [ ] Extend bulk actions with export/status-update flows (multi-select mark/delete now implemented)
 - [ ] Add column sorting controls and saved view presets
@@ -216,13 +252,16 @@ Last implementation update: **2026-02-16**
 ## Phase 4: Condition Intelligence Hardening (Priority)
 
 ### Why this phase
+
 Condition accuracy is a critical decision parameter and currently constrained by card-level text only.
 
 ### Objectives
+
 - Improve condition accuracy while minimizing Facebook account risk
 - Introduce automation-safe confidence gating
 
 ### Planned Tasks
+
 - [ ] Implement `condition_confidence` field (`high`, `medium`, `low`)
 - [ ] Emit evidence signals used for classification (matched keywords/source)
 - [ ] Add two-stage condition pipeline:
@@ -234,6 +273,7 @@ Condition accuracy is a critical decision parameter and currently constrained by
 - [ ] Add recalculation command to backfill confidence for existing rows
 
 ### Acceptance Criteria
+
 - Condition false-positive/false-negative rate materially reduced in sampled audits
 - Automation never auto-acts on `low` confidence listings
 - Scrape intensity remains under configured risk thresholds
@@ -243,10 +283,12 @@ Condition accuracy is a critical decision parameter and currently constrained by
 ## Phase 5: Reliability, Safety, and Scale
 
 ### Goals
+
 - Improve system reliability and operational safety
 - Reduce account-ban exposure under sustained runs
 
 ### Completed (This Update)
+
 - [x] Added worker runtime-compensated pacing (`sleep = max(0, interval - elapsed)`) with configurable jitter (`SCRAPE_INTERVAL_JITTER_PCT`).
 - [x] Added worker-level backoff scaling from eligible/enabled route ratio (capped multiplier) to protect surviving routes during low-capacity windows.
 - [x] Added structured JSON telemetry per worker cycle (`cycle_id`, `duration_ms`, `outcome`, `error_category`, `retry_count`).
@@ -270,8 +312,11 @@ Condition accuracy is a critical decision parameter and currently constrained by
 - [x] Added signal-detector unit tests (`server/tests/test_signal_detector.py`).
 - [x] Added runtime tests for proxy-mismatch classification/wait behavior (`server/tests/test_worker_runtime.py`).
 - [x] Added persona generation tests (`server/tests/test_persona.py`).
+- [x] Added stealth script fingerprint randomization to strengthen anti-detection against platform bans.
+- [x] Added enhanced soft-signals (`CONSECUTIVE_EMPTY_RESULTS`, `SESSION_TOO_LONG`) to the signal detector for safer proactive pausing.
 
 ### Remaining
+
 - [ ] Add broader automated tests for pricing, condition rules, DB/API integration, and migrations.
 - [ ] Extend pacing policies with explicit time windows and run-depth strategies.
 - [ ] Add secure secret handling guidance and hardening checks.
@@ -282,11 +327,13 @@ Condition accuracy is a critical decision parameter and currently constrained by
 ## Phase 5A: 24x7 Server and Real-Time Sync Migration (Approved Track)
 
 ### Goals
+
 - Move scraping to always-on VPS/server runtime
 - Deliver real-time listing writes and push-sync updates to desktop app
 - Scale account concurrency safely with account/proxy isolation
 
 ### Implemented Baseline (This Update)
+
 - [x] Split scraper runtime into long-lived worker service scaffolding deployable on VPS (`server/services/worker`)
 - [x] Introduced centralized server database schema baseline (`server/services/api/sql/001_init.sql`)
 - [x] Refactored ingest path from run-end batch commit to per-listing immediate persist (`scraper.py`)
@@ -338,6 +385,7 @@ Condition accuracy is a critical decision parameter and currently constrained by
 - [x] Added min-route resilience enforcement (API warnings for `<2` enabled routes and worker-side single-route rest multiplier).
 
 ### Remaining Tasks
+
 - [ ] Update desktop GUI sync model:
   - [x] initial snapshot load from server (`GET /listings?since_id=...`)
   - [x] reconnect + missed-event catch-up by persisted watermark cursor (`server_sync_since_id`)
@@ -357,16 +405,30 @@ Condition accuracy is a critical decision parameter and currently constrained by
   - [x] production TLS reverse proxy via Caddy on `443` (domain `api.iphoneguy.com.au`)
   - [x] host-level SSH/UFW/fail2ban hardening baseline applied on VPS
   - [x] structured per-cycle worker telemetry logs are now emitted in JSON
-- [ ] Add notification worker consuming server event stream (decoupled from GUI/CLI run completion)
+- [x] Add notification worker consuming server event stream (decoupled from GUI/CLI run completion)
+  - [x] standalone `notification_worker.py` subscribes to Redis `listing_events` pub/sub
+  - [x] priority-tier dispatch: instant (≥ $50 profit), fast-batch (≥ $0), suppressed (< $0)
+  - [x] Telegram + Firebase Cloud Messaging (FCM) push delivery
+  - [x] rate limiting (`NOTIFY_MAX_PER_MINUTE`) and deduplication (`NOTIFY_DEDUP_WINDOW_SECONDS`)
+  - [ ] wire into Docker Compose as production container service
+- [x] Add proxy provider real-time health monitor (`proxy_monitor.py`)
+  - [x] async polling of proxy gateway utilization API
+  - [x] pacing multiplier computation based on utilization/error-rate thresholds
+  - [x] Telegram degradation alerts with cooldown deduplication
+  - [ ] wire pacing multiplier into worker scrape-interval adjustment flow
 
 ### Operator Dependencies (User-Side Prerequisites)
+
 - [x] Provision VPS (recommended 4 vCPU / 8 GB RAM / 80+ GB disk) and secure SSH-only access
 - [x] Provision domain + TLS for API/WebSocket endpoint
 - [ ] Provision server database and provide credentials/secrets securely
-- [ ] Validate each FB account + SOCKS5 proxy pair on server-hosted browser profiles
-- [ ] Define concurrency and pacing limits (workers/account, query cap, delay floor/ceiling)
+- [x] Ensure Dolphin Anty desktop application is running (locally or on VPS) to allow API connections
+- [x] Configure headless autostart for Dolphin Anty and TigerVNC (`systemd`) on server reboots
+- [x] Validate each FB account + SOCKS5 proxy pair on server-hosted browser profiles (using Dolphin Anty profiles via CDP)
+- [x] Define concurrency and pacing limits (workers/account, query cap, delay floor/ceiling)
 
 ### Acceptance Criteria
+
 - New listings are inserted without waiting for entire scrape session completion
 - Desktop listing view updates within seconds of server-side ingest events
 - Server scraper processes run continuously with automatic restart on failure
@@ -377,6 +439,7 @@ Condition accuracy is a critical decision parameter and currently constrained by
 ## Phase 6: Strategic Expansion
 
 ### Candidate Enhancements (from baseline plan + audit)
+
 - [ ] Make.com integration for orchestrated workflows
 - [ ] Price trend and market analysis dashboards
 - [ ] Inventory lifecycle management after purchase
@@ -386,7 +449,9 @@ Condition accuracy is a critical decision parameter and currently constrained by
 ---
 
 ## Original Roadmap Drift Audit (Summary)
+
 The following significant enhancements were found in code but not reflected as explicit roadmap items in the original baseline:
+
 - GUI-integrated price sheet editor and full recalculation workflow
 - Scraper cancellation and live query-level progress reporting
 - User-applied listing color flags (`scam`, `interested`)
@@ -407,5 +472,8 @@ The following significant enhancements were found in code but not reflected as e
 
 These are now integrated into this roadmap as completed and maintained items.
 
+Note: Specifically, an external `patch_core.py` was used to dynamically patch `scraper/core.py` and extract some standalone functions to `scraper/legacy_utils.py` outside of the formal module refactor.
+
 ## Current Focus Recommendation
-Active priority should be **Phase 5A** (24x7 server + real-time sync migration), followed immediately by **Phase 4** (condition confidence + selective detail-page enrichment).
+
+Active priority should be **Phase 5A** (24x7 server + real-time sync migration), followed immediately by **Phase 4** (condition confidence + selective detail-page enrichment). Dolphin Anty VPS installation is a near-term operational dependency.

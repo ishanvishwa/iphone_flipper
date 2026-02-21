@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import hashlib
 import inspect
 import ipaddress
@@ -28,9 +29,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scraper import (  # noqa: E402
-    _start_local_socks5_auth_bridge,
-    cleanup_bridge_process,
-    init_db,
     is_accessory_only_listing,
     scrape_marketplace,
 )
@@ -437,9 +435,9 @@ def _parse_proxy_entry(raw_proxy: str | None, default_scheme: str = "socks5") ->
             return None
         return {
             "scheme": scheme,
-            "server": f"{scheme}://{parsed.hostname}:{int(parsed.port)}",
-            "username": unquote(parsed.username) if parsed.username else "",
-            "password": unquote(parsed.password) if parsed.password else "",
+            "server": f"{scheme}://{parsed.hostname}:{int(parsed.port or 0)}",
+            "username": unquote(str(parsed.username or "")) if parsed.username else "",
+            "password": unquote(str(parsed.password or "")) if parsed.password else "",
         }
 
     parts = [segment.strip() for segment in raw.split(":")]
@@ -615,14 +613,23 @@ def _build_quarantine_evidence(
             evidence["soft_signals"] = [str(item)[:100] for item in soft_signals if str(item).strip()]
         persona_payload = details.get("persona")
         if isinstance(persona_payload, dict):
+            viewport_w = persona_payload.get("viewport_width") or 0
+            viewport_h = persona_payload.get("viewport_height") or 0
+            timezone_id = str(persona_payload.get("timezone_id") or "").strip()[:64]
+            locale = str(persona_payload.get("locale") or "").strip()[:32]
+            color_scheme = str(persona_payload.get("color_scheme") or "").strip()[:16]
+            
+            try:
+                vw_int = int(viewport_w)
+                vh_int = int(viewport_h)
+            except (ValueError, TypeError):
+                vw_int, vh_int = 0, 0
+                
             evidence["persona"] = {
-                "viewport": (
-                    f"{int(persona_payload.get('viewport_width') or 0)}x"
-                    f"{int(persona_payload.get('viewport_height') or 0)}"
-                ),
-                "timezone_id": str(persona_payload.get("timezone_id") or "").strip()[:64],
-                "locale": str(persona_payload.get("locale") or "").strip()[:32],
-                "color_scheme": str(persona_payload.get("color_scheme") or "").strip()[:16],
+                "viewport": f"{vw_int}x{vh_int}",
+                "timezone_id": timezone_id,
+                "locale": locale,
+                "color_scheme": color_scheme,
             }
     return evidence
 
@@ -1767,29 +1774,14 @@ async def _build_playwright_proxy(
 
     clean_server = f"{scheme}://{parsed.hostname}:{parsed.port}"
 
-    if scheme == "socks5" and (username or password):
-        bridge_process, bridge_proxy = _start_local_socks5_auth_bridge(
-            {
-                "host": parsed.hostname,
-                "port": int(parsed.port),
-                "username": username,
-                "password": password,
-            }
-        )
-        return (
-            {"server": bridge_proxy},
-            bridge_process,
-            str(selected_proxy.get("proxy_id") or "").strip() or None,
-            proxy_key,
-            expected_proxy_ip,
-            proxy_geo_hint,
-        )
-
     proxy: dict[str, str] = {"server": clean_server}
     if username:
         proxy["username"] = username
     if password:
         proxy["password"] = password
+
+    # Bridge process is None since Dolphin Anty handles proxies internally per profile.
+    # The proxy lease logic is kept for telemetry, concurrency limits, and IP tracking.
     return (
         proxy,
         None,
@@ -1885,15 +1877,48 @@ async def _process_listing_event(
         metadata=metadata,
     )
     if _should_notify_telegram(created, listing):
-        await asyncio.to_thread(_send_telegram_listing_notification, listing)
+        await asyncio.get_running_loop().run_in_executor(
+            None, _send_telegram_listing_notification, listing
+        )
 
+
+BUCKET_BROAD = ["iPhone"]
+BUCKET_EXACT = ["iPhone 15 Pro Max", "iPhone 15 Pro", "iPhone 15", "iPhone 14 Pro Max", "iPhone 14 Pro", "iPhone 13 Pro Max", "iPhone 13 Pro"]
+BUCKET_FLIPPER = ["need gone iphone", "broken iphone", "cracked iphone", "unlocked iphone", "clean imei iphone", "iphone box alone", "icloud locked iphone"]
+BUCKET_MISSPELLING = ["i phone 13", "ipon 12", "i phone 11", "iphone 14 pro max cracked"]
+
+def _get_bucket_queries(num_queries: int = 3) -> list[str]:
+    buckets = [
+        (BUCKET_BROAD, 40),
+        (BUCKET_EXACT, 30),
+        (BUCKET_FLIPPER, 20),
+        (BUCKET_MISSPELLING, 10)
+    ]
+    selected_queries = set()
+    while len(selected_queries) < num_queries:
+        bucket_choices, weights = zip(*buckets)
+        chosen_bucket = random.choices(bucket_choices, weights=weights, k=1)[0]
+        query = random.choice(chosen_bucket)
+        selected_queries.add(query)
+        
+    query_list = list(selected_queries)
+    # Ensure "iPhone" (broad catch-all) is always first if selected
+    if "iPhone" in query_list:
+        query_list.remove("iPhone")
+        query_list.insert(0, "iPhone")
+    return query_list
 
 async def _run_scrape_cycle(
     pool: asyncpg.Pool,
     redis_client: Redis,
     route: dict[str, Any],
 ) -> tuple[dict[str, int], dict[str, Any]]:
-    query_override = _split_query_csv(route.get("search_queries"))
+    raw_queries = _split_query_csv(route.get("search_queries"))
+    if not raw_queries or (len(raw_queries) == 1 and raw_queries[0].upper() == "BUCKETS"):
+        query_override = _get_bucket_queries(num_queries=3)
+    else:
+        query_override = raw_queries
+        
     profile_dir = str(route.get("user_data_dir") or WORKER_USER_DATA_DIR or "").strip() or None
     profile_lock_id: str | None = None
     query_shard_lock_id: str | None = None
@@ -2051,8 +2076,9 @@ async def _run_scrape_cycle(
             metrics["query_error_count"] = metrics.get("query_error_count", 0) + 1
             error_text = str(payload.get("error") or "").strip()
             if error_text:
-                query_error_text_samples.append(error_text[:300])
-                del query_error_text_samples[:-5]
+                query_error_text_samples.append(str(error_text)[0:300])
+                if len(query_error_text_samples) > 5:
+                    query_error_text_samples.pop(0)
             return
 
         if event != "listing_saved":
@@ -2109,21 +2135,20 @@ async def _run_scrape_cycle(
         _start_lease_keepalive(query_shard_lock_id, "query_shard", WORKER_QUERY_SHARD_LEASE_SECONDS)
         scrape_started_monotonic = time.monotonic()
         try:
+            # For V2.2 Dolphin Anty, we need a profile_id. 
+            # In V2.1, `profile_dir` looked like `/app/browser_profiles/fb_account_123`
+            # We will extract the account ID ("123") and use it as the Dolphin profile_id.
+            # If we don't have one, we default to the route name or worker name.
+            dolphin_profile_id = _extract_profile_number(route)
+            
             scrape_kwargs = {
-                "headless": WORKER_HEADLESS,
+                "profile_id": dolphin_profile_id,
                 "progress_callback": _on_progress,
-                "user_data_dir": profile_dir,
-                "proxy": proxy_config,
                 "search_queries": query_override,
                 "scroll_target_cards_override": WORKER_SCROLL_TARGET_CARDS,
                 "scroll_max_rounds_override": WORKER_SCROLL_MAX_ROUNDS,
-                "verify_proxy_ip": VERIFY_PROXY_IP,
-                "proxy_ip_check_url": PROXY_IP_CHECK_URL,
-                "proxy_ip_check_timeout_ms": PROXY_IP_CHECK_TIMEOUT_MS,
-                "proxy_ip_expected": proxy_expected_ip,
-                "browser_context_options": persona_context_options,
-                "extra_http_headers": persona_extra_headers,
             }
+            # Remove unsupported kwargs if any
             unsupported_kwargs = [
                 key for key in scrape_kwargs.keys() if key not in SCRAPE_MARKETPLACE_SUPPORTED_KWARGS
             ]
@@ -2210,7 +2235,6 @@ async def _run_scrape_cycle(
             await _cleanup_old_scrape_events(pool)
         except Exception as exc:
             logging.warning("[%s] failed to record scrape events: %s", WORKER_NAME, exc)
-        cleanup_bridge_process(bridge_process)
         try:
             await _release_proxy_lease(pool=pool, route=route, proxy_id=proxy_lease_id)
         except Exception as exc:
@@ -2412,7 +2436,6 @@ async def _run_scrape_cycle_with_retry(
 
 
 async def _main() -> None:
-    init_db()
 
     pool = await asyncpg.create_pool(
         host=PGHOST,
@@ -2448,6 +2471,14 @@ async def _main() -> None:
     # Start proxy provider health monitor (no-op if no gateway token configured).
     await start_proxy_monitor()
 
+_route_selection_lock = asyncio.Lock()
+
+async def _worker_slot_loop(
+    pool: asyncpg.Pool,
+    redis_client: Redis,
+    slot_id: int,
+) -> None:
+    logging.info("[%s/slot-%d] online", WORKER_NAME, slot_id)
     global _SINGLE_ROUTE_ENFORCEMENT_ACTIVE
     try:
         while True:
@@ -2455,119 +2486,135 @@ async def _main() -> None:
             route = None
             started_at = datetime.now(timezone.utc)
             try:
-                released_cooldowns = await _release_expired_route_cooldowns(pool)
-                if released_cooldowns > 0:
-                    logging.info(
-                        "[%s] released %s route(s) from expired cooldown windows.",
-                        WORKER_NAME,
-                        released_cooldowns,
-                    )
-                routes = await _load_worker_routes(pool)
-                enabled_route_count = await _count_enabled_worker_routes(pool)
-                eligible_route_count = len(routes)
-                effective_interval_seconds = compute_worker_effective_interval(
-                    base_interval=SCRAPE_INTERVAL_SECONDS,
-                    enabled_count=enabled_route_count or eligible_route_count or 1,
-                    eligible_count=eligible_route_count,
-                    max_multiplier=WORKER_MAX_BACKOFF_MULTIPLIER,
-                )
-                single_route_enforcement = (
-                    enabled_route_count > 0 and enabled_route_count < WORKER_MIN_ENABLED_ROUTES_WARN
-                )
-                if single_route_enforcement:
-                    effective_interval_seconds *= WORKER_SINGLE_ROUTE_REST_MULTIPLIER
-                if single_route_enforcement != _SINGLE_ROUTE_ENFORCEMENT_ACTIVE:
-                    if single_route_enforcement:
-                        logging.warning(
-                            "[%s] min-route enforcement active: enabled routes=%s (< %s); applying %.2fx rest multiplier.",
-                            WORKER_NAME,
-                            enabled_route_count,
-                            WORKER_MIN_ENABLED_ROUTES_WARN,
-                            WORKER_SINGLE_ROUTE_REST_MULTIPLIER,
-                        )
-                    else:
+                # Synchronize route selection
+                async with _route_selection_lock:
+                    released_cooldowns = await _release_expired_route_cooldowns(pool)
+                    if released_cooldowns > 0:
                         logging.info(
-                            "[%s] min-route enforcement lifted: enabled routes=%s (>= %s).",
+                            "[%s/slot-%d] released %s route(s) from expired cooldown.",
                             WORKER_NAME,
-                            enabled_route_count,
-                            WORKER_MIN_ENABLED_ROUTES_WARN,
+                            slot_id,
+                            released_cooldowns,
                         )
-                    _SINGLE_ROUTE_ENFORCEMENT_ACTIVE = single_route_enforcement
-
-                # During quiet hours, slow down even further.
-                if _is_quiet_hours():
-                    effective_interval_seconds *= WORKER_QUIET_HOURS_MULTIPLIER
-                    logging.debug(
-                        "[%s] quiet hours active — interval *= %.1f",
-                        WORKER_NAME,
-                        WORKER_QUIET_HOURS_MULTIPLIER,
+                    routes = await _load_worker_routes(pool)
+                    enabled_route_count = await _count_enabled_worker_routes(pool)
+                    eligible_route_count = len(routes)
+                    effective_interval_seconds = compute_worker_effective_interval(
+                        base_interval=SCRAPE_INTERVAL_SECONDS,
+                        enabled_count=enabled_route_count or eligible_route_count or 1,
+                        eligible_count=eligible_route_count,
+                        max_multiplier=WORKER_MAX_BACKOFF_MULTIPLIER,
                     )
-
-                now_dt = datetime.now(timezone.utc)
-                route = _select_next_route(routes, now=now_dt)
-                if route is None:
-                    has_db_routes = await _has_configured_worker_routes(pool)
-                    if has_db_routes:
-                        manual_required_count = await _count_manual_login_required_routes(pool)
-                        due_in_seconds = seconds_until_next_route(routes=routes, now=now_dt) if routes else None
-                        cooldown_in_seconds = await _seconds_until_next_cooldown_release(pool)
-
-                        heartbeat_status = "scheduled_wait"
-                        if routes and due_in_seconds is not None:
-                            waiting_reason = (
-                                f"No route is due yet. Next route becomes eligible in {int(max(0, due_in_seconds))}s."
+                    single_route_enforcement = (
+                        enabled_route_count > 0 and enabled_route_count < WORKER_MIN_ENABLED_ROUTES_WARN
+                    )
+                    if single_route_enforcement:
+                        effective_interval_seconds *= WORKER_SINGLE_ROUTE_REST_MULTIPLIER
+                    if single_route_enforcement != _SINGLE_ROUTE_ENFORCEMENT_ACTIVE:
+                        if single_route_enforcement:
+                            logging.warning(
+                                "[%s] min-route enforcement active: enabled routes=%s (< %s); applying %.2fx rest multiplier.",
+                                WORKER_NAME,
+                                enabled_route_count,
+                                WORKER_MIN_ENABLED_ROUTES_WARN,
+                                WORKER_SINGLE_ROUTE_REST_MULTIPLIER,
                             )
-                            sleep_target_seconds = max(0.1, due_in_seconds)
                         else:
-                            heartbeat_status = "cooldown"
-                            if manual_required_count > 0:
-                                waiting_reason = (
-                                    f"{manual_required_count} route(s) are quarantined for manual login. "
-                                    "Run VPS Manual Login, then clear Manual Login Required on the route."
-                                )
-                            else:
-                                waiting_reason = (
-                                    "No eligible DB routes currently available (routes may be in cooldown or waiting for proxy reuse)."
-                                )
-                            if cooldown_in_seconds is not None:
-                                sleep_target_seconds = max(0.1, cooldown_in_seconds)
-                            else:
-                                sleep_target_seconds = max(1.0, effective_interval_seconds)
-                        await _upsert_worker_heartbeat(
-                            pool=pool,
-                            route_name="",
-                            status=heartbeat_status,
-                            listings_saved=0,
-                            query_count=0,
-                            last_error=waiting_reason,
-                            started_at=started_at,
-                            finished_at=datetime.now(timezone.utc),
-                        )
-                        logging.info("[%s] %s", WORKER_NAME, waiting_reason)
-                        await asyncio.sleep(
-                            compute_sleep_seconds(
-                                base_interval=sleep_target_seconds,
-                                elapsed=0,
-                                jitter_pct=SCRAPE_INTERVAL_JITTER_PCT,
-                                rng=random,
-                                min_sleep_seconds=0.1,
+                            logging.info(
+                                "[%s] min-route enforcement lifted: enabled routes=%s (>= %s).",
+                                WORKER_NAME,
+                                enabled_route_count,
+                                WORKER_MIN_ENABLED_ROUTES_WARN,
                             )
-                        )
-                        continue
+                        _SINGLE_ROUTE_ENFORCEMENT_ACTIVE = single_route_enforcement
 
-                    route = _build_env_route()
-                    effective_interval_seconds = float(SCRAPE_INTERVAL_SECONDS)
-                    has_proxy = bool(str(route.get("proxy_server") or "").strip()) or bool(
-                        _split_proxy_pool(route.get("proxy_pool"))
+                    # During quiet hours, slow down even further.
+                    if _is_quiet_hours():
+                        effective_interval_seconds *= WORKER_QUIET_HOURS_MULTIPLIER
+                        logging.debug(
+                            "[%s] quiet hours active — interval *= %.1f",
+                            WORKER_NAME,
+                            WORKER_QUIET_HOURS_MULTIPLIER,
+                        )
+
+                    now_dt = datetime.now(timezone.utc)
+                    route = _select_next_route(routes, now=now_dt)
+                    
+                    if route is None:
+                        has_db_routes = await _has_configured_worker_routes(pool)
+                        if has_db_routes:
+                            manual_required_count = await _count_manual_login_required_routes(pool)
+                            due_in_seconds = seconds_until_next_route(routes=routes, now=now_dt) if routes else None
+                            cooldown_in_seconds = await _seconds_until_next_cooldown_release(pool)
+
+                            heartbeat_status = "scheduled_wait"
+                            if routes and due_in_seconds is not None:
+                                waiting_reason = (
+                                    f"No route is due yet. Next route becomes eligible in {int(max(0, due_in_seconds))}s."
+                                )
+                                sleep_target_seconds = max(0.1, due_in_seconds)
+                            else:
+                                heartbeat_status = "cooldown"
+                                if manual_required_count > 0:
+                                    waiting_reason = (
+                                        f"{manual_required_count} route(s) are quarantined for manual login. "
+                                        "Run VPS Manual Login, then clear Manual Login Required on the route."
+                                    )
+                                else:
+                                    waiting_reason = (
+                                        "No eligible DB routes currently available (routes may be in cooldown or waiting for proxy reuse)."
+                                    )
+                                if cooldown_in_seconds is not None:
+                                    sleep_target_seconds = max(0.1, cooldown_in_seconds)
+                                else:
+                                    sleep_target_seconds = max(1.0, effective_interval_seconds)
+                            
+                            # Only slot-0 updates the worker-wide idle heartbeats to avoid spam
+                            if slot_id == 0:
+                                await _upsert_worker_heartbeat(
+                                    pool=pool,
+                                    route_name="",
+                                    status=heartbeat_status,
+                                    listings_saved=0,
+                                    query_count=0,
+                                    last_error=waiting_reason,
+                                    started_at=started_at,
+                                    finished_at=datetime.now(timezone.utc),
+                                )
+                                logging.info("[%s] %s", WORKER_NAME, waiting_reason)
+                            
+                        else:
+                            route = _build_env_route()
+                            effective_interval_seconds = float(SCRAPE_INTERVAL_SECONDS)
+                            has_proxy = bool(str(route.get("proxy_server") or "").strip()) or bool(
+                                _split_proxy_pool(route.get("proxy_pool"))
+                            )
+                            if not has_proxy:
+                                raise RuntimeError(
+                                    "No worker routes configured in DB and no SCRAPER_PROXY_SERVER/SCRAPER_PROXY_POOL in environment."
+                                )
+                    
+                    if route is not None:
+                        route_started_at = datetime.now(timezone.utc)
+                        route_started_monotonic = time.monotonic()
+                        if route.get("source") == "db":
+                            await _mark_route_selected(pool, route)
+                            
+                # --- Release Log & Execute Route ---
+                if route is None:
+                    # No route found, wait and try again
+                    sleep_target_seconds = sleep_target_seconds if has_db_routes else effective_interval_seconds
+                    await asyncio.sleep(
+                        compute_sleep_seconds(
+                            base_interval=sleep_target_seconds,
+                            elapsed=0,
+                            jitter_pct=SCRAPE_INTERVAL_JITTER_PCT,
+                            rng=random,
+                            min_sleep_seconds=0.1,
+                        )
                     )
-                    if not has_proxy:
-                        raise RuntimeError(
-                            "No worker routes configured in DB and no SCRAPER_PROXY_SERVER/SCRAPER_PROXY_POOL in environment."
-                        )
+                    continue
 
-                route_started_at = datetime.now(timezone.utc)
-                route_started_monotonic = time.monotonic()
-                await _mark_route_selected(pool, route)
                 route_name = str(route.get("route_name") or "unknown")
                 await _upsert_worker_heartbeat(
                     pool=pool,
@@ -2838,7 +2885,8 @@ async def _main() -> None:
                     if degraded:
                         alert_key = _profile_failure_alert_key(route)
                         if _should_send_profile_failure_alert(alert_key):
-                            await asyncio.to_thread(
+                            loop = asyncio.get_running_loop()
+                            func = functools.partial(
                                 _send_telegram_profile_failure_alert,
                                 route,
                                 base_reason,
@@ -2846,6 +2894,7 @@ async def _main() -> None:
                                 bad_cycles,
                                 cooldown_for_alert,
                             )
+                            await loop.run_in_executor(None, func)
 
                     await _upsert_worker_heartbeat(
                         pool=pool,
@@ -2969,8 +3018,10 @@ async def _main() -> None:
                     )
                     if sleep_seconds > 0:
                         await asyncio.sleep(sleep_seconds)
+                if sleep_seconds > 0:
+                    await asyncio.sleep(sleep_seconds)
             except Exception as exc:
-                logging.exception("[%s] scrape cycle failed: %s", WORKER_NAME, exc)
+                logging.exception("[%s/slot-%d] scrape cycle failed: %s", WORKER_NAME, slot_id, exc)
                 route_name = str((route or {}).get("route_name") or "unknown")
                 error_reason = str(exc) or "unknown scrape error"
                 await _record_route_outcome(pool, route or {}, success=False, error=str(exc))
@@ -3014,7 +3065,24 @@ async def _main() -> None:
                 )
                 if sleep_seconds > 0:
                     await asyncio.sleep(sleep_seconds)
+    except asyncio.CancelledError:
+        logging.info("[%s/slot-%d] slot loop cancelled", WORKER_NAME, slot_id)
+        raise
+    except Exception as e:
+        logging.exception("[%s/slot-%d] slot loop crashed cleanly: %s", WORKER_NAME, slot_id, e)
+
+async def _run_worker_loop(pool: asyncpg.Pool, redis_client: Redis) -> None:
+    # Launch 5 concurrent slots for proxy rotation
+    WORKER_CONCURRENCY = 5
+    tasks = []
+    for slot_id in range(WORKER_CONCURRENCY):
+        tasks.append(asyncio.create_task(_worker_slot_loop(pool, redis_client, slot_id)))
+    
+    try:
+        await asyncio.gather(*tasks)
     finally:
+        for t in tasks:
+            t.cancel()
         await redis_client.close()
         await pool.close()
 
