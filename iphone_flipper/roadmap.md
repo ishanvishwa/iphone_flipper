@@ -10,7 +10,7 @@ This roadmap is a comprehensive implementation plan that combines:
 - Remaining work needed for stability, condition accuracy, and safe automation
 
 Audit date: **2026-02-10**
-Last implementation update: **2026-02-20**
+Last implementation update: **2026-02-22**
 
 ## Roadmap Structure
 
@@ -97,8 +97,14 @@ Last implementation update: **2026-02-20**
   - [x] `scraper/storage.py` — database operations and persistence
   - [x] `scraper/parsers.py` — model/condition/price parsing and accessory detection
   - [x] `scraper/proxy.py` — proxy bridge and Playwright proxy configuration
-  - [x] `scraper/browser.py` — stealth scripts and browser context launcher
+  - [x] `scraper/browser.py` — stealth scripts, browser context launcher, Dolphin Anty CDP integration with cloud-first API listing and duplicate-running reuse
   - [x] `scraper/core.py` — `scrape_marketplace()`, financial recalculation, accessory purge
+  - [x] `scraper/legacy_utils.py` — V1 monolithic scraper logic preserved as shared utilities (GraphQL extraction, DOM extraction, progressive scroll, stealth scripts, listing persistence)
+- [x] V2.2 `core/scraper/` package built for Dolphin Anty CDP-based browser automation:
+  - [x] `core/scraper/driver.py` — CDP WebSocket connection via Dolphin Anty API (`connect_over_cdp`), stealth delegated to Dolphin's native engine
+  - [x] `core/scraper/pipeline.py` — `scrape_marketplace()` with GraphQL interception on CDP-connected context
+  - [x] `core/scraper/parser.py`, `config.py`, `storage.py` — model/condition/price/storage mirroring `scraper/` package
+  - [x] `core/scraper/config.py` — carries bridge/connection-limiting configs (`PROXY_BRIDGE_*`, `BROWSER_MAX_CONNECTIONS_*`) from prior iterations; available for future re-activation
 
 ### Remaining
 
@@ -314,6 +320,9 @@ Condition accuracy is a critical decision parameter and currently constrained by
 - [x] Added persona generation tests (`server/tests/test_persona.py`).
 - [x] Added stealth script fingerprint randomization to strengthen anti-detection against platform bans.
 - [x] Added enhanced soft-signals (`CONSECUTIVE_EMPTY_RESULTS`, `SESSION_TOO_LONG`) to the signal detector for safer proactive pausing.
+- [x] Added quiet hours scheduling (`WORKER_QUIET_HOURS_UTC`, `WORKER_QUIET_HOURS_MULTIPLIER`) to slow scraping during off-peak UTC windows (midnight-wrapping supported).
+- [x] Added session duration caps (`WORKER_SESSION_MAX_QUERIES`) to restart browser sessions and avoid session-length fingerprinting.
+- [x] Added weighted bucket query diversification (`_get_bucket_queries`) with four categories (broad 40%, exact 30%, flipper 20%, misspelling 10%) for per-cycle query randomization.
 
 ### Remaining
 
@@ -383,6 +392,33 @@ Condition accuracy is a critical decision parameter and currently constrained by
 - [x] Added route state machine + interval multipliers (`DEGRADED=2x`, `THROTTLED=4x`) with persisted status metadata (`status`, `status_reason`, `status_since`).
 - [x] Added pre-checkpoint soft-signal detector with EMA baselines (`avg_result_count`, `avg_page_load_ms`) and proactive throttle/pause/quarantine actions.
 - [x] Added min-route resilience enforcement (API warnings for `<2` enabled routes and worker-side single-route rest multiplier).
+- [x] Migrated worker browser launch to Dolphin Anty CDP integration:
+  - [x] `core/scraper/driver.py` connects to Dolphin Anty-managed Chromium via `connect_over_cdp` WebSocket
+  - [x] Dynamic auto-allocation of profiles per worker via `worker_proxy_leases` Postgres lock (bypasses static env vars)
+  - [x] Cloud-first API fallback for fetching available profiles to avoid local session lockouts
+  - [x] `DOLPHIN_API_URL` and `DOLPHIN_ANTY_TOKEN` env vars in compose for container→host API connectivity and authentication
+  - [x] proxy management delegated to Dolphin Anty's native per-profile proxy bindings
+  - [x] `DOLPHIN_WS_HOST` env var (default `host.docker.internal`) for Docker→host WebSocket connectivity
+  - [x] Duplicate-running profile reuse (`E_BROWSER_RUN_DUPLICATE`) with session port query and stop+restart fallback
+  - [x] Three-tier profile listing: Cloud API → Local API w/auth → Local API fallback
+- [x] Updated VPS deployment target from `root@147.182.131.111` to `ubuntu@15.235.185.32` with new remote directory structure
+- [x] Added Caddy reverse proxy service in Docker Compose (`caddy:2`) with auto-TLS via `SERVER_DOMAIN` env var, persistent cert volumes, and API health-check dependency
+- [x] ~~Added 5-slot concurrent worker architecture~~ — **removed**: reverted to single-loop-per-container; parallelism via Docker worker containers instead
+  - ~~`_run_worker_loop()` launches 5 parallel `_worker_slot_loop()` tasks per worker container~~
+  - ~~Route selection serialized via `_route_selection_lock` to prevent duplicate claims~~
+  - ~~Slot-0 exclusive idle heartbeat updates to avoid spam~~
+  - ~~5x effective route throughput per Docker service without additional compose definitions~~
+- [x] Wired proxy provider health monitor into worker slot loop:
+  - [x] Cycle-level saturated check skips scraping with `wait_proxy_provider` heartbeat
+  - [x] Pacing multiplier applied to `next_interval_seconds` when provider under load
+- [x] Fixed worker container connectivity (`ECONNREFUSED`) to Dolphin Anty by migrating worker compose services to `network_mode: host`.
+- [x] Fixed Dolphin profile collision lock leaks by explicitly tracking and releasing both the database lease (`profile_lock_id`) and the remote Dolphin API lock (`dolphin_lock_id`).
+- [x] Hardened `_start_dolphin_profile` against transient `E_BROWSER_RUN_DUPLICATE` errors by issuing explicit stop commands and executing exponential backoff retries.
+- [x] Added Per-Profile Health Tracking and automation safeguards:
+  - [x] Distributed PostgreSQL-backed tracking (`proxy_stats` table) of consecutive failures targeted at the mapped Dolphin Profile ID (`PROFILE:{id}`).
+  - [x] Automatic profile blacklisting with exponential backoff (starting at 30 minutes, max 24 hours) after 2 consecutive failures (`DOLPHIN_PROFILE_BLACKLIST_AFTER`).
+  - [x] Safe bypass during profile selection; all workers query the DB to skip blacklisted profiles, preventing cross-worker retry loops.
+  - [x] Sent Telegram alerts immediately upon blacklisting to notify operators of blocked or broken profiles (includes profile name and ID).
 
 ### Remaining Tasks
 
@@ -415,7 +451,7 @@ Condition accuracy is a critical decision parameter and currently constrained by
   - [x] async polling of proxy gateway utilization API
   - [x] pacing multiplier computation based on utilization/error-rate thresholds
   - [x] Telegram degradation alerts with cooldown deduplication
-  - [ ] wire pacing multiplier into worker scrape-interval adjustment flow
+  - [x] pacing multiplier wired into worker scrape-interval adjustment flow (per-cycle `next_interval_seconds` scaling + saturated cycle skipping)
 
 ### Operator Dependencies (User-Side Prerequisites)
 
@@ -474,6 +510,21 @@ These are now integrated into this roadmap as completed and maintained items.
 
 Note: Specifically, an external `patch_core.py` was used to dynamically patch `scraper/core.py` and extract some standalone functions to `scraper/legacy_utils.py` outside of the formal module refactor.
 
+1. V2.2 `core/scraper/` package rewrite with Dolphin Anty CDP-based browser launch (`connect_over_cdp`) replacing direct Playwright profile management.
+2. Weighted bucket query system (`_get_bucket_queries`) with four diversified query categories (broad/exact/flipper/misspelling) and per-cycle randomized selection.
+3. Quiet hours scheduling (`WORKER_QUIET_HOURS_UTC`, `WORKER_QUIET_HOURS_MULTIPLIER`) for reduced scraping cadence during configurable UTC off-peak windows.
+4. Session duration caps (`WORKER_SESSION_MAX_QUERIES`) to restart browser sessions after N queries, preventing session-length fingerprinting.
+5. Per-worker dynamic Dolphin Anty profile binding via Postgres lease pool and `DOLPHIN_API_URL`/`DOLPHIN_ANTY_TOKEN` compose integration.
+6. VPS infrastructure migration: deploy target updated from `root@147.182.131.111` to `ubuntu@15.235.185.32` with new directory layout.
+7. ~~5-slot concurrent worker architecture~~ — **removed**: reverted to single-loop-per-container in dev-log §34.
+8. `scraper/legacy_utils.py` (814 lines) preserving V1 monolithic scraper logic as shared utilities during package refactoring.
+9. Dolphin Anty browser.py hardening: `DOLPHIN_WS_HOST` for Docker→host WS connectivity, `E_BROWSER_RUN_DUPLICATE` reuse, three-tier profile listing.
+10. Caddy reverse proxy service in Docker Compose with auto-TLS provisioning.
+11. Proxy provider health monitor fully wired into worker slot loop (per-cycle saturated skip + pacing multiplier).
+12. V2.2 core scraper package carries bridge/connection configs (`PROXY_BRIDGE_*`) from prior iterations — available but inactive in worker runtime.
+
+Action taken: all above are now documented in `roadmap.md` as completed scope.
+
 ## Current Focus Recommendation
 
-Active priority should be **Phase 5A** (24x7 server + real-time sync migration), followed immediately by **Phase 4** (condition confidence + selective detail-page enrichment). Dolphin Anty VPS installation is a near-term operational dependency.
+Active priority should be **Phase 5A** (24x7 server + real-time sync migration), followed immediately by **Phase 4** (condition confidence + selective detail-page enrichment). Dolphin Anty VPS installation is now resolved (systemd autostart operational). Remaining high-impact items: WebSocket desktop sync, notification worker compose wiring, and `legacy_utils.py` test coverage.

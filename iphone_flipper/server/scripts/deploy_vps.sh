@@ -20,18 +20,21 @@ rsync -az \
   "${SERVER_DIR}/" "${DEPLOY_SSH_TARGET}:${DEPLOY_REMOTE_DIR}/"
 
 echo "[deploy] syncing root runtime files to ${DEPLOY_SSH_TARGET}:${DEPLOY_REMOTE_ROOT}"
-for file in scraper.py notifications.py requirements.txt .dockerignore; do
-  if [[ -f "${PROJECT_ROOT}/${file}" ]]; then
-    rsync -az "${PROJECT_ROOT}/${file}" "${DEPLOY_SSH_TARGET}:${DEPLOY_REMOTE_ROOT}/${file}"
+for item in scraper/ notifications.py requirements.txt .dockerignore; do
+  if [[ -e "${PROJECT_ROOT}/${item}" ]]; then
+    rsync -az "${PROJECT_ROOT}/${item}" "${DEPLOY_SSH_TARGET}:${DEPLOY_REMOTE_ROOT}/${item}"
   fi
 done
 
 echo "[deploy] running remote compose update"
 ssh -o BatchMode=yes "${DEPLOY_SSH_TARGET}" \
-  "DEPLOY_REMOTE_DIR='${DEPLOY_REMOTE_DIR}' DEPLOY_SERVICES='${DEPLOY_SERVICES}' DEPLOY_RUN_MIGRATIONS='${DEPLOY_RUN_MIGRATIONS}' bash -s" <<'REMOTE'
+  "DEPLOY_REMOTE_DIR='${DEPLOY_REMOTE_DIR}' DEPLOY_REMOTE_ROOT='${DEPLOY_REMOTE_ROOT}' DEPLOY_SERVICES='${DEPLOY_SERVICES}' DEPLOY_RUN_MIGRATIONS='${DEPLOY_RUN_MIGRATIONS}' bash -s" <<'REMOTE'
 set -euo pipefail
 
 cd "${DEPLOY_REMOTE_DIR}/infra"
+
+# Remove legacy monolithic file if it exists to avoid module resolution conflicts
+rm -f "${DEPLOY_REMOTE_ROOT}/scraper.py"
 
 docker compose --env-file ../.env up -d postgres redis
 

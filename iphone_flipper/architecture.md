@@ -20,7 +20,7 @@ Scope includes:
 The system is a local-first Python application with:
 
 - **Execution layer**: CLI (`main.py`) and desktop GUI (`gui.py` via `run_gui.py`)
-- **Acquisition layer**: Hybrid Marketplace fetch in Playwright (`scraper/` package — `core.py`, `parsers.py`, `browser.py`, `storage.py`, `proxy.py`, `config.py`)
+- **Acquisition layer**: Hybrid Marketplace fetch — V1 in Playwright (`scraper/` package — `core.py`, `parsers.py`, `browser.py`, `storage.py`, `proxy.py`, `config.py`, `legacy_utils.py`), V2.2 via Dolphin Anty CDP (`core/scraper/` package — `driver.py`, `pipeline.py`, `parser.py`, `storage.py`, `config.py`)
 - **Decision layer**: model identification, condition assessment, max-offer/profit computation
 - **Interaction layer**: AI-assisted negotiation (`negotiation_agent.py`)
 - **Learning layer**: purchase analytics + conversion scoring (`deal_tracker.py`)
@@ -78,6 +78,8 @@ flowchart TD
     D --> B
     B --> G["Notification Worker"]
     G --> H["Email / Telegram / Discord"]
+    I["Caddy Reverse Proxy (TLS)"] --> B
+    A --> I
 ```
 
 ## 4. Runtime Architecture
@@ -86,6 +88,7 @@ flowchart TD
 
 1. User triggers scrape from CLI (`main.py scrape`) or GUI (`Run Scraper`).
 2. `scraper.scrape_marketplace()` launches persistent Chromium profile (GUI/CLI orchestrators pass per-account profile paths; direct module execution defaults to `browser_profile/`).
+2.1 V2.2 worker path: `core/scraper/driver.py` starts a Dolphin Anty profile via local API (`GET /v1.0/browser_profiles/{id}/start?automation=1`), receives a CDP WebSocket endpoint, and connects via `playwright.chromium.connect_over_cdp()`. If the profile is already running (`E_BROWSER_RUN_DUPLICATE`), the driver attempts an explicit stop and restarts with exponential backoff retries. WebSocket endpoint is constructed as `ws://{DOLPHIN_WS_HOST}:{port}{wsEndpoint}` where `DOLPHIN_WS_HOST` defaults to `127.0.0.1` (worker containers use `network_mode: host` to reach the host-bound Chrome DevTools port). Stealth/fingerprinting is delegated to Dolphin Anty's native anti-detect engine. To prevent failure loops, a distributed PostgreSQL-backed Per-Profile Health Tracker (`proxy_stats` table) monitors consecutive Dolphin profile failures across all workers. If a profile fails repeatedly, it is temporarily blacklisted with exponential backoff (starting at 30 minutes, up to 24 hours) and bypassed across all workers during selection.
 3. Queries load from DB-backed `search_queries` (`is_active=1`) with fallback to seeded defaults.
 4. During each query run, response listeners capture Marketplace GraphQL payloads (`/api/graphql/`) and normalize listing fields.
 5. DOM card extraction runs as fallback and backup enrichment source.
@@ -169,16 +172,18 @@ flowchart TD
 ### 4.5 24x7 Server Flow (Baseline Implemented, Desktop Sync Pending)
 
 1. VPS supervisor launches a long-running scraper worker pool.
-2. Each worker pulls its enabled route set (`worker_routes`) and selects the next **due** route using persisted `next_run_at` (NULL treated as immediately due) instead of in-memory round-robin.
+2. Each worker container runs a single sequential scrape loop via `_run_worker_loop()`. The loop selects routes, acquires leases, and executes scrape cycles one at a time. Parallelism is achieved via multiple Docker worker containers (`worker`, `worker_2`, `worker_3`).
+3. Each loop iteration pulls its enabled route set (`worker_routes`) and selects the next **due** route using persisted `next_run_at` (NULL treated as immediately due) instead of in-memory round-robin.
 2.1 Route cadence uses runtime-compensated sleep (`max(0, interval - elapsed)`) plus configurable jitter to keep effective scrape frequency aligned to config.
 2.2 If no route is currently due, worker sleeps until the nearest `next_run_at` (or earliest cooldown release) with jitter, rather than fast-looping.
 2.3 If DB routes exist but are temporarily unavailable (cooldown/proxy lock), worker waits in scheduled/cooldown state rather than falling back to `env_default`.
 2.4 `env_default` fallback is used only when no DB routes exist for that worker.
-3. Every discovered listing is normalized/enriched and **upserted immediately** (per listing, not end-of-run batch commit).
+4. Every discovered listing is normalized/enriched and **upserted immediately** (per listing, not end-of-run batch commit).
 3.1 `worker_3` fast-lane profile is supported for broad `iPhone` sweeps with short interval + medium-depth scroll controls (target cards capped at 100) to prioritize newly listed posts.
 3.2 Marketplace queries use explicit newest-first ordering (`sortBy=creation_time_descend`) and enforce at least one scroll pass before target-card early exit.
-4. Each insert/update emits an event (`listing_created` / `listing_updated`) to a broker.
-5. Worker heartbeat/status is upserted into `worker_heartbeats` for operator visibility.
+3.3 Worker supports weighted bucket query diversification (`_get_bucket_queries`) with four categories: broad (40%), exact model (30%), flipper/deal-hunter (20%), misspelling (10%). When route `search_queries` is empty or `BUCKETS`, 3 random weighted queries are selected per cycle.
+5. Each insert/update emits an event (`listing_created` / `listing_updated`) to a broker.
+6. Worker heartbeat/status is upserted into `worker_heartbeats` for operator visibility.
 5.1 Worker routes are marked `degraded` when all query results return `page_cards=0` (profile likely unhealthy), with error context persisted for operators.
 5.2 `GET /worker-health` now enriches each worker heartbeat row with active proxy lease metadata and route cooldown remaining seconds for GUI monitoring.
 5.3 Worker cycles with zero executed queries are now treated as bad cycles so degraded/cooldown/telegram-failure flow can trigger instead of silently passing.
@@ -190,20 +195,22 @@ flowchart TD
 5.9 Every cycle emits structured JSON telemetry (`cycle_id`, `route_name`, `proxy_key`, `query_shard_key`, `duration_ms`, `outcome`, `error_category`, `retry_count`) for diagnostics.
 5.10 Manual-login quarantine state now persists incident metadata (`quarantined_at`, `quarantine_reason`, `quarantine_evidence`) and supports API/GUI recovery actions (route retest and worker-level bulk clear).
 5.11 Worker cycles can apply coherent browser personas (`ENABLE_FINGERPRINT_VARIATION`) and log `persona_hash`/persona context in telemetry for correlation diagnostics.
-6. API service relays events through Redis/WebSocket-compatible channels; desktop currently consumes server changes via incremental cursor polling with direct WebSocket apply still pending.
-7. Worker runtime can send immediate Telegram listing cards on `listing_created` when `potential_profit >= TELEGRAM_NOTIFY_MIN_PROFIT` (default `0`) and model is not blank/`Unknown`, including link + price/profit/description summary.
-8. Notification service architecture (implemented baseline + decoupled event-driven worker):
+7. API service relays events through Redis/WebSocket-compatible channels; desktop currently consumes server changes via incremental cursor polling with direct WebSocket apply still pending.
+8. Worker runtime can send immediate Telegram listing cards on `listing_created` when `potential_profit >= TELEGRAM_NOTIFY_MIN_PROFIT` (default `0`) and model is not blank/`Unknown`, including link + price/profit/description summary.
+9. Notification service architecture (implemented baseline + decoupled event-driven worker):
    - **Inline worker path** (current production default): worker runtime sends Telegram listing cards directly on `listing_created` events when `potential_profit >= TELEGRAM_NOTIFY_MIN_PROFIT`.
    - **Event-driven notification worker** (`notification_worker.py`): standalone service subscribing to Redis `listing_events` pub/sub for sub-second delivery with priority tiers (instant ≥ $50, fast-batch ≥ $0, suppressed < $0), Telegram + FCM push, rate limiting, and deduplication. Pending compose service wiring for production deployment.
 8.1 Proxy provider health monitoring (`proxy_monitor.py`):
    - background async polling of proxy gateway utilization API.
    - health snapshot tracks threads/utilization/error-rate/bandwidth with pacing multiplier computation.
    - Telegram degradation alerts with cooldown deduplication.
-   - integration-ready: workers can call `get_proxy_health()` to adjust scrape intervals proactively.
+   - **Active integration**: each worker slot checks `proxy_health.is_saturated` before executing a cycle; saturated state skips scraping with `wait_proxy_provider` heartbeat. Post-cycle, `proxy_health.pacing_multiplier` is applied to `next_interval_seconds` when multiplier > 1.0 to dynamically slow workers under provider load.
+8.2 Quiet hours scheduling (`WORKER_QUIET_HOURS_UTC`, format `HH:MM-HH:MM` in UTC) slows scraping during off-peak windows with configurable multiplier (`WORKER_QUIET_HOURS_MULTIPLIER`, default `4.0x`). Midnight-wrapping ranges are supported.
+8.3 Session duration caps (`WORKER_SESSION_MAX_QUERIES`) restart the browser session after N queries to prevent session-length fingerprinting.
 
 Implemented baseline artifacts in repository:
 
-- `server/infra/docker-compose.yml` (Postgres, Redis, API, Worker)
+- `server/infra/docker-compose.yml` (Caddy TLS reverse proxy, Postgres, Redis, API, multi-Worker with `DOLPHIN_ANTY_TOKEN` env)
 - `server/services/api/app/main.py` (health, listing snapshot, WebSocket stream, `worker_routes` + `worker_health` endpoints)
 - `server/services/worker/worker.py` (continuous scrape + due-route scheduling + per-listing upsert + Redis publish + heartbeat)
 - `server/services/worker/notification_worker.py` (event-driven notification service with priority tiers, FCM push, rate limiting, dedup)
@@ -215,7 +222,7 @@ Implemented baseline artifacts in repository:
 - `server/services/api/sql/001_init.sql` (server listings schema + worker route/heartbeat schema)
 - `server/.env.example` + `server/README.md` (operator deployment/runbook)
 - `.dockerignore` hardened to exclude runtime/data/log/secrets artifacts from worker image build context
-- `server/scripts/deploy_vps.sh` (one-command rsync + rebuild + schema bootstrap + health verification)
+- `server/scripts/deploy_vps.sh` (one-command rsync + rebuild + schema bootstrap + health verification; SSH target: `ubuntu@15.235.185.32`)
 - `server/scripts/telemetry_rollup.py` (log rollup utility for per-route success/wait/failure trends)
 
 ## 5. Data Architecture
@@ -320,7 +327,7 @@ Global proxy coordination for concurrent workers/routes:
 
 #### `proxy_stats` (Postgres)
 
-Proxy reliability memory used by worker candidate selection:
+Proxy reliability memory used by worker candidate selection. Also used for distributed Dolphin Profile Health tracking using `PROFILE:<profile_id>` keys:
 
 - `proxy_key` (canonical identity, primary key)
 - `consecutive_failures`, `last_success_at`
@@ -432,7 +439,8 @@ Current condition logic is **keyword-only** using listing card text/title (+ des
 - Enhanced soft-signals (`CONSECUTIVE_EMPTY_RESULTS`, `SESSION_TOO_LONG`) are utilized by the signal detector for safer proactive pausing during long or unproductive cycles.
 - Worker logs now include structured JSON telemetry per cycle for observability and incident debugging.
 - Structured cycle telemetry can include persona context (`persona_hash`, sanitized persona fields) when fingerprint variation is enabled.
-- Stealth script fingerprint randomization is injected (e.g., `hardwareConcurrency`, `deviceMemory`, `platform`, `webgl_renderer`) to strengthen anti-detection against platform bans.
+- Stealth script fingerprint randomization is injected (e.g., `hardwareConcurrency`, `deviceMemory`, `platform`, `webgl_renderer`) to strengthen anti-detection against platform bans. V2.2 Dolphin CDP path delegates stealth entirely to Dolphin Anty's native engine.
+- Worker runtime supports dynamic per-worker Dolphin Anty profile binding. At startup, the worker connects to Dolphin API via `DOLPHIN_API_URL` (default `http://host.docker.internal:3001/v1.0`) and `https://anty-api.com` using the `DOLPHIN_ANTY_TOKEN`. Profile listing uses a three-tier fallback: Cloud API (`https://anty-api.com/browser_profiles`) with Bearer auth → Local API with auth headers → Local API without headers. It iterates through existing profiles and leverages a PostgreSQL lease lock in the `worker_proxy_leases` table to exclusively claim the first available, un-locked profile.
 - Worker runtime can validate proxy IP binding at cycle start (`VERIFY_PROXY_IP`) and classify mismatches as non-failure capacity waits.
 - VPS Scrapers connection settings separate proxy reuse cooldown from scrape interval control; scrape frequency is configurable per worker (`worker`, `worker_2`, `worker_3`) and applied to VPS env + container restarts.
 - Scraper runtime detects Facebook checkpoint/login challenge states and raises a manual-login-required signal that the worker converts into route quarantine.
@@ -510,4 +518,4 @@ Current condition logic is **keyword-only** using listing card text/title (+ des
 
 ## 13. Architecture Revision Notes
 
-1. This version reflects codebase state audited on **2026-02-20** and includes all prior GUI/process enhancements (price-sheet editor, row flags, scraper progress/cancel, hybrid GraphQL+DOM fetch, accessory suppression, proxy ingestion/ban controls, VPS route rendering), the implemented 24x7 server baseline (due-time scheduling, WAIT outcomes, profile/query-shard locks, proxy health scoring, route state machine, signal detection, quarantine operations, proxy-binding verification, persona variation, worker modularization, shared schema ensure, minimum-route resilience, structured telemetry), **plus** the following recent additions: scraper module refactoring from monolithic `scraper.py` to structured package (`scraper/`), standalone event-driven notification worker with FCM push and priority-tier dispatch (`notification_worker.py`), proxy provider real-time health monitoring (`proxy_monitor.py`), Dolphin Anty profile management GUI tab with API key integration and Bearer-token authentication, and manual standalone patching of `scraper/core.py` utilizing `patch_core.py` and `scraper/legacy_utils.py`.
+1. This version reflects codebase state audited on **2026-02-22** and includes all prior GUI/process enhancements (price-sheet editor, row flags, scraper progress/cancel, hybrid GraphQL+DOM fetch, accessory suppression, proxy ingestion/ban controls, VPS route rendering), the implemented 24x7 server baseline (due-time scheduling, WAIT outcomes, profile/query-shard locks, proxy health scoring, route state machine, signal detection, quarantine operations, proxy-binding verification, persona variation, worker modularization, shared schema ensure, minimum-route resilience, structured telemetry), **plus** the following recent additions: scraper module refactoring from monolithic `scraper.py` to structured package (`scraper/`), standalone event-driven notification worker with FCM push and priority-tier dispatch (`notification_worker.py`), proxy provider real-time health monitoring (`proxy_monitor.py`) now actively wired into worker loop, Dolphin Anty profile management GUI tab with API key integration and Bearer-token authentication, manual standalone patching of `scraper/core.py` utilizing `patch_core.py` and `scraper/legacy_utils.py` (814-line V1 utility preservation), **V2.2 milestone**: `core/scraper/` package rewrite with Dolphin Anty CDP-based browser launch (`connect_over_cdp`) with `DOLPHIN_WS_HOST` Docker→host connectivity and duplicate-running profile reuse (`E_BROWSER_RUN_DUPLICATE`), weighted bucket query diversification, quiet hours scheduling, session duration caps, dynamic Dolphin profile cloud-first allocation via Postgres locks with three-tier API fallback, VPS infrastructure migration to `ubuntu@15.235.185.32`, Caddy TLS reverse proxy in Docker Compose, `DOLPHIN_ANTY_TOKEN` compose environment for cloud API authentication, **and V2.3**: ~~5-slot concurrent worker architecture~~ removed — reverted to single-loop-per-container (dev-log §34); parallelism via Docker worker containers.

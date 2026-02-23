@@ -32,7 +32,7 @@ services:
     volumes:
       - ../runtime/postgres:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}" ]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -49,7 +49,7 @@ services:
     volumes:
       - ../runtime/redis:/data
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli -a \"$REDIS_PASSWORD\" ping | grep PONG"]
+      test: [ "CMD-SHELL", "redis-cli -a \"$REDIS_PASSWORD\" ping | grep PONG" ]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -83,7 +83,7 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      test: [ "CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz" ]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -93,32 +93,28 @@ services:
       context: ../..
       dockerfile: server/services/worker/Dockerfile
     restart: unless-stopped
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    network_mode: host
     env_file:
       - ../.env
     environment:
-      DOLPHIN_API_URL: http://host.docker.internal:3001/v1.0
+      DOLPHIN_API_URL: http://127.0.0.1:3001/v1.0
+      DOLPHIN_WS_HOST: '127.0.0.1'
+      DOLPHIN_ANTY_TOKEN: ${DOLPHIN_ANTY_TOKEN:-}
       TZ: ${TZ:-UTC}
       APP_ENV: ${APP_ENV:-production}
       LISTING_EVENT_CHANNEL: ${LISTING_EVENT_CHANNEL:-listing_events}
-      PGHOST: postgres
+      PGHOST: 127.0.0.1
       PGPORT: 5432
       PGDATABASE: ${POSTGRES_DB}
       PGUSER: ${POSTGRES_USER}
       PGPASSWORD: ${POSTGRES_PASSWORD}
-      REDIS_HOST: redis
+      REDIS_HOST: 127.0.0.1
       REDIS_PORT: 6379
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       WORKER_NAME: worker
       SCRAPE_INTERVAL_SECONDS: ${SCRAPE_INTERVAL_SECONDS:-8}
       WORKER_HEADLESS: ${WORKER_HEADLESS:-1}
       WORKER_USER_DATA_DIR: ${WORKER_USER_DATA_DIR:-/app/runtime/browser_profile_1}
-      SCRAPER_PROXY_SERVER: ${SCRAPER_PROXY_SERVER}
-      SCRAPER_PROXY_USERNAME: ${SCRAPER_PROXY_USERNAME}
-      SCRAPER_PROXY_PASSWORD: ${SCRAPER_PROXY_PASSWORD}
-      SCRAPER_PROXY_MODE: ${SCRAPER_PROXY_MODE:-fixed}
-      SCRAPER_PROXY_POOL: ${SCRAPER_PROXY_POOL:-}
       SCRAPER_QUERIES: ${SCRAPER_QUERIES:-}
       WORKER_CYCLE_RETRY_ATTEMPTS: ${WORKER_CYCLE_RETRY_ATTEMPTS:-3}
       WORKER_CYCLE_RETRY_BACKOFF_SECONDS: ${WORKER_CYCLE_RETRY_BACKOFF_SECONDS:-3}
@@ -131,43 +127,34 @@ services:
     volumes:
       - ../runtime:/app/runtime
       - ../../price_list.csv:/app/price_list.csv:ro
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
 
   worker_2:
     build:
       context: ../..
       dockerfile: server/services/worker/Dockerfile
     restart: unless-stopped
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    network_mode: host
     env_file:
       - ../.env
     environment:
-      DOLPHIN_API_URL: http://host.docker.internal:3001/v1.0
+      DOLPHIN_API_URL: http://127.0.0.1:3001/v1.0
+      DOLPHIN_WS_HOST: '127.0.0.1'
+      DOLPHIN_ANTY_TOKEN: ${DOLPHIN_ANTY_TOKEN:-}
       TZ: ${TZ:-UTC}
       APP_ENV: ${APP_ENV:-production}
       LISTING_EVENT_CHANNEL: ${LISTING_EVENT_CHANNEL:-listing_events}
-      PGHOST: postgres
+      PGHOST: 127.0.0.1
       PGPORT: 5432
       PGDATABASE: ${POSTGRES_DB}
       PGUSER: ${POSTGRES_USER}
       PGPASSWORD: ${POSTGRES_PASSWORD}
-      REDIS_HOST: redis
+      REDIS_HOST: 127.0.0.1
       REDIS_PORT: 6379
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       WORKER_NAME: worker_2
       SCRAPE_INTERVAL_SECONDS: ${SCRAPE_INTERVAL_SECONDS_WORKER_2:-${SCRAPE_INTERVAL_SECONDS:-8}}
       WORKER_HEADLESS: ${WORKER_HEADLESS:-1}
       WORKER_USER_DATA_DIR: /app/runtime/browser_profile_2
-      SCRAPER_PROXY_SERVER: ${SCRAPER_PROXY_SERVER_2}
-      SCRAPER_PROXY_USERNAME: ${SCRAPER_PROXY_USERNAME_2}
-      SCRAPER_PROXY_PASSWORD: ${SCRAPER_PROXY_PASSWORD_2}
-      SCRAPER_PROXY_MODE: ${SCRAPER_PROXY_MODE_2:-fixed}
-      SCRAPER_PROXY_POOL: ${SCRAPER_PROXY_POOL_2:-}
       SCRAPER_QUERIES: ${SCRAPER_QUERIES_2:-}
       WORKER_CYCLE_RETRY_ATTEMPTS: ${WORKER_CYCLE_RETRY_ATTEMPTS:-3}
       WORKER_CYCLE_RETRY_BACKOFF_SECONDS: ${WORKER_CYCLE_RETRY_BACKOFF_SECONDS:-3}
@@ -180,32 +167,28 @@ services:
     volumes:
       - ../runtime:/app/runtime
       - ../../price_list.csv:/app/price_list.csv:ro
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
 
   worker_3:
     build:
       context: ../..
       dockerfile: server/services/worker/Dockerfile
     restart: unless-stopped
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    network_mode: host
     env_file:
       - ../.env
     environment:
-      DOLPHIN_API_URL: http://host.docker.internal:3001/v1.0
+      DOLPHIN_API_URL: http://127.0.0.1:3001/v1.0
+      DOLPHIN_WS_HOST: '127.0.0.1'
+      DOLPHIN_ANTY_TOKEN: ${DOLPHIN_ANTY_TOKEN:-}
       TZ: ${TZ:-UTC}
       APP_ENV: ${APP_ENV:-production}
       LISTING_EVENT_CHANNEL: ${LISTING_EVENT_CHANNEL:-listing_events}
-      PGHOST: postgres
+      PGHOST: 127.0.0.1
       PGPORT: 5432
       PGDATABASE: ${POSTGRES_DB}
       PGUSER: ${POSTGRES_USER}
       PGPASSWORD: ${POSTGRES_PASSWORD}
-      REDIS_HOST: redis
+      REDIS_HOST: 127.0.0.1
       REDIS_PORT: 6379
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       WORKER_NAME: worker_3
@@ -213,11 +196,6 @@ services:
       WORKER_HEADLESS: ${WORKER_HEADLESS:-1}
       WORKER_USER_DATA_DIR: /app/runtime/browser_profile_3
       # Fast lane: broad newest-first sweep for immediate detections.
-      SCRAPER_PROXY_SERVER: ${SCRAPER_PROXY_SERVER_3}
-      SCRAPER_PROXY_USERNAME: ${SCRAPER_PROXY_USERNAME_3}
-      SCRAPER_PROXY_PASSWORD: ${SCRAPER_PROXY_PASSWORD_3}
-      SCRAPER_PROXY_MODE: ${SCRAPER_PROXY_MODE_3:-fixed}
-      SCRAPER_PROXY_POOL: ${SCRAPER_PROXY_POOL_3:-}
       SCRAPER_QUERIES: ${SCRAPER_QUERIES_3:-iPhone}
       WORKER_CYCLE_RETRY_ATTEMPTS: ${WORKER_CYCLE_RETRY_ATTEMPTS:-3}
       WORKER_CYCLE_RETRY_BACKOFF_SECONDS: ${WORKER_CYCLE_RETRY_BACKOFF_SECONDS:-3}
@@ -232,17 +210,12 @@ services:
     volumes:
       - ../runtime:/app/runtime
       - ../../price_list.csv:/app/price_list.csv:ro
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
 
 volumes:
   caddy_data:
   caddy_config:
 
-# Add more workers by copying the worker service block with:
-# - a unique service name (worker_4, worker_5, ...)
-# - unique WORKER_USER_DATA_DIR and IPHONE_FLIPPER_DB_PATH
-# - account-specific proxy credentials and optional SCRAPER_QUERIES shard
+    # Add more workers by copying the worker service block with:
+    # - a unique service name (worker_4, worker_5, ...)
+    # - unique WORKER_USER_DATA_DIR and IPHONE_FLIPPER_DB_PATH
+    # - account-specific proxy credentials and optional SCRAPER_QUERIES shard

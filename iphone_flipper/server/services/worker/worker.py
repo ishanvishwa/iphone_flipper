@@ -11,7 +11,7 @@ import re
 import sys
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -246,7 +246,7 @@ SIGNAL_THROTTLE_MULTIPLIER = _parse_float(
 )
 SIGNAL_THROTTLE_DURATION = _parse_int(os.getenv("SIGNAL_THROTTLE_DURATION"), default=600, minimum=60)
 SIGNAL_MIN_SUCCESS_CYCLES = _parse_int(os.getenv("SIGNAL_MIN_SUCCESS_CYCLES"), default=5, minimum=1)
-ENABLE_FINGERPRINT_VARIATION = _parse_bool(os.getenv("ENABLE_FINGERPRINT_VARIATION", "1"), default=True)
+ENABLE_FINGERPRINT_VARIATION = _parse_bool(os.getenv("ENABLE_FINGERPRINT_VARIATION", "0"), default=False)
 VERIFY_PROXY_IP = _parse_bool(os.getenv("VERIFY_PROXY_IP", "1"), default=True)
 PROXY_IP_CHECK_URL = str(os.getenv("PROXY_IP_CHECK_URL", "https://api.ipify.org?format=json") or "").strip()
 if not PROXY_IP_CHECK_URL:
@@ -314,6 +314,10 @@ _MANUAL_LOGIN_ALERT_LAST_SENT_AT: dict[str, datetime] = {}
 _ROUTE_CONSECUTIVE_BAD_CYCLES: dict[str, int] = {}
 _ROUTE_SESSION_QUERY_COUNTS: dict[str, int] = {}
 _SINGLE_ROUTE_ENFORCEMENT_ACTIVE = False
+
+# Dolphin Profile failures tracking is now backed by `proxy_stats` in PostgreSQL
+DOLPHIN_PROFILE_BLACKLIST_AFTER = 2   # blacklist after N consecutive failures
+DOLPHIN_PROFILE_BLACKLIST_SECONDS = 1800  # 30-min cooldown
 
 
 def _parse_quiet_hours(raw: str) -> tuple[tuple[int, int], tuple[int, int]] | None:
@@ -829,9 +833,169 @@ def _send_telegram_profile_failure_alert(
     if not sent:
         logging.warning(
             "[%s] telegram profile-failure alert failed for route=%s profile=%s",
+
             WORKER_NAME,
             route_name,
             profile_number,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Per-Dolphin-profile health helpers
+# ---------------------------------------------------------------------------
+
+
+async def _fetch_dolphin_profile_blacklist(pool: asyncpg.Pool, profile_ids: list[str]) -> dict[str, datetime]:
+    """Return a dictionary of blacklisted profile IDs pointing to their banned_until timestamp."""
+    keys = [f"DOLPHIN:{str(pid).strip()}" for pid in profile_ids if str(pid).strip()]
+    if not keys:
+        return {}
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT substring(proxy_key from 9) AS profile_id, banned_until
+            FROM proxy_stats
+            WHERE proxy_key = ANY($1::TEXT[])
+              AND banned_until > NOW()
+            """,
+            keys,
+        )
+    return {str(row["profile_id"]): row["banned_until"] for row in rows if row["banned_until"]}
+
+
+async def _record_dolphin_profile_outcome(
+    pool: asyncpg.Pool,
+    profile_id: str | None,
+    success: bool,
+    profile_name: str = "",
+    reason: str = "",
+) -> None:
+    """Track per-profile success/failure in Postgres and send Telegram alerts upon blacklisting."""
+    if not profile_id:
+        return
+    
+    proxy_key = f"DOLPHIN:{str(profile_id).strip()}"
+    
+    if success:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO proxy_stats (
+                    proxy_key, consecutive_failures, last_success_at, banned_until, updated_at
+                ) VALUES ($1, 0, NOW(), NULL, NOW())
+                ON CONFLICT (proxy_key) DO UPDATE SET
+                    consecutive_failures = 0,
+                    last_success_at = NOW(),
+                    banned_until = NULL,
+                    updated_at = NOW()
+                """,
+                proxy_key,
+            )
+        return
+
+    # Failure path: update proxy_stats table using exponential backoff logic from DB
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO proxy_stats (
+                proxy_key,
+                consecutive_failures,
+                banned_until,
+                updated_at
+            ) VALUES (
+                $1, 1,
+                CASE
+                    WHEN 1 >= $2::INT THEN NOW() + ($3::INT * INTERVAL '1 second')
+                    ELSE NULL
+                END,
+                NOW()
+            )
+            ON CONFLICT (proxy_key) DO UPDATE SET
+                consecutive_failures = proxy_stats.consecutive_failures + 1,
+                banned_until = CASE
+                    WHEN proxy_stats.consecutive_failures + 1 >= $2::INT THEN
+                        NOW() + (
+                            LEAST(
+                                86400, -- max 24h cap
+                                $3::INT * POWER(2, GREATEST(0, (proxy_stats.consecutive_failures + 1) - $2::INT))
+                            )::INT * INTERVAL '1 second'
+                        )
+                    ELSE proxy_stats.banned_until
+                END,
+                updated_at = NOW()
+            RETURNING consecutive_failures, banned_until
+            """,
+            proxy_key,
+            DOLPHIN_PROFILE_BLACKLIST_AFTER,
+            DOLPHIN_PROFILE_BLACKLIST_SECONDS,
+        )
+        
+    failures = row["consecutive_failures"] if row else 1
+    until = row["banned_until"] if row else None
+
+    # Only fire Telegram alert exactly when the threshold is first crossed
+    if failures == DOLPHIN_PROFILE_BLACKLIST_AFTER and until:
+        logging.warning(
+            "[%s] Dolphin profile %s (%s) BLACKLISTED until %s (%d consecutive failures)",
+            WORKER_NAME, profile_id, profile_name or "?", until.isoformat(), failures,
+        )
+        _send_telegram_profile_blacklisted_alert(
+            profile_id=profile_id,
+            profile_name=profile_name,
+            reason=reason,
+            failures=failures,
+            until=until,
+        )
+    elif until:
+        logging.warning(
+            "[%s] Dolphin profile %s (%s) still blacklisted, failure #%d (until %s)",
+            WORKER_NAME, profile_id, profile_name or "?", failures, until.isoformat(),
+        )
+    else:
+        logging.warning(
+            "[%s] Dolphin profile %s (%s) consecutive failure #%d",
+            WORKER_NAME, profile_id, profile_name or "?", failures,
+        )
+
+
+def _send_telegram_profile_blacklisted_alert(
+    profile_id: str,
+    profile_name: str = "",
+    reason: str = "",
+    failures: int = 0,
+    until: datetime | None = None,
+) -> None:
+    """Send a Telegram alert when a Dolphin profile is blacklisted."""
+    if not TELEGRAM_NOTIFICATIONS_ENABLED:
+        return
+    
+    cooldown_str = "an unknown time"
+    if until:
+        now_dt = datetime.now(timezone.utc)
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+        diff_minutes = max(1, int((until - now_dt).total_seconds() / 60))
+        cooldown_str = f"{diff_minutes} minutes"
+
+    message = (
+        f"\U0001f6ab Dolphin profile blacklisted\n"
+        f"Worker: {WORKER_NAME}\n"
+        f"Profile: {profile_name or 'Unknown'} (ID: {profile_id})\n"
+        f"Consecutive failures: {failures}\n"
+        f"Reason: {reason or 'unknown'}\n"
+        f"Blacklisted for: {cooldown_str}\n"
+        f"Action: Profile will be skipped until cooldown expires. "
+        f"Check proxy and Facebook login status."
+    )
+    sent = send_telegram(
+        message=message,
+        parse_mode=None,
+        disable_web_page_preview=True,
+    )
+    if not sent:
+        logging.warning(
+            "[%s] telegram profile-blacklisted alert failed for profile=%s",
+            WORKER_NAME, profile_id,
         )
 
 
@@ -1746,49 +1910,17 @@ async def _cleanup_old_scrape_events(pool: asyncpg.Pool) -> None:
 async def _build_playwright_proxy(
     pool: asyncpg.Pool,
     route: dict[str, Any],
-) -> tuple[dict[str, str], Any, str | None, str | None, str | None, dict[str, str] | None]:
-    selected_proxy = await _acquire_proxy_for_route(pool=pool, route=route)
-    raw_server = str(selected_proxy.get("proxy_server") or "").strip()
-    if not raw_server:
-        raise NoProxyAvailableError("Selected proxy entry was missing proxy_server.")
-    proxy_key = str(selected_proxy.get("proxy_key") or "").strip() or str(selected_proxy.get("proxy_id") or "").strip() or None
-    proxy_geo_hint = _build_proxy_geo_hint(route=route, selected_proxy=selected_proxy)
-
-    parsed = urlparse(raw_server)
-    scheme = (parsed.scheme or "").lower()
-    if not scheme:
-        raise RuntimeError("SCRAPER_PROXY_SERVER must include a scheme (http://, https://, socks5://)")
-
-    if not parsed.hostname or not parsed.port:
-        raise RuntimeError("SCRAPER_PROXY_SERVER must include host:port")
-    expected_proxy_ip = _extract_proxy_host_ip(raw_server)
-
-    configured_username = str(selected_proxy.get("proxy_username") or "").strip()
-    configured_password = str(selected_proxy.get("proxy_password") or "").strip()
-
-    url_username = unquote(parsed.username) if parsed.username else ""
-    url_password = unquote(parsed.password) if parsed.password else ""
-
-    username = configured_username or url_username
-    password = configured_password or url_password
-
-    clean_server = f"{scheme}://{parsed.hostname}:{parsed.port}"
-
-    proxy: dict[str, str] = {"server": clean_server}
-    if username:
-        proxy["username"] = username
-    if password:
-        proxy["password"] = password
-
+) -> tuple[dict[str, str] | None, Any, str | None, str | None, str | None, dict[str, str] | None]:
     # Bridge process is None since Dolphin Anty handles proxies internally per profile.
-    # The proxy lease logic is kept for telemetry, concurrency limits, and IP tracking.
+    # In V2.2, Dolphin profiles already have bound proxies configured natively in the Anty app. 
+    # We do not need the worker to maintain a proxy pool or acquire proxy locks.
     return (
-        proxy,
-        None,
-        str(selected_proxy.get("proxy_id") or "").strip() or None,
-        proxy_key,
-        expected_proxy_ip,
-        proxy_geo_hint,
+        None,   # proxy dict
+        None,   # bridge process
+        None,   # proxy_id
+        None,   # proxy_key 
+        None,   # expected proxy IP
+        None,   # geo hint
     )
 
 
@@ -1921,6 +2053,7 @@ async def _run_scrape_cycle(
         
     profile_dir = str(route.get("user_data_dir") or WORKER_USER_DATA_DIR or "").strip() or None
     profile_lock_id: str | None = None
+    dolphin_lock_id: str | None = None
     query_shard_lock_id: str | None = None
     query_shard_key: str | None = None
     bridge_process = None
@@ -1932,6 +2065,7 @@ async def _run_scrape_cycle(
     ingest_tasks: set[asyncio.Task] = set()
     scrape_event_tasks: set[asyncio.Task] = set()
     query_error_text_samples: list[str] = []
+    available_profiles: list[dict[str, Any]] = []
     persona_context_options: dict[str, Any] | None = None
     persona_extra_headers: dict[str, str] | None = None
     persona_details: dict[str, Any] | None = None
@@ -1969,6 +2103,8 @@ async def _run_scrape_cycle(
         if not lock_id_value:
             return
         refresh_interval = _lease_refresh_interval_seconds(lease_seconds)
+        max_consecutive_failures = 2  # tolerate brief DB blips before aborting
+        consecutive_failures = 0
         while not lease_keepalive_stop.is_set():
             await asyncio.sleep(refresh_interval)
             if lease_keepalive_stop.is_set():
@@ -1986,6 +2122,15 @@ async def _run_scrape_cycle(
             else:
                 error_text = f"{lock_name} lease lost during active session."
             if refreshed:
+                consecutive_failures = 0
+                continue
+            consecutive_failures += 1
+            if consecutive_failures < max_consecutive_failures:
+                logging.warning(
+                    "[%s] %s refresh returned False (attempt %d/%d), will retry in 5s",
+                    WORKER_NAME, lock_name, consecutive_failures, max_consecutive_failures,
+                )
+                await asyncio.sleep(5)
                 continue
             if "error" not in lease_keepalive_failure:
                 lease_keepalive_failure["error"] = error_text
@@ -2135,11 +2280,54 @@ async def _run_scrape_cycle(
         _start_lease_keepalive(query_shard_lock_id, "query_shard", WORKER_QUERY_SHARD_LEASE_SECONDS)
         scrape_started_monotonic = time.monotonic()
         try:
-            # For V2.2 Dolphin Anty, we need a profile_id. 
-            # In V2.1, `profile_dir` looked like `/app/browser_profiles/fb_account_123`
-            # We will extract the account ID ("123") and use it as the Dolphin profile_id.
-            # If we don't have one, we default to the route name or worker name.
-            dolphin_profile_id = _extract_profile_number(route)
+            # V2.2: Dynamically select an available Dolphin Anty profile.
+            # Instead of relying strictly on the DOLPHIN_PROFILE_ID env var,
+            # fetch the list of profiles and attempt to acquire a lock.
+            dolphin_profile_id = (os.getenv("DOLPHIN_PROFILE_ID") or "").strip()
+            
+            # If a strict DOLPHIN_PROFILE_ID is set (e.g. for testing), respect it.
+            # Otherwise, dynamically claim an available profile.
+            if not dolphin_profile_id:
+                from scraper.browser import list_dolphin_profiles
+                available_profiles = await list_dolphin_profiles()
+                
+                if available_profiles:
+                    # randomize the list slightly so workers don't all stampede the same order
+                    random.shuffle(available_profiles)
+                    
+                    # Fetch global blacklist state across all workers from Postgres
+                    all_ids = [str(p.get("id")) for p in available_profiles]
+                    blacklisted_profiles = await _fetch_dolphin_profile_blacklist(pool, all_ids)
+                    
+                    for p in available_profiles:
+                        pid_str = str(p.get("id"))
+                        until = blacklisted_profiles.get(pid_str)
+                        if until:
+                            logging.debug(
+                                "[%s] skipping blacklisted Dolphin profile %s (banned until %s)",
+                                WORKER_NAME, pid_str, until.isoformat()
+                            )
+                            continue
+                        
+                        # Overload the profile_dir argument to pass the Dolphin ID for locking
+                        locked_id = await _try_acquire_profile_lock(pool, route, pid_str)
+                        if locked_id:
+                            dolphin_profile_id = pid_str
+                            dolphin_lock_id = locked_id
+                            # Restart profile lease keepalive with the new lock ID
+                            _start_lease_keepalive(dolphin_lock_id, f"dolphin_profile_{dolphin_profile_id}", WORKER_PROXY_LEASE_SECONDS)
+                            logging.info("[%s] Dynamically claimed Dolphin Anty profile %s (%s)", WORKER_NAME, dolphin_profile_id, p.get("name"))
+                            break
+
+                if not dolphin_profile_id:
+                    # If we couldn't dynamically allocate any profile (e.g. token expired, or all profiles locked)
+                    raise NoProxyAvailableError(
+                        f"No available Dolphin Anty profiles could be locked dynamically. "
+                        f"(Found {len(available_profiles)} total profiles via API). Is the Dolphin session token valid?"
+                    )
+            
+            if not dolphin_profile_id:
+                raise ValueError("Could not determine or dynamically allocate a Dolphin Anty profile ID")
             
             scrape_kwargs = {
                 "profile_id": dolphin_profile_id,
@@ -2214,6 +2402,16 @@ async def _run_scrape_cycle(
             "proxy_observed_ip": proxy_observed_ip,
             "proxy_ip_check_status": proxy_ip_check_status,
         }
+        if dolphin_profile_id:
+            cycle_meta["dolphin_profile_id"] = dolphin_profile_id
+            try:
+                # Look up and preserve the profile name so outcome handlers can use it for alerts
+                for p in available_profiles:
+                    if str(p.get("id")) == dolphin_profile_id:
+                        cycle_meta["dolphin_profile_name"] = str(p.get("name") or "")
+                        break
+            except Exception:
+                pass
         if persona_digest:
             cycle_meta["persona_hash"] = persona_digest
         if isinstance(persona_details, dict):
@@ -2243,6 +2441,10 @@ async def _run_scrape_cycle(
             await _release_profile_lock(pool=pool, route=route, profile_lock_id=profile_lock_id)
         except Exception as exc:
             logging.warning("[%s] failed to release profile lock: %s", WORKER_NAME, exc)
+        try:
+            await _release_profile_lock(pool=pool, route=route, profile_lock_id=dolphin_lock_id)
+        except Exception as exc:
+            logging.warning("[%s] failed to release dolphin profile lock: %s", WORKER_NAME, exc)
         try:
             await _release_query_shard_lock(pool=pool, route=route, query_lock_id=query_shard_lock_id)
         except Exception as exc:
@@ -2471,14 +2673,18 @@ async def _main() -> None:
     # Start proxy provider health monitor (no-op if no gateway token configured).
     await start_proxy_monitor()
 
-_route_selection_lock = asyncio.Lock()
+    # Enter main scrape event loop
+    try:
+        await _run_worker_loop(pool, redis_client)
+    except asyncio.CancelledError:
+        logging.info("[%s] Worker shut down requested.", WORKER_NAME)
 
-async def _worker_slot_loop(
+
+async def _run_worker_loop(
     pool: asyncpg.Pool,
     redis_client: Redis,
-    slot_id: int,
 ) -> None:
-    logging.info("[%s/slot-%d] online", WORKER_NAME, slot_id)
+    logging.info("[%s] worker loop online", WORKER_NAME)
     global _SINGLE_ROUTE_ENFORCEMENT_ACTIVE
     try:
         while True:
@@ -2486,121 +2692,111 @@ async def _worker_slot_loop(
             route = None
             started_at = datetime.now(timezone.utc)
             try:
-                # Synchronize route selection
-                async with _route_selection_lock:
-                    released_cooldowns = await _release_expired_route_cooldowns(pool)
-                    if released_cooldowns > 0:
-                        logging.info(
-                            "[%s/slot-%d] released %s route(s) from expired cooldown.",
-                            WORKER_NAME,
-                            slot_id,
-                            released_cooldowns,
-                        )
-                    routes = await _load_worker_routes(pool)
-                    enabled_route_count = await _count_enabled_worker_routes(pool)
-                    eligible_route_count = len(routes)
-                    effective_interval_seconds = compute_worker_effective_interval(
-                        base_interval=SCRAPE_INTERVAL_SECONDS,
-                        enabled_count=enabled_route_count or eligible_route_count or 1,
-                        eligible_count=eligible_route_count,
-                        max_multiplier=WORKER_MAX_BACKOFF_MULTIPLIER,
+                released_cooldowns = await _release_expired_route_cooldowns(pool)
+                if released_cooldowns > 0:
+                    logging.info(
+                        "[%s] released %s route(s) from expired cooldown.",
+                        WORKER_NAME,
+                        released_cooldowns,
                     )
-                    single_route_enforcement = (
-                        enabled_route_count > 0 and enabled_route_count < WORKER_MIN_ENABLED_ROUTES_WARN
-                    )
+                routes = await _load_worker_routes(pool)
+                enabled_route_count = await _count_enabled_worker_routes(pool)
+                eligible_route_count = len(routes)
+                effective_interval_seconds = compute_worker_effective_interval(
+                    base_interval=SCRAPE_INTERVAL_SECONDS,
+                    enabled_count=enabled_route_count or eligible_route_count or 1,
+                    eligible_count=eligible_route_count,
+                    max_multiplier=WORKER_MAX_BACKOFF_MULTIPLIER,
+                )
+                single_route_enforcement = (
+                    enabled_route_count > 0 and enabled_route_count < WORKER_MIN_ENABLED_ROUTES_WARN
+                )
+                if single_route_enforcement:
+                    effective_interval_seconds *= WORKER_SINGLE_ROUTE_REST_MULTIPLIER
+                if single_route_enforcement != _SINGLE_ROUTE_ENFORCEMENT_ACTIVE:
                     if single_route_enforcement:
-                        effective_interval_seconds *= WORKER_SINGLE_ROUTE_REST_MULTIPLIER
-                    if single_route_enforcement != _SINGLE_ROUTE_ENFORCEMENT_ACTIVE:
-                        if single_route_enforcement:
-                            logging.warning(
-                                "[%s] min-route enforcement active: enabled routes=%s (< %s); applying %.2fx rest multiplier.",
-                                WORKER_NAME,
-                                enabled_route_count,
-                                WORKER_MIN_ENABLED_ROUTES_WARN,
-                                WORKER_SINGLE_ROUTE_REST_MULTIPLIER,
-                            )
-                        else:
-                            logging.info(
-                                "[%s] min-route enforcement lifted: enabled routes=%s (>= %s).",
-                                WORKER_NAME,
-                                enabled_route_count,
-                                WORKER_MIN_ENABLED_ROUTES_WARN,
-                            )
-                        _SINGLE_ROUTE_ENFORCEMENT_ACTIVE = single_route_enforcement
-
-                    # During quiet hours, slow down even further.
-                    if _is_quiet_hours():
-                        effective_interval_seconds *= WORKER_QUIET_HOURS_MULTIPLIER
-                        logging.debug(
-                            "[%s] quiet hours active — interval *= %.1f",
+                        logging.warning(
+                            "[%s] min-route enforcement active: enabled routes=%s (< %s); applying %.2fx rest multiplier.",
                             WORKER_NAME,
-                            WORKER_QUIET_HOURS_MULTIPLIER,
+                            enabled_route_count,
+                            WORKER_MIN_ENABLED_ROUTES_WARN,
+                            WORKER_SINGLE_ROUTE_REST_MULTIPLIER,
                         )
+                    else:
+                        logging.info(
+                            "[%s] min-route enforcement lifted: enabled routes=%s (>= %s).",
+                            WORKER_NAME,
+                            enabled_route_count,
+                            WORKER_MIN_ENABLED_ROUTES_WARN,
+                        )
+                    _SINGLE_ROUTE_ENFORCEMENT_ACTIVE = single_route_enforcement
 
-                    now_dt = datetime.now(timezone.utc)
-                    route = _select_next_route(routes, now=now_dt)
-                    
-                    if route is None:
-                        has_db_routes = await _has_configured_worker_routes(pool)
-                        if has_db_routes:
-                            manual_required_count = await _count_manual_login_required_routes(pool)
-                            due_in_seconds = seconds_until_next_route(routes=routes, now=now_dt) if routes else None
-                            cooldown_in_seconds = await _seconds_until_next_cooldown_release(pool)
+                # During quiet hours, slow down even further.
+                if _is_quiet_hours():
+                    effective_interval_seconds *= WORKER_QUIET_HOURS_MULTIPLIER
+                    logging.debug(
+                        "[%s] quiet hours active — interval *= %.1f",
+                        WORKER_NAME,
+                        WORKER_QUIET_HOURS_MULTIPLIER,
+                    )
 
-                            heartbeat_status = "scheduled_wait"
-                            if routes and due_in_seconds is not None:
-                                waiting_reason = (
-                                    f"No route is due yet. Next route becomes eligible in {int(max(0, due_in_seconds))}s."
-                                )
-                                sleep_target_seconds = max(0.1, due_in_seconds)
-                            else:
-                                heartbeat_status = "cooldown"
-                                if manual_required_count > 0:
-                                    waiting_reason = (
-                                        f"{manual_required_count} route(s) are quarantined for manual login. "
-                                        "Run VPS Manual Login, then clear Manual Login Required on the route."
-                                    )
-                                else:
-                                    waiting_reason = (
-                                        "No eligible DB routes currently available (routes may be in cooldown or waiting for proxy reuse)."
-                                    )
-                                if cooldown_in_seconds is not None:
-                                    sleep_target_seconds = max(0.1, cooldown_in_seconds)
-                                else:
-                                    sleep_target_seconds = max(1.0, effective_interval_seconds)
-                            
-                            # Only slot-0 updates the worker-wide idle heartbeats to avoid spam
-                            if slot_id == 0:
-                                await _upsert_worker_heartbeat(
-                                    pool=pool,
-                                    route_name="",
-                                    status=heartbeat_status,
-                                    listings_saved=0,
-                                    query_count=0,
-                                    last_error=waiting_reason,
-                                    started_at=started_at,
-                                    finished_at=datetime.now(timezone.utc),
-                                )
-                                logging.info("[%s] %s", WORKER_NAME, waiting_reason)
-                            
-                        else:
-                            route = _build_env_route()
-                            effective_interval_seconds = float(SCRAPE_INTERVAL_SECONDS)
-                            has_proxy = bool(str(route.get("proxy_server") or "").strip()) or bool(
-                                _split_proxy_pool(route.get("proxy_pool"))
+                now_dt = datetime.now(timezone.utc)
+                route = _select_next_route(routes, now=now_dt)
+                
+                if route is None:
+                    has_db_routes = await _has_configured_worker_routes(pool)
+                    if has_db_routes:
+                        manual_required_count = await _count_manual_login_required_routes(pool)
+                        due_in_seconds = seconds_until_next_route(routes=routes, now=now_dt) if routes else None
+                        cooldown_in_seconds = await _seconds_until_next_cooldown_release(pool)
+
+                        heartbeat_status = "scheduled_wait"
+                        if routes and due_in_seconds is not None:
+                            waiting_reason = (
+                                f"No route is due yet. Next route becomes eligible in {int(max(0, due_in_seconds))}s."
                             )
-                            if not has_proxy:
-                                raise RuntimeError(
-                                    "No worker routes configured in DB and no SCRAPER_PROXY_SERVER/SCRAPER_PROXY_POOL in environment."
+                            sleep_target_seconds = max(0.1, due_in_seconds)
+                        else:
+                            heartbeat_status = "cooldown"
+                            if manual_required_count > 0:
+                                waiting_reason = (
+                                    f"{manual_required_count} route(s) are quarantined for manual login. "
+                                    "Run VPS Manual Login, then clear Manual Login Required on the route."
                                 )
-                    
-                    if route is not None:
-                        route_started_at = datetime.now(timezone.utc)
-                        route_started_monotonic = time.monotonic()
-                        if route.get("source") == "db":
-                            await _mark_route_selected(pool, route)
+                            else:
+                                waiting_reason = (
+                                    "No eligible DB routes currently available (routes may be in cooldown or waiting for proxy reuse)."
+                                )
+                            if cooldown_in_seconds is not None:
+                                sleep_target_seconds = max(0.1, cooldown_in_seconds)
+                            else:
+                                sleep_target_seconds = max(1.0, effective_interval_seconds)
+                        
+                        await _upsert_worker_heartbeat(
+                            pool=pool,
+                            route_name="",
+                            status=heartbeat_status,
+                            listings_saved=0,
+                            query_count=0,
+                            last_error=waiting_reason,
+                            started_at=started_at,
+                            finished_at=datetime.now(timezone.utc),
+                        )
+                        logging.info("[%s] %s", WORKER_NAME, waiting_reason)
+                        
+                    else:
+                        route = _build_env_route()
+                        effective_interval_seconds = float(SCRAPE_INTERVAL_SECONDS)
+                        # V2.2: Dolphin Anty profiles have bound proxies configured
+                        # natively.  A standalone SCRAPER_PROXY_SERVER is no longer
+                        # required for workers to operate.
+                
+                if route is not None:
+                    route_started_at = datetime.now(timezone.utc)
+                    route_started_monotonic = time.monotonic()
+                    if route.get("source") == "db":
+                        await _mark_route_selected(pool, route)
                             
-                # --- Release Log & Execute Route ---
                 if route is None:
                     # No route found, wait and try again
                     sleep_target_seconds = sleep_target_seconds if has_db_routes else effective_interval_seconds
@@ -2686,6 +2882,7 @@ async def _worker_slot_loop(
                 outcome = cycle_result.outcome
                 error_category = cycle_result.error_category
                 reason = (cycle_result.reason or "").strip()
+                _cycle_dolphin_id = (cycle_result.details or {}).get("dolphin_profile_id") if cycle_result.details else None
                 route_interval_seconds = _route_interval_seconds(route, fallback_seconds=effective_interval_seconds)
                 if (
                     single_route_enforcement
@@ -2741,6 +2938,18 @@ async def _worker_slot_loop(
                             route,
                             quarantine_reason,
                         )
+                    alert_key = _profile_failure_alert_key(route)
+                    if _should_send_profile_failure_alert(alert_key):
+                        loop = asyncio.get_running_loop()
+                        func = functools.partial(
+                            _send_telegram_profile_failure_alert,
+                            route,
+                            quarantine_reason,
+                            metrics,
+                            0,
+                            None,
+                        )
+                        await loop.run_in_executor(None, func)
                 elif outcome in {
                     CycleOutcome.WAIT_PROXY,
                     CycleOutcome.WAIT_PROXY_MISMATCH,
@@ -2813,6 +3022,16 @@ async def _worker_slot_loop(
                     _ROUTE_CONSECUTIVE_BAD_CYCLES[route_runtime_key] = bad_cycles
 
                     base_reason = reason or "unknown scrape failure"
+
+                    # Record per-profile failure
+                    await _record_dolphin_profile_outcome(
+                        pool=pool,
+                        profile_id=_cycle_dolphin_id,
+                        success=False,
+                        profile_name=(cycle_result.details or {}).get("dolphin_profile_name", ""),
+                        reason=base_reason,
+                    )
+
                     failure_counts = counts_toward_bad_cycles(outcome, error_category)
                     derived_status = derive_route_status_for_bad_cycles(
                         bad_cycles=bad_cycles,
@@ -2882,19 +3101,6 @@ async def _worker_slot_loop(
                                 bad_cycles,
                             )
 
-                    if degraded:
-                        alert_key = _profile_failure_alert_key(route)
-                        if _should_send_profile_failure_alert(alert_key):
-                            loop = asyncio.get_running_loop()
-                            func = functools.partial(
-                                _send_telegram_profile_failure_alert,
-                                route,
-                                base_reason,
-                                metrics,
-                                bad_cycles,
-                                cooldown_for_alert,
-                            )
-                            await loop.run_in_executor(None, func)
 
                     await _upsert_worker_heartbeat(
                         pool=pool,
@@ -2907,6 +3113,14 @@ async def _worker_slot_loop(
                     )
                 else:
                     _ROUTE_CONSECUTIVE_BAD_CYCLES[route_runtime_key] = 0
+
+                    # Record per-profile success
+                    await _record_dolphin_profile_outcome(
+                        pool=pool,
+                        profile_id=_cycle_dolphin_id,
+                        success=True,
+                        profile_name=(cycle_result.details or {}).get("dolphin_profile_name", ""),
+                    )
 
                     # Session query cap tracking — force browser restart after N queries.
                     cycle_query_count = metrics.get("query_count", 0)
@@ -3021,7 +3235,7 @@ async def _worker_slot_loop(
                 if sleep_seconds > 0:
                     await asyncio.sleep(sleep_seconds)
             except Exception as exc:
-                logging.exception("[%s/slot-%d] scrape cycle failed: %s", WORKER_NAME, slot_id, exc)
+                logging.exception("[%s] scrape cycle failed: %s", WORKER_NAME, exc)
                 route_name = str((route or {}).get("route_name") or "unknown")
                 error_reason = str(exc) or "unknown scrape error"
                 await _record_route_outcome(pool, route or {}, success=False, error=str(exc))
@@ -3066,23 +3280,11 @@ async def _worker_slot_loop(
                 if sleep_seconds > 0:
                     await asyncio.sleep(sleep_seconds)
     except asyncio.CancelledError:
-        logging.info("[%s/slot-%d] slot loop cancelled", WORKER_NAME, slot_id)
+        logging.info("[%s] worker loop cancelled", WORKER_NAME)
         raise
     except Exception as e:
-        logging.exception("[%s/slot-%d] slot loop crashed cleanly: %s", WORKER_NAME, slot_id, e)
-
-async def _run_worker_loop(pool: asyncpg.Pool, redis_client: Redis) -> None:
-    # Launch 5 concurrent slots for proxy rotation
-    WORKER_CONCURRENCY = 5
-    tasks = []
-    for slot_id in range(WORKER_CONCURRENCY):
-        tasks.append(asyncio.create_task(_worker_slot_loop(pool, redis_client, slot_id)))
-    
-    try:
-        await asyncio.gather(*tasks)
+        logging.exception("[%s] worker loop crashed cleanly: %s", WORKER_NAME, e)
     finally:
-        for t in tasks:
-            t.cancel()
         await redis_client.close()
         await pool.close()
 
