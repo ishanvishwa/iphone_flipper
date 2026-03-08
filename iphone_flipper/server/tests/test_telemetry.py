@@ -12,7 +12,21 @@ class TelemetryPayloadTests(unittest.TestCase):
         started = datetime(2026, 2, 16, 10, 0, 0, tzinfo=timezone.utc)
         finished = started + timedelta(seconds=2)
         result = CycleResult(
-            metrics={"listings_saved": 3},
+            metrics={
+                "listings_saved": 3,
+                "listings_scraped": 5,
+                "listings_parsed": 5,
+                "query_count": 2,
+                "query_result_count": 2,
+                "postgres_upsert_latency_ms_sum": 15,
+                "postgres_upsert_latency_ms_count": 3,
+                "redis_publish_latency_ms_sum": 9,
+                "redis_publish_latency_ms_count": 3,
+                "notification_delivery_latency_ms_sum": 11,
+                "notification_delivery_latency_ms_count": 1,
+                "end_to_end_alert_latency_ms_sum": 120,
+                "end_to_end_alert_latency_ms_count": 1,
+            },
             outcome=CycleOutcome.OK,
             retry_count=1,
             details={
@@ -32,6 +46,8 @@ class TelemetryPayloadTests(unittest.TestCase):
                     "locale": "en-US",
                     "color_scheme": "light",
                 },
+                "websocket_broadcast_latency_ms": 18,
+                "websocket_broadcast_client_count": 2,
             },
         )
         payload = build_cycle_telemetry_payload(
@@ -52,12 +68,24 @@ class TelemetryPayloadTests(unittest.TestCase):
         self.assertEqual(payload["outcome"], CycleOutcome.OK.value)
         self.assertEqual(payload["error_category"], ErrorCategory.NONE.value)
         self.assertEqual(payload["retry_count"], 1)
+        self.assertEqual(payload["listings_saved"], 3)
+        self.assertEqual(payload["listings_scraped"], 5)
+        self.assertEqual(payload["listings_parsed"], 5)
+        self.assertEqual(payload["query_count"], 2)
+        self.assertEqual(payload["postgres_upsert_latency_ms_sum"], 15)
+        self.assertEqual(payload["postgres_upsert_latency_ms_count"], 3)
+        self.assertEqual(payload["redis_publish_latency_ms_count"], 3)
+        self.assertEqual(payload["notification_delivery_latency_ms_sum"], 11)
+        self.assertEqual(payload["notification_delivery_latency_ms_count"], 1)
+        self.assertEqual(payload["end_to_end_alert_latency_ms_count"], 1)
         self.assertEqual(payload["signal_action"], "throttle")
         self.assertEqual(payload["query_shard_key"], "iphone_15")
         self.assertEqual(payload["soft_signals"], ["LOW_RESULTS"])
         self.assertEqual(payload["persona_hash"], "abc123")
         self.assertEqual(payload["persona"]["timezone_id"], "America/Los_Angeles")
         self.assertEqual(payload["persona"]["locale"], "en-US")
+        self.assertEqual(payload["websocket_broadcast_latency_ms"], 18)
+        self.assertEqual(payload["websocket_broadcast_client_count"], 2)
 
     def test_payload_uses_fallback_values_without_result(self) -> None:
         started = datetime(2026, 2, 16, 10, 0, 0, tzinfo=timezone.utc)

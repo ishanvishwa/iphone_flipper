@@ -24,6 +24,9 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
+from server.services.common.feature_flags import FLAG_HASH_KEY, RedisFeatureFlags
+from server.services.common.observability import emit_json_log
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -456,6 +459,13 @@ async def run_notification_worker() -> None:
     )
 
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+    feature_flags = RedisFeatureFlags(redis_client, hash_key=FLAG_HASH_KEY)
+    emit_json_log(
+        "feature_flag_snapshot",
+        service="notification_worker",
+        flag_hash_key=FLAG_HASH_KEY,
+        flags=await feature_flags.snapshot(),
+    )
     pubsub = redis_client.pubsub()
     await pubsub.subscribe(LISTING_EVENTS_CHANNEL)
 

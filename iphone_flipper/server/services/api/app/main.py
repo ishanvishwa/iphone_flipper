@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import time
 from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Any
@@ -10,6 +11,8 @@ import asyncpg
 from fastapi import FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
+from server.services.common.feature_flags import FLAG_HASH_KEY, RedisFeatureFlags
+from server.services.common.observability import emit_json_log, monotonic_duration_ms, utc_now_iso
 from server.services.common.schema_ensure import ensure_worker_tables as ensure_common_worker_tables
 
 APP_ENV = os.getenv("APP_ENV", "production")
@@ -84,6 +87,33 @@ def _serialize_datetimes(item: dict[str, Any], keys: tuple[str, ...]) -> dict[st
         if hasattr(value, "isoformat"):
             item[key] = value.isoformat()
     return item
+
+
+def _extract_listing_observation_fields(payload: dict[str, Any]) -> dict[str, Any] | None:
+    event_name = str(payload.get("event") or "").strip()
+    if event_name not in {"listing_created", "listing_updated"}:
+        return None
+
+    listing = payload.get("listing")
+    listing_payload = listing if isinstance(listing, dict) else {}
+    listing_id = str(listing_payload.get("id") or payload.get("listing_id") or "").strip()
+    if not listing_id:
+        return None
+
+    worker_name = (
+        str(payload.get("worker_name") or "").strip()
+        or str(payload.get("worker") or "").strip()
+        or None
+    )
+    route_name = str(payload.get("route_name") or "").strip() or None
+    event_id = str(payload.get("event_id") or "").strip() or None
+    return {
+        "listing_id": listing_id,
+        "event_id": event_id,
+        "worker_name": worker_name,
+        "route_name": route_name,
+        "event_name": event_name,
+    }
 
 
 def _normalize_proxy_mode(raw: str | None) -> str:
@@ -215,6 +245,13 @@ async def startup() -> None:
         password=REDIS_PASSWORD or None,
         decode_responses=True,
     )
+    app.state.feature_flags = RedisFeatureFlags(app.state.redis, hash_key=FLAG_HASH_KEY)
+    emit_json_log(
+        "feature_flag_snapshot",
+        service="api",
+        flag_hash_key=FLAG_HASH_KEY,
+        flags=await app.state.feature_flags.snapshot(),
+    )
     app.state.ws_clients: set[WebSocket] = set()
     app.state.redis_listener_task = asyncio.create_task(_redis_listener())
 
@@ -237,8 +274,18 @@ async def shutdown() -> None:
 
 
 async def _broadcast(payload: dict[str, Any]) -> None:
+    broadcast_started = time.monotonic()
     clients = list(getattr(app.state, "ws_clients", set()))
+    listing_fields = _extract_listing_observation_fields(payload)
     if not clients:
+        if listing_fields:
+            emit_json_log(
+                "listing_gui_push",
+                **listing_fields,
+                gui_pushed_ts=utc_now_iso(),
+                websocket_broadcast_latency_ms=0,
+                websocket_client_count=0,
+            )
         return
 
     dead_clients: list[WebSocket] = []
@@ -253,6 +300,15 @@ async def _broadcast(payload: dict[str, Any]) -> None:
             with suppress(Exception):
                 await ws.close()
             app.state.ws_clients.discard(ws)
+
+    if listing_fields:
+        emit_json_log(
+            "listing_gui_push",
+            **listing_fields,
+            gui_pushed_ts=utc_now_iso(),
+            websocket_broadcast_latency_ms=monotonic_duration_ms(broadcast_started),
+            websocket_client_count=max(0, len(clients) - len(dead_clients)),
+        )
 
 
 async def _redis_listener() -> None:

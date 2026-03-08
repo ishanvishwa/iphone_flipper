@@ -9,7 +9,7 @@ This is a living development log tracking:
 - roadmap drift (manual/additional features)
 - current status and active risks
 
-Last updated: **2026-02-22**
+Last updated: **2026-03-08**
 Author: Codex implementation/update pass
 
 ---
@@ -877,6 +877,7 @@ Still out of current local-app scope (documented, not removed):
 12. V2.2 core scraper package (`core/scraper/config.py`) and V1 scraper package (`scraper/config.py`, `scraper/__init__.py`) still carry bridge/connection-limiting configs (`FORCE_LOCAL_PROXY_BRIDGE`, `PROXY_BRIDGE_*`) that were rolled back from the worker runtime path in dev-log §25. Config symbols are importable but have no active runtime consumer. Cleanup or re-activation decision is pending.
 13. `scraper/legacy_utils.py` preserves V1 monolithic scraper logic (GraphQL extraction, DOM extraction, progressive scroll, stealth scripts) as shared utilities. No automated tests cover these utilities directly; coverage relies on integration-level scrape runs.
 14. ~~Worker slot concurrency (`WORKER_CONCURRENCY = 5` hardcoded in `_run_worker_loop`) is not operator-configurable via env var.~~ **Resolved** – concurrency removed entirely (§34). Workers now run single-loop-per-container; parallelism via Docker compose.
+15. Current worker pub/sub event payload shape and `notification_worker.py` parse expectations do not fully align. This is now explicitly documented and deferred to the later Redis event-spine / notification-consumer phases, not fixed in V3.0 Phase 0.
 
 ---
 
@@ -884,6 +885,7 @@ Still out of current local-app scope (documented, not removed):
 
 ### Priority 1
 
+- Review, test, and approve V3.0 Phase 0 (Redis flags + baseline observability) before starting any V3.0 behavior-change phase.
 - Complete Phase 5A desktop sync integration by adding direct WebSocket apply on top of the shipped cursor-poll baseline.
 - Implement `condition_confidence` tiers and manual-review routing.
 - Add selective detail-page enrichment for low-confidence/high-value listings.
@@ -1758,5 +1760,74 @@ This keeps `dev-log.md` actionable for both engineering and operations.
 - Validation performed:
   - Cross-referenced all worker env vars in `docker-compose.yml` against `.env.example` template
   - Verified all dev-log entries §1–§35 accurately reflect current source code in `worker.py`, `lease_manager.py`, `gui.py`, `docker-compose.yml`
+
+---
+
+### §37 – V3.0 Phase 0: Redis Flags + Baseline Observability (2026-03-08)
+
+- Summary: Implemented Phase 0 of the approved V3.0 latency/responsiveness upgrade track. This phase adds Redis-backed runtime feature flags plus JSON observability across worker/API/GUI poll-sync flows without changing current event payload contracts or moving into Phase 1 behavior.
+- Motivation:
+  - establish rollout controls and latency measurement before modifying the current event spine
+  - keep the upgrade within the approved non-goals and strict phase order
+  - document the current server baseline, including known deferred mismatches, before deeper transport/scheduler changes
+- Changes:
+  - added shared Redis feature-flag helper (`server/services/common/feature_flags.py`):
+    - Redis hash key: `flipper:flags`
+    - default-disabled flags: `ENABLE_REDIS_STREAM_EVENTS`, `ENABLE_NOTIFICATION_CONSUMER`, `ENABLE_GUI_WEBSOCKET_PUSH`, `ENABLE_PRIORITY_SCHEDULER`, `ENABLE_ROUTE_LANES`
+    - ~1s in-process cache, async reads, safe fallback to defaults on Redis failure
+  - added shared JSON observability helper (`server/services/common/observability.py`) for timestamp normalization, latency calculation, and JSON-only log emission
+  - added startup feature-flag snapshot logs in:
+    - `server/services/api/app/main.py`
+    - `server/services/worker/worker.py`
+    - `server/services/worker/notification_worker.py`
+  - added worker-side listing-path observability:
+    - `listing_seen_ts`
+    - `listing_persisted_ts`
+    - `listing_event_published_ts`
+    - inline Telegram `notification_sent_ts` / delivery status
+    - aggregate cycle metrics for Postgres upsert latency, Redis publish latency, inline notification delivery latency, and end-to-end alert latency
+  - extended worker cycle telemetry payload builder (`server/services/worker/telemetry.py`) with listings-parsed count and new latency aggregate fields
+  - added API-side observability for listing WebSocket push attempts:
+    - `gui_pushed_ts`
+    - `websocket_broadcast_latency_ms`
+    - `websocket_client_count`
+  - added GUI poll-sync observability for per-listing local render/apply events:
+    - `gui_rendered_ts`
+    - source marker `poll_sync`
+  - updated `architecture.md`, `roadmap.md`, and `dev-log.md` to record:
+    - V3.0 Phase 0 scope and explicit non-goals
+    - current baseline vs later approved phases
+    - deferred notification-worker payload-shape mismatch
+  - fresh audit result:
+    - no additional undocumented features or process enhancements were found beyond the existing roadmap-drift audit sections already captured in project docs
+- Files touched:
+  - `server/services/common/feature_flags.py`
+  - `server/services/common/observability.py`
+  - `server/services/worker/worker.py`
+  - `server/services/worker/telemetry.py`
+  - `server/services/worker/notification_worker.py`
+  - `server/services/api/app/main.py`
+  - `gui.py`
+  - `server/tests/test_feature_flags.py`
+  - `server/tests/test_api_observability.py`
+  - `server/tests/test_worker_observability.py`
+  - `server/tests/test_telemetry.py`
+  - `architecture.md`
+  - `roadmap.md`
+  - `dev-log.md`
+- Decision/rationale:
+  - Phase 0 is intentionally measurement-only. Existing Redis pub/sub fanout, inline worker Telegram notifications, standalone notification-worker implementation, and API WebSocket endpoint remain behaviorally unchanged.
+  - The pre-existing payload mismatch between current worker pub/sub events and `notification_worker.py` parsing is documented but intentionally deferred until the later Redis event-spine / notification-consumer phases.
+  - Untracked workspace SSH keys (`iphone_flipper/l`, `iphone_flipper/l.pub`) were explicitly left untouched and are not part of this implementation.
+- Validation performed:
+  - installed missing server test dependencies into the existing repo venv so API/worker modules could be imported for targeted Phase 0 validation
+  - `./.venv/bin/python -m pytest server/tests/test_feature_flags.py server/tests/test_telemetry.py server/tests/test_api_observability.py server/tests/test_worker_observability.py server/tests/test_notification_worker.py -q`
+  - result: `27 passed`
+  - Python AST parse checks passed for modified API/worker/GUI/test modules before running pytest
+- Unresolved follow-ups:
+  - Phase 1 is blocked pending operator review, test, and approval of this Phase 0 patch
+  - notification worker still is not compose-wired as a production service
+  - worker pub/sub payload alignment with `notification_worker.py` remains deferred to later approved phases
+  - GUI still applies server changes via cursor polling; WebSocket-first apply path remains deferred to later approved phases
 
 ---

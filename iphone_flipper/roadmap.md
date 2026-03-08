@@ -9,8 +9,8 @@ This roadmap is a comprehensive implementation plan that combines:
 - Additional/manual enhancements discovered during code audit
 - Remaining work needed for stability, condition accuracy, and safe automation
 
-Audit date: **2026-02-10**
-Last implementation update: **2026-02-22**
+Audit date: **2026-03-08**
+Last implementation update: **2026-03-08**
 
 ## Roadmap Structure
 
@@ -484,6 +484,69 @@ Condition accuracy is a critical decision parameter and currently constrained by
 
 ---
 
+## V3.0 Upgrade Track: Latency and Responsiveness
+
+### Goals
+
+- Improve end-to-end alert latency without increasing per-profile request intensity
+- Add safe rollout controls and measurement before changing the current event path
+- Execute the upgrade strictly in approved phases
+
+### Explicit Non-Goals
+
+- No separate raw HTTP scraper driver as the primary discovery path
+- No token extraction/replay architecture outside the browser as the main runtime mode
+- No proxy/fingerprint escalation intended to preserve large-scale account automation
+- No profile role-segregation specifically for anti-spam evasion
+- No notification-before-persistence flow
+
+### Phase 0 Completed (This Update)
+
+- [x] Added shared Redis-backed feature-flag registry (`flipper:flags`) with all V3.0 upgrade-path flags defaulting to `false`:
+  - [x] `ENABLE_REDIS_STREAM_EVENTS`
+  - [x] `ENABLE_NOTIFICATION_CONSUMER`
+  - [x] `ENABLE_GUI_WEBSOCKET_PUSH`
+  - [x] `ENABLE_PRIORITY_SCHEDULER`
+  - [x] `ENABLE_ROUTE_LANES`
+- [x] Added safe feature-flag cache/fallback behavior (`server/services/common/feature_flags.py`):
+  - [x] async Redis reads
+  - [x] ~1s in-process cache
+  - [x] safe fallback to defaults on Redis failure
+  - [x] startup flag snapshot logging in API, worker, and notification worker
+- [x] Added shared JSON observability helper layer (`server/services/common/observability.py`) with timestamp/latency utilities and JSON-only log emission
+- [x] Added worker-side listing-path observability without changing pub/sub payload contracts:
+  - [x] `listing_seen_ts`
+  - [x] `listing_persisted_ts`
+  - [x] `listing_event_published_ts`
+  - [x] inline Telegram `notification_sent_ts` / delivery status
+  - [x] join keys via `listing_id` + worker/route context
+- [x] Extended cycle telemetry with:
+  - [x] listings parsed count
+  - [x] Postgres upsert latency aggregates
+  - [x] Redis publish latency aggregates
+  - [x] inline notification delivery latency aggregates
+  - [x] end-to-end alert latency aggregates
+- [x] Added API-side observability for WebSocket broadcast latency and `gui_pushed_ts`
+- [x] Added GUI poll-sync observability for per-listing `gui_rendered_ts` with source marker `poll_sync`
+- [x] Added targeted tests for feature flags, telemetry, worker observability, API observability, and existing notification worker coverage
+- [x] Fresh 2026-03-08 code audit found no additional undocumented features/process enhancements beyond the audit sections already captured elsewhere in this roadmap and `dev-log.md`
+
+### Planned Next Phases (Do Not Start Until Phase 0 Is Approved)
+
+- [ ] Phase 1: durable Redis Streams event spine after persistence, with capped retention and duplicate protection
+- [ ] Phase 2: standalone notification consumer service with consumer-group retries, dedupe ledger, and outbound rate limiting
+- [ ] Phase 3: desktop WebSocket-first live sync with polling fallback, reconnect backfill, and GUI-thread-safe apply path
+- [ ] Phase 4: priority scheduler and route/query lanes while preserving current cooldown/reuse windows
+- [ ] Phase 5: hot-path payload slimming and background enrichment for non-critical fields
+- [ ] Phase 6: reliability/replay/operator controls (health endpoints, backlog visibility, replay tooling, live push rollback switches)
+
+### Upgrade-Track Notes
+
+- Current baseline remains unchanged in Phase 0: Redis pub/sub fanout stays active, inline worker Telegram notifications stay active, the API WebSocket endpoint stays available, and the GUI remains polling-first.
+- Pre-existing notification-worker payload-shape mismatch remains documented and deferred to the later event-spine / notification-consumer phases.
+
+---
+
 ## Original Roadmap Drift Audit (Summary)
 
 The following significant enhancements were found in code but not reflected as explicit roadmap items in the original baseline:
@@ -525,6 +588,8 @@ Note: Specifically, an external `patch_core.py` was used to dynamically patch `s
 
 Action taken: all above are now documented in `roadmap.md` as completed scope.
 
+Fresh audit note (2026-03-08): no additional undocumented code-level features were found beyond the items already captured in this summary and the later V3.0 upgrade-track section above.
+
 ## Current Focus Recommendation
 
-Active priority should be **Phase 5A** (24x7 server + real-time sync migration), followed immediately by **Phase 4** (condition confidence + selective detail-page enrichment). Dolphin Anty VPS installation is now resolved (systemd autostart operational). Remaining high-impact items: WebSocket desktop sync, notification worker compose wiring, and `legacy_utils.py` test coverage.
+Active priority is **V3.0 Phase 0 review/validation**. After approval, the next implementation step should be **V3.0 Phase 1** (durable Redis Streams event spine), while keeping the broader **Phase 5A** server-migration direction intact. Dolphin Anty VPS installation is now resolved (systemd autostart operational). Remaining high-impact items after Phase 0 approval: Redis Streams event spine, notification worker compose wiring/schema alignment, WebSocket desktop sync apply path, and `legacy_utils.py` test coverage.

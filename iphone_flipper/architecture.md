@@ -36,6 +36,17 @@ Target direction (approved migration path):
 - **Desktop sync layer**: WebSocket client in local GUI for real-time listing updates
 - **Desktop role**: operator console (review, negotiation, deal tracking), no longer long-running scraper host
 
+V3.0 upgrade guardrails (approved for the latency/responsiveness track):
+
+- Phase 0 is instrumentation + rollout-control scaffolding only: Redis-backed flags and JSON observability without changing current payload contracts.
+- Explicit non-goals for this track:
+  - no separate raw HTTP scraper driver as the primary discovery path
+  - no token extraction/replay architecture outside the browser as the main runtime mode
+  - no proxy/fingerprint escalation intended to preserve large-scale account automation
+  - no profile role-segregation specifically for anti-spam evasion
+  - no notification-before-persistence flow
+- Current baseline remains Redis pub/sub + API WebSocket endpoint + GUI polling sync; later phases may formalize Redis Streams and WebSocket-first desktop sync only after approval.
+
 ## 3. High-Level Component Diagram
 
 ```mermaid
@@ -195,11 +206,15 @@ flowchart TD
 5.9 Every cycle emits structured JSON telemetry (`cycle_id`, `route_name`, `proxy_key`, `query_shard_key`, `duration_ms`, `outcome`, `error_category`, `retry_count`) for diagnostics.
 5.10 Manual-login quarantine state now persists incident metadata (`quarantined_at`, `quarantine_reason`, `quarantine_evidence`) and supports API/GUI recovery actions (route retest and worker-level bulk clear).
 5.11 Worker cycles can apply coherent browser personas (`ENABLE_FINGERPRINT_VARIATION`) and log `persona_hash`/persona context in telemetry for correlation diagnostics.
+5.12 V3.0 Phase 0 adds a Redis-backed feature-flag registry (`flipper:flags`) with all upgrade-path flags defaulting to disabled: `ENABLE_REDIS_STREAM_EVENTS`, `ENABLE_NOTIFICATION_CONSUMER`, `ENABLE_GUI_WEBSOCKET_PUSH`, `ENABLE_PRIORITY_SCHEDULER`, and `ENABLE_ROUTE_LANES`.
+5.13 V3.0 Phase 0 also adds JSON observability markers for `listing_seen_ts`, `listing_persisted_ts`, `listing_event_published_ts`, and inline `notification_sent_ts`, plus cycle-level latency aggregates for Postgres upsert, Redis publish, and end-to-end alert timing.
 7. API service relays events through Redis/WebSocket-compatible channels; desktop currently consumes server changes via incremental cursor polling with direct WebSocket apply still pending.
+7.1 V3.0 Phase 0 instruments API broadcast latency and GUI poll-sync render timestamps (`gui_pushed_ts`, `gui_rendered_ts`) without changing REST or WebSocket payload shapes.
 8. Worker runtime can send immediate Telegram listing cards on `listing_created` when `potential_profit >= TELEGRAM_NOTIFY_MIN_PROFIT` (default `0`) and model is not blank/`Unknown`, including link + price/profit/description summary.
 9. Notification service architecture (implemented baseline + decoupled event-driven worker):
    - **Inline worker path** (current production default): worker runtime sends Telegram listing cards directly on `listing_created` events when `potential_profit >= TELEGRAM_NOTIFY_MIN_PROFIT`.
    - **Event-driven notification worker** (`notification_worker.py`): standalone service subscribing to Redis `listing_events` pub/sub for sub-second delivery with priority tiers (instant ≥ $50, fast-batch ≥ $0, suppressed < $0), Telegram + FCM push, rate limiting, and deduplication. Pending compose service wiring for production deployment.
+9.1 A pre-existing payload-shape mismatch remains between current worker pub/sub events and `notification_worker.py` parse expectations; this is documented and intentionally deferred until the later Redis event-spine / notification-consumer phases.
 8.1 Proxy provider health monitoring (`proxy_monitor.py`):
    - background async polling of proxy gateway utilization API.
    - health snapshot tracks threads/utilization/error-rate/bandwidth with pacing multiplier computation.
@@ -217,6 +232,8 @@ Implemented baseline artifacts in repository:
 - `server/services/worker/proxy_monitor.py` (proxy provider real-time health polling with pacing multiplier and Telegram alerts)
 - `server/services/worker/runtime.py` (cycle outcomes, error taxonomy, scheduling/backoff helpers)
 - `server/services/worker/lease_manager.py`, `server/services/worker/route_transitions.py`, `server/services/worker/scheduler.py`, `server/services/worker/persona.py` (worker modularization)
+- `server/services/common/feature_flags.py` (Redis-backed runtime flag registry with 1s cache + safe defaults)
+- `server/services/common/observability.py` (shared JSON log emission + latency/timestamp helpers)
 - `server/services/common/schema_ensure.py` (shared schema ensure path for API + worker startup)
 - `notifications.py` card path reused by worker for Telegram listing-card dispatch (`notify_telegram_listing_card`)
 - `server/services/api/sql/001_init.sql` (server listings schema + worker route/heartbeat schema)
@@ -518,4 +535,5 @@ Current condition logic is **keyword-only** using listing card text/title (+ des
 
 ## 13. Architecture Revision Notes
 
-1. This version reflects codebase state audited on **2026-02-22** and includes all prior GUI/process enhancements (price-sheet editor, row flags, scraper progress/cancel, hybrid GraphQL+DOM fetch, accessory suppression, proxy ingestion/ban controls, VPS route rendering), the implemented 24x7 server baseline (due-time scheduling, WAIT outcomes, profile/query-shard locks, proxy health scoring, route state machine, signal detection, quarantine operations, proxy-binding verification, persona variation, worker modularization, shared schema ensure, minimum-route resilience, structured telemetry), **plus** the following recent additions: scraper module refactoring from monolithic `scraper.py` to structured package (`scraper/`), standalone event-driven notification worker with FCM push and priority-tier dispatch (`notification_worker.py`), proxy provider real-time health monitoring (`proxy_monitor.py`) now actively wired into worker loop, Dolphin Anty profile management GUI tab with API key integration and Bearer-token authentication, manual standalone patching of `scraper/core.py` utilizing `patch_core.py` and `scraper/legacy_utils.py` (814-line V1 utility preservation), **V2.2 milestone**: `core/scraper/` package rewrite with Dolphin Anty CDP-based browser launch (`connect_over_cdp`) with `DOLPHIN_WS_HOST` Docker→host connectivity and duplicate-running profile reuse (`E_BROWSER_RUN_DUPLICATE`), weighted bucket query diversification, quiet hours scheduling, session duration caps, dynamic Dolphin profile cloud-first allocation via Postgres locks with three-tier API fallback, VPS infrastructure migration to `ubuntu@15.235.185.32`, Caddy TLS reverse proxy in Docker Compose, `DOLPHIN_ANTY_TOKEN` compose environment for cloud API authentication, **and V2.3**: ~~5-slot concurrent worker architecture~~ removed — reverted to single-loop-per-container (dev-log §34); parallelism via Docker worker containers.
+1. This version reflects codebase state audited on **2026-03-08** and includes all prior GUI/process enhancements (price-sheet editor, row flags, scraper progress/cancel, hybrid GraphQL+DOM fetch, accessory suppression, proxy ingestion/ban controls, VPS route rendering), the implemented 24x7 server baseline (due-time scheduling, WAIT outcomes, profile/query-shard locks, proxy health scoring, route state machine, signal detection, quarantine operations, proxy-binding verification, persona variation, worker modularization, shared schema ensure, minimum-route resilience, structured telemetry), **plus** the following recent additions: scraper module refactoring from monolithic `scraper.py` to structured package (`scraper/`), standalone event-driven notification worker with FCM push and priority-tier dispatch (`notification_worker.py`), proxy provider real-time health monitoring (`proxy_monitor.py`) now actively wired into worker loop, Dolphin Anty profile management GUI tab with API key integration and Bearer-token authentication, manual standalone patching of `scraper/core.py` utilizing `patch_core.py` and `scraper/legacy_utils.py` (814-line V1 utility preservation), **V2.2 milestone**: `core/scraper/` package rewrite with Dolphin Anty CDP-based browser launch (`connect_over_cdp`) with `DOLPHIN_WS_HOST` Docker→host connectivity and duplicate-running profile reuse (`E_BROWSER_RUN_DUPLICATE`), weighted bucket query diversification, quiet hours scheduling, session duration caps, dynamic Dolphin profile cloud-first allocation via Postgres locks with three-tier API fallback, VPS infrastructure migration to `ubuntu@15.235.185.32`, Caddy TLS reverse proxy in Docker Compose, `DOLPHIN_ANTY_TOKEN` compose environment for cloud API authentication, **V2.3**: ~~5-slot concurrent worker architecture~~ removed — reverted to single-loop-per-container (dev-log §34); parallelism via Docker worker containers, **and V3.0 Phase 0**: Redis-backed upgrade-path feature flags in `flipper:flags`, JSON latency/correlation logging across worker/API/GUI poll-sync flows, extended cycle telemetry aggregates, and a fresh audit confirming no additional undocumented features beyond the existing roadmap-drift sections.
+2. V3.0 Phase 0 intentionally does **not** change the current runtime contracts: worker pub/sub stays in place, inline worker Telegram notifications stay active, the API WebSocket endpoint remains available, the GUI remains polling-first, and the notification-worker payload-shape mismatch is documented but deferred to later approved phases.

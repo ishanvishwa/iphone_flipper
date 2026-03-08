@@ -43,6 +43,7 @@ from scraper import (
     update_fb_account_runtime_status,
 )
 from notifications import notify_new_listings
+from server.services.common.observability import emit_json_log, utc_now_iso
 
 DB_PATH = Path(__file__).parent / "listings.db"
 
@@ -681,8 +682,20 @@ class iPhoneFlipperGUI:
 
             if listing_id in existing_ids:
                 updated += 1
+                sync_action = "updated"
             else:
                 inserted += 1
+                sync_action = "inserted"
+
+            emit_json_log(
+                "listing_gui_rendered",
+                listing_id=listing_id,
+                source="poll_sync",
+                sync_action=sync_action,
+                gui_rendered_ts=utc_now_iso(),
+                server_created_at=created_at,
+                server_updated_at=updated_at,
+            )
 
         purge_accessory_only_listings(cursor)
         conn.commit()

@@ -33,6 +33,14 @@ from scraper import (  # noqa: E402
     scrape_marketplace,
 )
 from notifications import notify_telegram_listing_card, send_telegram  # noqa: E402
+from server.services.common.feature_flags import FLAG_HASH_KEY, RedisFeatureFlags  # noqa: E402
+from server.services.common.observability import (  # noqa: E402
+    emit_json_log,
+    emit_json_payload,
+    monotonic_duration_ms,
+    timestamp_delta_ms,
+    utc_now_iso,
+)
 from server.services.common.schema_ensure import ensure_worker_tables as ensure_common_worker_tables  # noqa: E402
 from server.services.worker.proxy_monitor import get_proxy_health, start_monitor as start_proxy_monitor  # noqa: E402
 from server.services.worker.lease_manager import (  # noqa: E402
@@ -658,7 +666,7 @@ def _should_notify_telegram(created: bool, listing: dict[str, Any]) -> bool:
     return profit is not None and profit >= TELEGRAM_NOTIFY_MIN_PROFIT
 
 
-def _send_telegram_listing_notification(listing: dict[str, Any]) -> None:
+def _send_telegram_listing_notification(listing: dict[str, Any]) -> bool:
     sent = notify_telegram_listing_card(listing)
     if not sent:
         logging.warning(
@@ -666,6 +674,7 @@ def _send_telegram_listing_notification(listing: dict[str, Any]) -> None:
             WORKER_NAME,
             listing.get("id"),
         )
+    return bool(sent)
 
 
 def _extract_profile_number(route: dict[str, Any]) -> str:
@@ -767,6 +776,14 @@ def _telemetry_proxy_key(route: dict[str, Any]) -> str | None:
     return _canonical_proxy_key(server=server, username=username)
 
 
+def _increment_latency_metric(metrics: dict[str, int], prefix: str, latency_ms: int | None) -> None:
+    if latency_ms is None:
+        return
+    safe_latency = max(0, int(latency_ms))
+    metrics[f"{prefix}_sum"] = metrics.get(f"{prefix}_sum", 0) + safe_latency
+    metrics[f"{prefix}_count"] = metrics.get(f"{prefix}_count", 0) + 1
+
+
 def _emit_cycle_telemetry(
     cycle_id: str,
     route: dict[str, Any],
@@ -783,7 +800,7 @@ def _emit_cycle_telemetry(
         result=result,
         fallback_proxy_key=_telemetry_proxy_key(route),
     )
-    logging.info("%s", json.dumps(payload, default=str, separators=(",", ":")))
+    emit_json_payload(payload)
 
 
 def _should_send_profile_failure_alert(alert_key: str, now: datetime | None = None) -> bool:
@@ -1981,10 +1998,10 @@ async def _publish_listing_event(
     event_name: str,
     listing: dict[str, Any],
     metadata: dict[str, Any],
-) -> None:
+) -> tuple[str, int]:
     payload = {
         "event": event_name,
-        "at": datetime.now(timezone.utc).isoformat(),
+        "at": utc_now_iso(),
         "worker": WORKER_NAME,
         "route_name": metadata.get("route_name"),
         "query": metadata.get("query"),
@@ -1992,7 +2009,9 @@ async def _publish_listing_event(
         "query_total": metadata.get("query_total"),
         "listing": listing,
     }
+    publish_started = time.monotonic()
     await redis_client.publish(LISTING_EVENT_CHANNEL, json.dumps(payload, default=str))
+    return utc_now_iso(), monotonic_duration_ms(publish_started)
 
 
 async def _process_listing_event(
@@ -2000,17 +2019,76 @@ async def _process_listing_event(
     redis_client: Redis,
     listing: dict[str, Any],
     metadata: dict[str, Any],
+    cycle_metrics: dict[str, int],
 ) -> None:
+    listing_id = str(listing.get("id") or "").strip() or None
+    listing_seen_ts = str(metadata.get("listing_seen_ts") or "").strip() or utc_now_iso()
+    route_name = str(metadata.get("route_name") or "").strip() or None
+    event_id = str(metadata.get("event_id") or "").strip() or None
+
+    upsert_started = time.monotonic()
     created = await _upsert_listing(pool, listing)
-    await _publish_listing_event(
+    listing_persisted_ts = utc_now_iso()
+    postgres_upsert_latency_ms = monotonic_duration_ms(upsert_started)
+    _increment_latency_metric(cycle_metrics, "postgres_upsert_latency_ms", postgres_upsert_latency_ms)
+
+    event_name = "listing_created" if created else "listing_updated"
+    listing_event_published_ts, redis_publish_latency_ms = await _publish_listing_event(
         redis_client=redis_client,
-        event_name="listing_created" if created else "listing_updated",
+        event_name=event_name,
         listing=listing,
         metadata=metadata,
     )
+    _increment_latency_metric(cycle_metrics, "redis_publish_latency_ms", redis_publish_latency_ms)
+
+    emit_json_log(
+        "listing_pipeline_observed",
+        listing_id=listing_id,
+        event_id=event_id,
+        worker_name=WORKER_NAME,
+        route_name=route_name,
+        event_name=event_name,
+        listing_seen_ts=listing_seen_ts,
+        listing_persisted_ts=listing_persisted_ts,
+        listing_event_published_ts=listing_event_published_ts,
+        postgres_upsert_latency_ms=postgres_upsert_latency_ms,
+        redis_publish_latency_ms=redis_publish_latency_ms,
+    )
+
     if _should_notify_telegram(created, listing):
-        await asyncio.get_running_loop().run_in_executor(
+        notification_started = time.monotonic()
+        sent = await asyncio.get_running_loop().run_in_executor(
             None, _send_telegram_listing_notification, listing
+        )
+        notification_delivery_latency_ms = monotonic_duration_ms(notification_started)
+        _increment_latency_metric(
+            cycle_metrics,
+            "notification_delivery_latency_ms",
+            notification_delivery_latency_ms,
+        )
+        notification_sent_ts = utc_now_iso() if sent else None
+        end_to_end_alert_latency_ms = timestamp_delta_ms(listing_seen_ts, notification_sent_ts)
+        if sent:
+            _increment_latency_metric(
+                cycle_metrics,
+                "end_to_end_alert_latency_ms",
+                end_to_end_alert_latency_ms,
+            )
+        emit_json_log(
+            "inline_notification_delivery",
+            listing_id=listing_id,
+            event_id=event_id,
+            worker_name=WORKER_NAME,
+            route_name=route_name,
+            event_name=event_name,
+            notification_channel="telegram",
+            notification_status="sent" if sent else "failed",
+            listing_seen_ts=listing_seen_ts,
+            listing_persisted_ts=listing_persisted_ts,
+            listing_event_published_ts=listing_event_published_ts,
+            notification_sent_ts=notification_sent_ts,
+            notification_delivery_latency_ms=notification_delivery_latency_ms,
+            end_to_end_alert_latency_ms=end_to_end_alert_latency_ms if sent else None,
         )
 
 
@@ -2076,12 +2154,21 @@ async def _run_scrape_cycle(
     metrics: dict[str, int] = {
         "listings_saved": 0,
         "listings_scraped": 0,
+        "listings_parsed": 0,
         "query_count": 0,
         "query_result_count": 0,
         "zero_page_queries": 0,
         "max_page_cards": 0,
         "query_error_count": 0,
         "redirect_count": 0,
+        "postgres_upsert_latency_ms_sum": 0,
+        "postgres_upsert_latency_ms_count": 0,
+        "redis_publish_latency_ms_sum": 0,
+        "redis_publish_latency_ms_count": 0,
+        "notification_delivery_latency_ms_sum": 0,
+        "notification_delivery_latency_ms_count": 0,
+        "end_to_end_alert_latency_ms_sum": 0,
+        "end_to_end_alert_latency_ms_count": 0,
     }
 
     if profile_dir:
@@ -2188,6 +2275,7 @@ async def _run_scrape_cycle(
             except (TypeError, ValueError):
                 redirect_count = 0
             metrics["listings_scraped"] = metrics.get("listings_scraped", 0) + max(0, found_count)
+            metrics["listings_parsed"] = metrics.get("listings_parsed", 0) + max(0, found_count)
             metrics["query_result_count"] = metrics.get("query_result_count", 0) + 1
             metrics["max_page_cards"] = max(metrics.get("max_page_cards", 0), page_cards)
             metrics["redirect_count"] = max(metrics.get("redirect_count", 0), max(0, redirect_count))
@@ -2252,9 +2340,10 @@ async def _run_scrape_cycle(
             "query": payload.get("query"),
             "query_index": payload.get("query_index"),
             "query_total": payload.get("query_total"),
+            "listing_seen_ts": utc_now_iso(),
         }
 
-        task = asyncio.create_task(_process_listing_event(pool, redis_client, listing, metadata))
+        task = asyncio.create_task(_process_listing_event(pool, redis_client, listing, metadata, metrics))
         ingest_tasks.add(task)
         task.add_done_callback(lambda done_task: ingest_tasks.discard(done_task))
 
@@ -2460,12 +2549,21 @@ async def _run_scrape_cycle_with_retry(
     last_metrics: dict[str, int] = {
         "listings_saved": 0,
         "listings_scraped": 0,
+        "listings_parsed": 0,
         "query_count": 0,
         "query_result_count": 0,
         "zero_page_queries": 0,
         "max_page_cards": 0,
         "query_error_count": 0,
         "redirect_count": 0,
+        "postgres_upsert_latency_ms_sum": 0,
+        "postgres_upsert_latency_ms_count": 0,
+        "redis_publish_latency_ms_sum": 0,
+        "redis_publish_latency_ms_count": 0,
+        "notification_delivery_latency_ms_sum": 0,
+        "notification_delivery_latency_ms_count": 0,
+        "end_to_end_alert_latency_ms_sum": 0,
+        "end_to_end_alert_latency_ms_count": 0,
     }
     last_reason: str | None = None
     retry_count = 0
@@ -2654,6 +2752,14 @@ async def _main() -> None:
         port=REDIS_PORT,
         password=REDIS_PASSWORD or None,
         decode_responses=True,
+    )
+    feature_flags = RedisFeatureFlags(redis_client, hash_key=FLAG_HASH_KEY)
+    emit_json_log(
+        "feature_flag_snapshot",
+        service="worker",
+        worker_name=WORKER_NAME,
+        flag_hash_key=FLAG_HASH_KEY,
+        flags=await feature_flags.snapshot(),
     )
 
     logging.info(
