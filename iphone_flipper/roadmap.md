@@ -659,6 +659,7 @@ Condition accuracy is a critical decision parameter and currently constrained by
   - [x] `/worker-routes` now returns lane/score fields
   - [x] route update validation only permits `lane_override` edits
   - [x] GUI VPS Scrapers route table/editor now shows lane + score and supports `auto/hot/warm/sweep` pinning
+  - [x] GUI VPS Scrapers route table now falls back to live `/worker-health` rows when no DB-backed routes exist, so env-backed workers still render as active even though Phase 4 lane/score fields are unavailable for them
 - [x] Added targeted tests for:
   - [x] deterministic score/lane calculation and hot-over-sweep route choice
   - [x] lane-override precedence

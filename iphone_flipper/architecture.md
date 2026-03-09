@@ -157,6 +157,7 @@ flowchart TD
   - VPS Activity Monitor `Worker Logs (Live)` stream renders continuous `docker compose logs -f` output in-panel with stop control
   - VPS Telegram verification action (`Send Telegram Test`) that executes from running worker env to confirm real `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` delivery path
   - VPS route table/editor now exposes scheduler state (`lane_override`, `computed_lane`, `effective_lane`, `priority_score`) and lets operators pin or clear route lane overrides without editing server-derived score fields
+  - When no persisted DB routes exist, the VPS route table now falls back to live `/worker-health` rows so env-backed workers remain visible; those rows explicitly show that lane/score values are not applicable until a DB-backed route is created
   - `Dolphin Profiles` tab with profile table (ID, Name, Status, Browser, Tags, Memory), Fetch/Start/Stop profile controls via Dolphin Anty API (configurable URL, defaults to `http://localhost:3001`) (requires the Dolphin Anty desktop application to be running to expose the API port), API key masked entry + instant save, and `Authorization: Bearer` header injection on all Dolphin API requests
   - `dolphin_api_key` and `dolphin_api_url` persisted in `scraper_settings` and loaded on Settings open
   - Persisted runtime controls including local scraper paging depth (`scrape_scroll_target_cards`, `scrape_scroll_max_rounds`)

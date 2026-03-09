@@ -2158,6 +2158,7 @@ This keeps `dev-log.md` actionable for both engineering and operations.
   - rollout fixes discovered during implementation:
     - moved route-lane normalization into shared `server/services/common/route_lanes.py` because importing it from the worker package broke the slimmer API image
     - fixed a worker loop bug where DB-backed routes could hit `UnboundLocalError: sleep_seconds referenced before assignment` after a cycle finished
+    - post-rollout GUI fix: VPS Scrapers route table now synthesizes live `/worker-health` rows when production has no persisted `worker_routes`, so env-backed workers remain visible instead of rendering an empty table; these rows explicitly leave lane/score unavailable until a DB-backed route is created
   - fresh audit result:
     - no additional undocumented code-level features or process enhancements were found beyond the approved Phase 4 work and the earlier audit sections
 - Files touched:

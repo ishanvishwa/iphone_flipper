@@ -2216,6 +2216,81 @@ PY
             return key, parts[0].strip(), parts[1].strip()
         return key, None, None
 
+    def _insert_vps_health_only_row(
+        self,
+        *,
+        worker_name: str,
+        health: dict,
+        selected_worker_name: str | None,
+        selected_route_name: str | None,
+        matched_selected_key: str | None,
+    ) -> str | None:
+        if not self.vps_scraper_tree:
+            return matched_selected_key
+
+        worker_name_clean = str(worker_name or "").strip()
+        if not worker_name_clean:
+            return matched_selected_key
+
+        route_name = str(health.get("route_name") or "").strip()
+        route_key_name = route_name or "env_default"
+        status = str(health.get("status") or "unknown").strip() or "unknown"
+        last_run = str(
+            health.get("last_run_finished_at")
+            or health.get("last_run_started_at")
+            or health.get("updated_at")
+            or ""
+        )
+        last_run_display = last_run.replace("T", " ")[:19] if last_run else ""
+        values = (
+            worker_name_clean,
+            "env-backed",
+            "env",
+            "-",
+            status,
+            str(max(0, self._safe_int(health.get("listings_scraped_last_minute"), 0))),
+            last_run_display,
+        )
+        key = f"{worker_name_clean}::__health__::{route_key_name}"
+        duplicate_suffix = 2
+        while key in self.vps_scraper_records_by_key:
+            key = f"{worker_name_clean}::__health__::{route_key_name}::{duplicate_suffix}"
+            duplicate_suffix += 1
+
+        self.vps_scraper_tree.insert("", tk.END, iid=key, values=values)
+        self.vps_scraper_records_by_key[key] = {
+            "route": {
+                "worker_name": worker_name_clean,
+                "route_name": route_name,
+                "is_enabled": True,
+                "is_synthetic_health_row": True,
+                "user_data_dir": "",
+                "lane_override": "",
+                "computed_lane": "",
+                "effective_lane": "",
+                "priority_score": "",
+                "priority_score_updated_at": "",
+                "profitable_hit_rate": "",
+                "recent_duplicate_ratio": "",
+                "search_queries": "",
+                "priority": "",
+                "manual_login_required": False,
+            },
+            "health": health,
+            "lease_display": str(health.get("leased_proxy_server") or "no active lease"),
+            "cooldown_display": (
+                f"route cooldown ({self._format_elapsed(self._safe_int(health.get('cooldown_remaining_seconds'), 0))})"
+                if self._safe_int(health.get("cooldown_remaining_seconds"), 0) > 0
+                else "no cooldown"
+            ),
+            "manual_login_required": False,
+        }
+        if selected_worker_name == worker_name_clean and (
+            not selected_route_name or selected_route_name in {route_name, route_key_name}
+        ) and not matched_selected_key:
+            return key
+        return matched_selected_key
+
     def _refresh_vps_scraper_tree(self, preserve_selection: bool = True):
         if not self.vps_scraper_tree:
             return
@@ -2246,6 +2321,7 @@ PY
                 self.vps_scraper_form_vars["proxy_profile"].set("Custom (manual proxy)")
 
         skipped_routes = 0
+        rendered_workers: set[str] = set()
         for route in routes:
             try:
                 worker_name = str(route.get("worker_name") or "").strip()
@@ -2334,11 +2410,23 @@ PY
                     "cooldown_display": cooldown_display,
                     "manual_login_required": manual_login_required,
                 }
+                rendered_workers.add(worker_name)
                 if selected_worker_name == worker_name and selected_route_name == route_name and not matched_selected_key:
                     matched_selected_key = key
             except Exception:
                 skipped_routes += 1
                 continue
+
+        for worker_name in sorted(health_by_worker):
+            if worker_name in rendered_workers:
+                continue
+            matched_selected_key = self._insert_vps_health_only_row(
+                worker_name=worker_name,
+                health=health_by_worker.get(worker_name) or {},
+                selected_worker_name=selected_worker_name,
+                selected_route_name=selected_route_name,
+                matched_selected_key=matched_selected_key,
+            )
 
         if matched_selected_key and matched_selected_key in self.vps_scraper_tree.get_children():
             self.vps_scraper_tree.selection_set(matched_selected_key)
@@ -2355,7 +2443,15 @@ PY
         if skipped_routes > 0:
             self.status_bar.config(text=f"Loaded {loaded_count} VPS scraper route(s), skipped {skipped_routes} malformed row(s)")
         else:
-            self.status_bar.config(text=f"Loaded {loaded_count} VPS scraper route(s)")
+            if not routes and health_by_worker:
+                self.status_bar.config(
+                    text=(
+                        "No saved VPS routes found. Showing live worker health rows only. "
+                        "Lane/score values appear after you save a DB-backed route."
+                    )
+                )
+            else:
+                self.status_bar.config(text=f"Loaded {loaded_count} VPS scraper route(s)")
 
     def _clear_vps_scraper_form(self):
         self.selected_vps_scraper_key = None
@@ -2411,19 +2507,26 @@ PY
         data = self.vps_scraper_records_by_key.get(key) or {}
         route = data.get("route") or {}
         health = data.get("health") or {}
+        synthetic_health_row = bool(route.get("is_synthetic_health_row"))
 
         self.selected_vps_scraper_key = key
         self.vps_scraper_form_vars["worker_name"].set(str(route.get("worker_name") or ""))
-        self.vps_scraper_form_vars["route_name"].set(str(route.get("route_name") or ""))
+        self.vps_scraper_form_vars["route_name"].set(
+            str(route.get("route_name") or "") if synthetic_health_row else str(route.get("route_name") or "")
+        )
         self.vps_scraper_form_vars["is_enabled"].set("1" if route.get("is_enabled", True) else "0")
-        self.vps_scraper_form_vars["priority"].set(str(route.get("priority") or 100))
+        self.vps_scraper_form_vars["priority"].set("" if synthetic_health_row else str(route.get("priority") or 100))
         lane_override = str(route.get("lane_override") or "").strip().lower() or "auto"
         self.vps_scraper_form_vars["lane_override"].set(lane_override)
         route_interval_value = route.get("route_interval_seconds")
         self.vps_scraper_form_vars["route_interval_seconds"].set(
             str(route_interval_value) if route_interval_value not in (None, "") else ""
         )
-        self.vps_scraper_form_vars["user_data_dir"].set(str(route.get("user_data_dir") or ""))
+        self.vps_scraper_form_vars["user_data_dir"].set(
+            self._suggest_profile_dir_for_worker(str(route.get("worker_name") or "").strip())
+            if synthetic_health_row
+            else str(route.get("user_data_dir") or "")
+        )
         self.vps_scraper_form_vars["proxy_mode"].set(str(route.get("proxy_mode") or "fixed"))
         self.vps_scraper_form_vars["proxy_server"].set(str(route.get("proxy_server") or ""))
         self.vps_scraper_form_vars["proxy_username"].set(str(route.get("proxy_username") or ""))
@@ -2478,6 +2581,16 @@ PY
             or ""
         )
         self.vps_scraper_form_vars["worker_last_run"].set(last_run.replace("T", " ")[:19] if last_run else "")
+        if synthetic_health_row:
+            route_hint = str(route.get("route_name") or "").strip()
+            self.status_bar.config(
+                text=(
+                    f"{route.get('worker_name')}: showing live worker health only"
+                    + (f" for route '{route_hint}'" if route_hint else "")
+                    + ". "
+                    "Create or save a DB-backed route to populate lane and score fields."
+                )
+            )
 
     def _save_vps_scraper_route(self, allow_remap: bool = True):
         worker_name = self.vps_scraper_form_vars["worker_name"].get().strip()
