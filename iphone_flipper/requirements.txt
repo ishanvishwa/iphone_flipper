@@ -20,5 +20,5 @@ pproxy>=2.7.9
 # Optional: For scheduling
 # schedule>=1.2.0
 
-# Optional: For better async support
-# aiohttp>=3.9.0
+# Desktop live sync / async HTTP
+aiohttp>=3.9.0

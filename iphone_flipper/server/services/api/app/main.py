@@ -3,11 +3,14 @@ import json
 import os
 import time
 from contextlib import suppress
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import unquote, urlparse
+from uuid import uuid4
 
 import asyncpg
+from fastapi.encoders import jsonable_encoder
 from fastapi import FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
@@ -34,6 +37,71 @@ except (TypeError, ValueError):
     WORKER_MIN_ENABLED_ROUTES_WARN = 2
 
 app = FastAPI(title="iPhone Flipper API", version="1.0.0")
+
+LISTING_SELECT_COLUMNS = """
+    seq_id,
+    id,
+    title,
+    price,
+    location,
+    url,
+    description,
+    seller_name,
+    model,
+    condition,
+    max_buy_price,
+    potential_profit,
+    status,
+    source_seen_at,
+    created_at,
+    updated_at
+"""
+WEBSOCKET_PING_INTERVAL_SECONDS = 15.0
+WEBSOCKET_PONG_TIMEOUT_SECONDS = 35.0
+
+
+@dataclass(slots=True)
+class ManagedWebSocketClient:
+    websocket: WebSocket
+    client_id: str = field(default_factory=lambda: uuid4().hex[:12])
+    connected_at: float = field(default_factory=time.monotonic)
+    last_pong_at: float = field(default_factory=time.monotonic)
+    send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    async def send_json(self, payload: dict[str, Any]) -> None:
+        async with self.send_lock:
+            await self.websocket.send_json(payload)
+
+    async def close(self, *, code: int = 1000, reason: str = "") -> None:
+        async with self.send_lock:
+            try:
+                await self.websocket.close(code=code, reason=reason)
+            except TypeError:
+                await self.websocket.close(code=code)
+
+
+class WebSocketConnectionManager:
+    def __init__(self) -> None:
+        self._clients: dict[str, ManagedWebSocketClient] = {}
+        self._lock = asyncio.Lock()
+
+    async def register(self, websocket: WebSocket) -> ManagedWebSocketClient:
+        client = ManagedWebSocketClient(websocket=websocket)
+        async with self._lock:
+            self._clients[client.client_id] = client
+        return client
+
+    async def unregister(self, client: ManagedWebSocketClient) -> None:
+        async with self._lock:
+            self._clients.pop(client.client_id, None)
+
+    async def snapshot(self) -> list[ManagedWebSocketClient]:
+        async with self._lock:
+            return list(self._clients.values())
+
+    async def active_count(self) -> int:
+        async with self._lock:
+            return len(self._clients)
 
 
 class WorkerRouteUpsert(BaseModel):
@@ -114,6 +182,101 @@ def _extract_listing_observation_fields(payload: dict[str, Any]) -> dict[str, An
         "route_name": route_name,
         "event_name": event_name,
     }
+
+
+def _client_host(websocket: WebSocket) -> str | None:
+    client = getattr(websocket, "client", None)
+    if client is None:
+        return None
+    host = getattr(client, "host", None)
+    if host:
+        return str(host)
+    if isinstance(client, tuple) and client:
+        return str(client[0])
+    return None
+
+
+async def _is_gui_websocket_push_enabled() -> bool:
+    feature_flags: RedisFeatureFlags | None = getattr(app.state, "feature_flags", None)
+    if feature_flags is None:
+        return False
+    return await feature_flags.is_enabled("ENABLE_GUI_WEBSOCKET_PUSH")
+
+
+def _listing_row_to_item(row: asyncpg.Record) -> dict[str, Any]:
+    return dict(jsonable_encoder(dict(row)))
+
+
+async def _fetch_listing_item(listing_id: str) -> dict[str, Any] | None:
+    listing_id_clean = str(listing_id or "").strip()
+    if not listing_id_clean:
+        return None
+
+    async with app.state.db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            f"""
+            SELECT {LISTING_SELECT_COLUMNS}
+            FROM listings
+            WHERE id = $1
+            LIMIT 1
+            """,
+            listing_id_clean,
+        )
+
+    if row is None:
+        return None
+    return _listing_row_to_item(row)
+
+
+def _build_listing_snapshot_message(
+    *,
+    item: dict[str, Any],
+    listing_fields: dict[str, Any],
+    observed_at: str,
+) -> dict[str, Any]:
+    return {
+        "event": "listing_snapshot",
+        "at": observed_at,
+        "cursor": int(item["seq_id"]),
+        "item": item,
+        "worker_name": listing_fields.get("worker_name"),
+        "route_name": listing_fields.get("route_name"),
+        "source": "websocket",
+    }
+
+
+async def _close_ws_client(
+    client: ManagedWebSocketClient,
+    *,
+    payload: dict[str, Any] | None = None,
+    code: int = 1000,
+    reason: str = "",
+) -> None:
+    if payload is not None:
+        with suppress(Exception):
+            await client.send_json(payload)
+    await app.state.ws_manager.unregister(client)
+    with suppress(Exception):
+        await client.close(code=code, reason=reason)
+
+
+async def _close_all_ws_clients_disabled(reason: str) -> None:
+    manager: WebSocketConnectionManager = app.state.ws_manager
+    clients = await manager.snapshot()
+    disabled_payload = {
+        "event": "websocket_disabled",
+        "at": utc_now_iso(),
+        "reason": reason,
+    }
+    for client in clients:
+        emit_json_log(
+            "websocket_client_disabled",
+            service="api",
+            client_id=client.client_id,
+            client_host=_client_host(client.websocket),
+            reason=reason,
+        )
+        await _close_ws_client(client, payload=disabled_payload, reason=reason)
 
 
 def _normalize_proxy_mode(raw: str | None) -> str:
@@ -252,7 +415,7 @@ async def startup() -> None:
         flag_hash_key=FLAG_HASH_KEY,
         flags=await app.state.feature_flags.snapshot(),
     )
-    app.state.ws_clients: set[WebSocket] = set()
+    app.state.ws_manager = WebSocketConnectionManager()
     app.state.redis_listener_task = asyncio.create_task(_redis_listener())
 
 
@@ -264,6 +427,10 @@ async def shutdown() -> None:
         with suppress(asyncio.CancelledError):
             await listener_task
 
+    ws_manager: WebSocketConnectionManager | None = getattr(app.state, "ws_manager", None)
+    if ws_manager is not None:
+        await _close_all_ws_clients_disabled("service_shutdown")
+
     redis_client: Redis | None = getattr(app.state, "redis", None)
     if redis_client:
         await redis_client.close()
@@ -274,41 +441,65 @@ async def shutdown() -> None:
 
 
 async def _broadcast(payload: dict[str, Any]) -> None:
-    broadcast_started = time.monotonic()
-    clients = list(getattr(app.state, "ws_clients", set()))
     listing_fields = _extract_listing_observation_fields(payload)
-    if not clients:
-        if listing_fields:
-            emit_json_log(
-                "listing_gui_push",
-                **listing_fields,
-                gui_pushed_ts=utc_now_iso(),
-                websocket_broadcast_latency_ms=0,
-                websocket_client_count=0,
-            )
+    if listing_fields is None:
         return
 
-    dead_clients: list[WebSocket] = []
-    for ws in clients:
-        try:
-            await ws.send_json(payload)
-        except Exception:
-            dead_clients.append(ws)
+    broadcast_started = time.monotonic()
+    if not await _is_gui_websocket_push_enabled():
+        await _close_all_ws_clients_disabled("feature_flag_off")
+        return
 
-    if dead_clients:
-        for ws in dead_clients:
-            with suppress(Exception):
-                await ws.close()
-            app.state.ws_clients.discard(ws)
+    item = await _fetch_listing_item(str(listing_fields["listing_id"]))
+    if item is None:
+        emit_json_log(
+            "listing_gui_push_skipped",
+            service="api",
+            **listing_fields,
+            reason="listing_not_found",
+        )
+        return
 
-    if listing_fields:
+    message = _build_listing_snapshot_message(
+        item=item,
+        listing_fields=listing_fields,
+        observed_at=str(payload.get("at") or utc_now_iso()),
+    )
+    clients = await app.state.ws_manager.snapshot()
+    if not clients:
         emit_json_log(
             "listing_gui_push",
             **listing_fields,
+            cursor=int(item["seq_id"]),
             gui_pushed_ts=utc_now_iso(),
-            websocket_broadcast_latency_ms=monotonic_duration_ms(broadcast_started),
-            websocket_client_count=max(0, len(clients) - len(dead_clients)),
+            websocket_broadcast_latency_ms=0,
+            websocket_client_count=0,
+            push_source="websocket",
         )
+        return
+
+    dead_clients: list[ManagedWebSocketClient] = []
+    delivered_count = 0
+    for client in clients:
+        try:
+            await client.send_json(message)
+            delivered_count += 1
+        except Exception:
+            dead_clients.append(client)
+
+    if dead_clients:
+        for client in dead_clients:
+            await _close_ws_client(client, reason="send_failed")
+
+    emit_json_log(
+        "listing_gui_push",
+        **listing_fields,
+        cursor=int(item["seq_id"]),
+        gui_pushed_ts=utc_now_iso(),
+        websocket_broadcast_latency_ms=monotonic_duration_ms(broadcast_started),
+        websocket_client_count=max(0, delivered_count),
+        push_source="websocket",
+    )
 
 
 async def _redis_listener() -> None:
@@ -384,24 +575,8 @@ async def get_listings(
 ) -> dict[str, Any]:
     await _auth_rest(x_api_token)
 
-    query = """
-        SELECT
-            seq_id,
-            id,
-            title,
-            price,
-            location,
-            url,
-            description,
-            seller_name,
-            model,
-            condition,
-            max_buy_price,
-            potential_profit,
-            status,
-            source_seen_at,
-            created_at,
-            updated_at
+    query = f"""
+        SELECT {LISTING_SELECT_COLUMNS}
         FROM listings
         WHERE seq_id > $1
         ORDER BY seq_id ASC
@@ -1192,16 +1367,114 @@ async def reset_proxy_stats(
 async def ws_listings(websocket: WebSocket, token: str | None = Query(default=None)) -> None:
     _assert_api_token(token)
     await websocket.accept()
-    app.state.ws_clients.add(websocket)
+    if not await _is_gui_websocket_push_enabled():
+        emit_json_log(
+            "websocket_client_disabled",
+            service="api",
+            client_host=_client_host(websocket),
+            reason="feature_flag_off",
+        )
+        with suppress(Exception):
+            await websocket.send_json(
+                {
+                    "event": "websocket_disabled",
+                    "at": utc_now_iso(),
+                    "reason": "feature_flag_off",
+                }
+            )
+        with suppress(Exception):
+            await websocket.close(code=1000)
+        return
 
+    client = await app.state.ws_manager.register(websocket)
+    emit_json_log(
+        "websocket_client_connected",
+        service="api",
+        client_id=client.client_id,
+        client_host=_client_host(websocket),
+        websocket_client_count=await app.state.ws_manager.active_count(),
+    )
+    heartbeat_task = asyncio.create_task(_ws_heartbeat_loop(client))
+
+    disconnect_reason = "client_disconnected"
     try:
         while True:
-            with suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(websocket.receive_text(), timeout=30)
-            await websocket.send_json({"event": "heartbeat", "at": datetime.now(timezone.utc).isoformat()})
-    except (WebSocketDisconnect, Exception):
-        pass
+            message = await websocket.receive()
+            message_type = str(message.get("type") or "")
+            if message_type == "websocket.disconnect":
+                disconnect_reason = "client_disconnected"
+                break
+            if message_type != "websocket.receive":
+                continue
+
+            raw_text = message.get("text")
+            if not raw_text:
+                continue
+
+            try:
+                payload = json.loads(raw_text)
+            except Exception:
+                continue
+
+            event_name = str(payload.get("event") or "").strip().lower()
+            if event_name == "pong":
+                client.last_pong_at = time.monotonic()
+    except WebSocketDisconnect:
+        disconnect_reason = "client_disconnected"
+    except Exception as exc:
+        disconnect_reason = f"error:{str(exc)[:200]}"
     finally:
-        app.state.ws_clients.discard(websocket)
+        heartbeat_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
+        await app.state.ws_manager.unregister(client)
+        emit_json_log(
+            "websocket_client_disconnected",
+            service="api",
+            client_id=client.client_id,
+            client_host=_client_host(websocket),
+            reason=disconnect_reason,
+            websocket_client_count=await app.state.ws_manager.active_count(),
+        )
         with suppress(Exception):
-            await websocket.close()
+            await client.close(code=1000, reason=disconnect_reason)
+
+
+async def _ws_heartbeat_loop(client: ManagedWebSocketClient) -> None:
+    while True:
+        await asyncio.sleep(WEBSOCKET_PING_INTERVAL_SECONDS)
+        if not await _is_gui_websocket_push_enabled():
+            emit_json_log(
+                "websocket_client_disabled",
+                service="api",
+                client_id=client.client_id,
+                client_host=_client_host(client.websocket),
+                reason="feature_flag_off",
+            )
+            await _close_ws_client(
+                client,
+                payload={
+                    "event": "websocket_disabled",
+                    "at": utc_now_iso(),
+                    "reason": "feature_flag_off",
+                },
+                reason="feature_flag_off",
+            )
+            return
+
+        if (time.monotonic() - client.last_pong_at) > WEBSOCKET_PONG_TIMEOUT_SECONDS:
+            emit_json_log(
+                "websocket_client_timeout",
+                service="api",
+                client_id=client.client_id,
+                client_host=_client_host(client.websocket),
+                reason="pong_timeout",
+            )
+            await _close_ws_client(client, reason="pong_timeout")
+            return
+
+        try:
+            await client.send_json({"event": "ping", "at": utc_now_iso()})
+        except Exception:
+            await _close_ws_client(client, reason="ping_send_failed")
+            return

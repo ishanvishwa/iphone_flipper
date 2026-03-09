@@ -10,7 +10,7 @@ This roadmap is a comprehensive implementation plan that combines:
 - Remaining work needed for stability, condition accuracy, and safe automation
 
 Audit date: **2026-03-08**
-Last implementation update: **2026-03-08**
+Last implementation update: **2026-03-09**
 
 ## Roadmap Structure
 
@@ -426,7 +426,7 @@ Condition accuracy is a critical decision parameter and currently constrained by
   - [x] initial snapshot load from server (`GET /listings?since_id=...`)
   - [x] reconnect + missed-event catch-up by persisted watermark cursor (`server_sync_since_id`)
   - [x] near-real-time incremental refresh via background polling cursor worker
-  - [ ] apply live row updates from WebSocket
+  - [x] apply live row updates from WebSocket
 - [ ] Add worker orchestration policy for parallel account execution with full query-shard coordination controls
   - [x] cooldown-aware retries and WAIT outcomes are now implemented
   - [x] query-shard lock/deduplication is now implemented (`WAIT_QUERY_SHARD`)
@@ -559,7 +559,7 @@ Condition accuracy is a critical decision parameter and currently constrained by
 - [x] Added targeted tests for stream schema serialization, meaningful-change detection, worker gating/fallback behavior, and `XADD` call shape
 - [x] Fresh 2026-03-09 code audit found no newly undocumented features/process enhancements beyond the existing audit sections; only the approved Phase 1 event-spine changes required documentation updates
 
-### Phase 2 Completed (This Update)
+### Phase 2 Completed (Previous Update)
 
 - [x] Converted `notification_worker.py` from Redis pub/sub to a Redis Streams consumer-group service over `stream:listings`
 - [x] Added consumer-group bootstrap with `XGROUP CREATE ... MKSTREAM` and `BUSYGROUP` handling
@@ -582,34 +582,78 @@ Condition accuracy is a critical decision parameter and currently constrained by
   - [x] concurrent duplicate processing producing one stream publish in the happy path
 - [x] Fresh 2026-03-09 code audit found no newly undocumented features/process enhancements beyond the approved Phase 2 work and the previously recorded audit sections
 
-### Planned Next Phases (Do Not Start Until Phase 2 Is Approved)
+### Phase 3 Completed (This Update)
 
-- [ ] Phase 3: desktop WebSocket-first live sync with polling fallback, reconnect backfill, and GUI-thread-safe apply path
+- [x] Upgraded `/ws/listings` from a heartbeat-only stub to a normalized live listing feed behind `ENABLE_GUI_WEBSOCKET_PUSH`
+- [x] Replaced raw websocket client tracking with an API connection manager that serializes sends per socket and tracks per-client heartbeat state
+- [x] Added API-side application heartbeat handling:
+  - [x] server sends `ping`
+  - [x] desktop replies with `pong`
+  - [x] dead clients are timed out and removed
+  - [x] flag disable events close active clients with `websocket_disabled`
+- [x] Normalized live push payloads to match `/listings` item shape, including `seq_id` cursor metadata
+- [x] Added desktop WebSocket-first sync engine with:
+  - [x] background thread + asyncio loop
+  - [x] `aiohttp` websocket/HTTP client
+  - [x] websocket-first connect order
+  - [x] replay-window catch-up from `max(0, since_id - 100)`
+  - [x] buffered live-event drain after poll catch-up
+  - [x] exponential reconnect with jitter
+  - [x] immediate polling fallback on disconnect/disable/auth/transport errors
+- [x] Preserved poll path as the canonical fallback when WebSocket is disabled or disconnected
+- [x] Added GUI duplicate protection by cursor gating plus existing SQLite upsert idempotency
+- [x] Preserved GUI local filters and selection/focus state across sync-driven refreshes
+- [x] Hardened API websocket snapshots to use JSON-safe normalized listing rows so live push does not fail on Postgres `NUMERIC`/`Decimal` fields
+- [x] Hardened desktop poll fallback so transient REST failures during API restarts do not kill reconnect/backfill attempts
+- [x] Added targeted tests for:
+  - [x] normalized websocket snapshot push
+  - [x] websocket disabled control frame
+  - [x] ping/pong heartbeat + timeout cleanup
+  - [x] reconnect replay overlap without duplicate apply
+  - [x] poll fallback when live push is unavailable
+  - [x] poll fallback retry after transient poll error
+  - [x] tree selection/focus preservation
+- [x] Fresh 2026-03-09 code audit found no newly undocumented features/process enhancements beyond the approved Phase 3 work and the existing audit sections
+
+### Planned Next Phases (Do Not Start Until Phase 3 Is Approved)
+
 - [ ] Phase 4: priority scheduler and route/query lanes while preserving current cooldown/reuse windows
 - [ ] Phase 5: hot-path payload slimming and background enrichment for non-critical fields
 - [ ] Phase 6: reliability/replay/operator controls (health endpoints, backlog visibility, replay tooling, live push rollback switches)
 
 ### Upgrade-Track Notes
 
-- Current baseline after Phase 2 rollout: Postgres remains authoritative, Redis pub/sub fanout stays active for API/WebSocket fanout, the GUI remains polling-first, Redis Streams publishing is enabled, and notification delivery is handled by the dedicated notification consumer when `ENABLE_NOTIFICATION_CONSUMER=1`.
+- Current baseline after Phase 3 rollout: Postgres remains authoritative, Redis pub/sub fanout stays active as the API trigger for normalized WebSocket fanout, the desktop GUI now runs WebSocket-first with automatic poll fallback and reconnect backfill, Redis Streams publishing remains enabled, and notification delivery is handled by the dedicated notification consumer when `ENABLE_NOTIFICATION_CONSUMER=1`.
 - VPS rollout state on 2026-03-09:
   - `ENABLE_REDIS_STREAM_EVENTS=1`
   - `ENABLE_NOTIFICATION_CONSUMER=1`
-  - `ENABLE_GUI_WEBSOCKET_PUSH=0`
+  - `ENABLE_GUI_WEBSOCKET_PUSH=1`
   - `ENABLE_PRIORITY_SCHEDULER=0`
   - `ENABLE_ROUTE_LANES=0`
 - Rollout verification included:
-  - clean startup with the notification consumer service running but `ENABLE_NOTIFICATION_CONSUMER=0`
-  - live flag enable in `flipper:flags`
+  - clean startup with `ENABLE_GUI_WEBSOCKET_PUSH=0` proving the desktop remained poll-only
+  - live flag enable in `flipper:flags` for `ENABLE_GUI_WEBSOCKET_PUSH=1`
   - Redis verification of `stream:listings`, consumer-group presence, and zero lag after catch-up
   - controlled unread-event smoke with `phase2-smoke-unread-1` proving exactly one alert send
   - duplicate synthetic stream event for the same listing proving `duplicate_already_sent` dedupe via the PostgreSQL ledger
   - controlled restart smoke with `phase2-smoke-unread-restart-1` proving unread events are consumed after the consumer restarts
-  - controlled worker-process smoke with `phase2-worker-delegate-1` proving worker-side `notification_delivery_delegated` instead of inline Telegram delivery when the consumer flag is enabled
+      - controlled worker-process smoke with `phase2-worker-delegate-1` proving worker-side `notification_delivery_delegated` instead of inline Telegram delivery when the consumer flag is enabled
+- controlled Phase 3 desktop smoke with synthetic listings:
+  - rollout validation initially exposed two late bugs that were fixed before final acceptance:
+    - websocket push failed on raw Postgres `NUMERIC`/`Decimal` values until API snapshot payloads were JSON-normalized
+    - desktop fallback exited on transient `502` poll errors during API restarts until retry handling was hardened
+  - `phase3-smoke-live-pass-1773067600` proved a new listing appears in the GUI via `websocket` before the next poll interval
+  - `phase3-smoke-reconnect-pass-1773067812` proved disconnect/reconnect backfill does not lose listings and returns to live mode afterward
+  - `phase3-smoke-pollonly-pass-1773067877` proved poll fallback still works when `ENABLE_GUI_WEBSOCKET_PUSH=0`
+  - synthetic Phase 3 rows were removed after verification
 - Acceptance criteria now expected to hold together after Phase 1 + Phase 2:
   - newly persisted listings generate exactly one stream event in the happy path
   - consumer restart does not lose unread events
   - duplicate unchanged listings do not generate duplicate alerts
+- Acceptance criteria now expected to hold together after Phase 3:
+  - new listing appears in GUI without waiting for the next poll interval
+  - disconnect/reconnect does not lose listings
+  - poll fallback still works with WebSocket disabled
 
 ---
 
@@ -658,4 +702,4 @@ Fresh audit note (2026-03-08): no additional undocumented code-level features we
 
 ## Current Focus Recommendation
 
-Active priority is **V3.0 Phase 2 review/validation**. After approval, the next implementation step should be **V3.0 Phase 3** (desktop WebSocket-first live sync with polling fallback and reconnect/backfill behavior), while keeping the broader **Phase 5A** server-migration direction intact. Dolphin Anty VPS installation is now resolved (systemd autostart operational). Remaining high-impact items after Phase 2 approval: WebSocket desktop sync apply path, priority scheduling/route lanes, hot-path slimming/background enrichment, and `legacy_utils.py` test coverage.
+Active priority is **V3.0 Phase 4 approval/readiness**. The next implementation step, once approved, should be **V3.0 Phase 4** (priority scheduling and route/query lanes), while keeping the broader **Phase 5A** server-migration direction intact. Dolphin Anty VPS installation remains operational. Remaining high-impact items after Phase 3 acceptance: priority scheduling/route lanes, hot-path slimming/background enrichment, replay/operator tooling, and `legacy_utils.py` test coverage.

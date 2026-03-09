@@ -9,7 +9,7 @@ This is a living development log tracking:
 - roadmap drift (manual/additional features)
 - current status and active risks
 
-Last updated: **2026-03-08**
+Last updated: **2026-03-09**
 Author: Codex implementation/update pass
 
 ---
@@ -2018,5 +2018,109 @@ This keeps `dev-log.md` actionable for both engineering and operations.
   - Phase 3 is still required for WebSocket-first desktop sync and reconnect/backfill behavior
   - dead-letter handling and operator replay tooling remain Phase 6 scope
   - natural production measurements should continue to confirm latency improvement under real worker discoveries once Dolphin/browser stability improves
+
+---
+
+### §40 – V3.0 Phase 3: Desktop WebSocket Live Sync + Poll Fallback (2026-03-09)
+
+- Summary: Implemented Phase 3 of the approved V3.0 latency/responsiveness upgrade track. The API now emits normalized live listing snapshots over `/ws/listings`, and the desktop GUI now consumes them through a dedicated `aiohttp` sync coordinator that prefers WebSocket, falls back to polling on disconnect/disable, and replays missed listings from the persisted `server_sync_since_id` cursor with a bounded overlap window. Initial rollout surfaced one API payload bug and one fallback retry bug; both were fixed before final acceptance.
+- Motivation:
+  - remove the remaining desktop lag caused by waiting for the next polling interval
+  - keep the existing cursor-poll path as a safe fallback instead of replacing it
+  - make reconnects deterministic by backfilling missed rows from the canonical `/listings` cursor API
+- Changes:
+  - upgraded API WebSocket live sync (`server/services/api/app/main.py`):
+    - replaced raw `set[WebSocket]` tracking with a connection manager carrying per-client send lock, connection metadata, and last-pong state
+    - gated live desktop push behind `ENABLE_GUI_WEBSOCKET_PUSH`
+    - when the flag is disabled, `/ws/listings` now accepts, sends `websocket_disabled`, and closes so the desktop falls back immediately
+    - stopped forwarding raw worker pub/sub payloads to desktop clients; API now resolves the canonical Postgres listing row by `listing_id` and sends a normalized `listing_snapshot` frame shaped like `/listings`
+    - normalized snapshot rows through JSON-safe encoding so websocket push survives Postgres `NUMERIC`/`Decimal` fields in `price`, `max_buy_price`, and `potential_profit`
+    - added application heartbeat control frames:
+      - server sends `ping`
+      - client replies `pong`
+      - stale clients are removed on timeout
+      - active clients are closed when the live-push flag flips off
+  - added desktop sync helper module (`desktop_sync.py`):
+    - derives `wss://.../ws/listings?token=...` from the configured API base URL
+    - runs in a background thread with its own asyncio loop and `aiohttp` session
+    - opens WebSocket first, buffers live snapshots, then replays `/listings` from `max(0, since_id - 100)` before draining buffered live items
+    - on disconnect, auth failure, transport error, heartbeat timeout, or `websocket_disabled`, switches to poll-only mode and retries the WebSocket connection with exponential backoff and jitter
+    - explicitly answers websocket control `PING` frames in addition to JSON heartbeat `ping` messages
+    - keeps retrying through transient REST failures during fallback polling (for example brief `502` windows during API restarts) instead of terminating the sync thread
+    - applies cursor gating (`seq_id > server_sync_since_id`) before local upsert so replay overlap and later polling cannot duplicate rows
+  - updated GUI integration (`gui.py`):
+    - server sync startup now uses the new threaded coordinator instead of the legacy polling-only loop
+    - main Tk thread receives status/apply events through a queue and stays free of network I/O
+    - sync-driven refreshes now preserve selected listing IDs and focused row when those rows still exist after refresh
+  - updated dependencies and tests:
+    - promoted `aiohttp>=3.9.0` into root `requirements.txt`
+    - added API tests for normalized snapshots, disabled control frames, heartbeat ping/pong, and timeout cleanup
+    - added desktop sync tests for replay overlap, buffered live drain, poll fallback, retry-after-error fallback, websocket control ping handling, and tree selection/focus preservation
+  - updated canonical docs (`architecture.md`, `roadmap.md`, `dev-log.md`) to reflect:
+    - WebSocket-first desktop sync as the current baseline
+    - heartbeat protocol and control frames
+    - replay-window reconnect semantics
+    - final rollout state with `ENABLE_GUI_WEBSOCKET_PUSH=1`
+  - fresh audit result:
+    - no additional undocumented code-level features or process enhancements were found beyond the approved Phase 3 work and the existing roadmap-drift audit sections
+- Files touched:
+  - `server/services/api/app/main.py`
+  - `desktop_sync.py`
+  - `gui.py`
+  - `requirements.txt`
+  - `server/tests/test_api_observability.py`
+  - `server/tests/test_desktop_sync.py`
+  - `architecture.md`
+  - `roadmap.md`
+  - `dev-log.md`
+- Decision/rationale:
+  - WebSocket payloads now mirror `/listings` item shape so polling and live sync share one canonical listing schema and one cursor model
+  - Redis pub/sub remains the API fanout trigger in Phase 3; this keeps the current worker/API event spine intact while improving only the desktop consumption path
+  - replay overlap is implemented by rewinding 100 sequence IDs on reconnect and relying on cursor gating plus local SQLite upsert semantics to suppress duplicates
+  - GUI refresh remains table-rebuild based, but selection/focus state is preserved to avoid regressions in operator workflow
+- Validation performed:
+  - local import/compile sanity:
+    - `./.venv/bin/python -m py_compile server/services/api/app/main.py gui.py desktop_sync.py server/tests/test_api_observability.py server/tests/test_desktop_sync.py`
+  - targeted Phase 3 pytest suite:
+    - `./.venv/bin/python -m pytest server/tests/test_api_observability.py server/tests/test_desktop_sync.py -q`
+    - result after final hardening: `14 passed`
+  - full server pytest regression:
+    - `./.venv/bin/python -m pytest server/tests -q`
+    - result after final hardening: `97 passed`
+  - VPS rollout and acceptance verification:
+    - deployed Phase 3 to `ubuntu@15.235.185.32` via `server/scripts/deploy_vps.sh`
+    - verified clean startup with `ENABLE_GUI_WEBSOCKET_PUSH=0` and confirmed the desktop remained poll-only
+    - enabled `ENABLE_GUI_WEBSOCKET_PUSH=1` live in `flipper:flags`
+    - initial websocket smoke exposed two rollout bugs:
+      - API websocket push failed when normalized snapshot payloads still contained raw Postgres `NUMERIC`/`Decimal` objects
+      - desktop fallback exited on transient `502` poll failures during API restart/reconnect testing
+    - patched and redeployed the API for JSON-safe websocket snapshots
+    - patched the desktop sync coordinator so fallback polling retries instead of terminating
+    - final controlled live-listing smoke:
+      - inserted synthetic listing row `phase3-smoke-live-pass-1773067600`
+      - published matching `listing_created` pub/sub event
+      - verified GUI import through `source=websocket` before the next poll interval
+    - final controlled reconnect smoke:
+      - stopped the API service to force live disconnect
+      - inserted synthetic listing row `phase3-smoke-reconnect-pass-1773067812` while the API was unavailable
+      - restarted the API service
+      - verified fallback polling imported the listing exactly once and the client returned to live mode
+    - final controlled poll-only smoke:
+      - set `ENABLE_GUI_WEBSOCKET_PUSH=0`
+      - inserted synthetic listing row `phase3-smoke-pollonly-pass-1773067877`
+      - verified the desktop imported it through `source=poll_sync` without websocket assistance
+      - restored `ENABLE_GUI_WEBSOCKET_PUSH=1`
+    - cleaned all synthetic Phase 3 rows from Postgres with `DELETE FROM listings WHERE id LIKE 'phase3-%'`
+- Acceptance criteria status:
+  - `New listing appears in GUI without waiting for the next poll interval.`  
+    Met via controlled live-listing smoke with `phase3-smoke-live-pass-1773067600` (`source=websocket`).
+  - `Disconnect/reconnect does not lose listings.`  
+    Met via controlled reconnect smoke with `phase3-smoke-reconnect-pass-1773067812`; the listing was recovered during fallback/backfill and the client returned to live mode.
+  - `Poll fallback still works with WebSocket disabled.`  
+    Met via controlled poll-only smoke with `phase3-smoke-pollonly-pass-1773067877`.
+- Unresolved follow-ups:
+  - Phase 4 is still required for priority scheduling and route/query lanes
+  - Phase 6 still owns operator replay tooling, backlog visibility, and live-push rollback controls beyond the current flag
+  - broader GUI test coverage is still light outside the new sync helper path because most existing GUI behavior remains Tk-driven and integration-heavy
 
 ---

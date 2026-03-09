@@ -12,6 +12,7 @@ import threading
 import asyncio
 import csv
 import queue
+from contextlib import suppress
 from pathlib import Path
 from datetime import datetime
 import subprocess
@@ -29,6 +30,8 @@ try:
     import requests
 except ImportError:
     requests = None
+
+import desktop_sync
 
 # Import our modules
 import deal_tracker
@@ -101,6 +104,9 @@ class iPhoneFlipperGUI:
         self.server_sync_thread = None
         self.server_sync_stop_event = None
         self.server_sync_last_ui_refresh = 0.0
+        self.server_sync_coordinator = None
+        self.server_sync_event_queue = queue.Queue()
+        self.server_sync_event_job = None
         self.worker_status_labels = {}
         self.worker_status_canvases = {}
         self.worker_status_dot_ids = {}
@@ -603,113 +609,20 @@ class iPhoneFlipperGUI:
         return headers
 
     def _upsert_server_listing_batch(self, items: list[dict]) -> tuple[int, int]:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
+        result = desktop_sync.apply_server_listing_batch(
+            DB_PATH,
+            items,
+            source="poll_sync",
+            min_seq_id_exclusive=0,
+        )
+        return result.inserted, result.updated
 
-        listing_ids = []
-        for item in items:
-            listing_id = str(item.get("id") or "").strip()
-            if listing_id:
-                listing_ids.append(listing_id)
-
-        existing_ids = set()
-        if listing_ids:
-            placeholders = ",".join(["?"] * len(listing_ids))
-            cursor.execute(f"SELECT id FROM listings WHERE id IN ({placeholders})", listing_ids)
-            existing_ids = {str(row[0]) for row in cursor.fetchall()}
-
-        inserted = 0
-        updated = 0
-        now_iso = datetime.now().isoformat()
-
-        for item in items:
-            listing_id = str(item.get("id") or "").strip()
-            if not listing_id:
-                continue
-
-            title = str(item.get("title") or "")
-            location = str(item.get("location") or "")
-            url = str(item.get("url") or "")
-            description = str(item.get("description") or "")
-            seller_name = str(item.get("seller_name") or "")
-            model = str(item.get("model") or "")
-            condition = str(item.get("condition") or "")
-            status = str(item.get("status") or "new")
-            created_at = str(item.get("created_at") or now_iso)
-            updated_at = str(item.get("updated_at") or now_iso)
-
-            cursor.execute(
-                """
-                INSERT INTO listings (
-                    id, title, price, location, url, description, seller_name, model,
-                    condition, max_buy_price, potential_profit, status, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    title = excluded.title,
-                    price = excluded.price,
-                    location = excluded.location,
-                    url = excluded.url,
-                    description = excluded.description,
-                    seller_name = excluded.seller_name,
-                    model = excluded.model,
-                    condition = excluded.condition,
-                    max_buy_price = excluded.max_buy_price,
-                    potential_profit = excluded.potential_profit,
-                    status = CASE
-                        WHEN listings.status = 'purchased' THEN listings.status
-                        ELSE excluded.status
-                    END,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    listing_id,
-                    title,
-                    self._safe_float(item.get("price")),
-                    location,
-                    url,
-                    description,
-                    seller_name,
-                    model,
-                    condition,
-                    self._safe_float(item.get("max_buy_price")),
-                    self._safe_float(item.get("potential_profit")),
-                    status,
-                    created_at,
-                    updated_at,
-                ),
-            )
-
-            if listing_id in existing_ids:
-                updated += 1
-                sync_action = "updated"
-            else:
-                inserted += 1
-                sync_action = "inserted"
-
-            emit_json_log(
-                "listing_gui_rendered",
-                listing_id=listing_id,
-                source="poll_sync",
-                sync_action=sync_action,
-                gui_rendered_ts=utc_now_iso(),
-                server_created_at=created_at,
-                server_updated_at=updated_at,
-            )
-
-        purge_accessory_only_listings(cursor)
-        conn.commit()
-        conn.close()
-        return inserted, updated
-
-    def _refresh_after_server_sync(self, inserted: int, updated: int, since_id: int):
+    def _refresh_after_server_sync(self, inserted: int, updated: int, since_id: int, *, status_text: str | None = None):
         now = time.time()
         if (now - self.server_sync_last_ui_refresh) >= 0.75:
             self.refresh_listings()
             self.server_sync_last_ui_refresh = now
-        self.status_bar.config(
-            text=f"Server sync active | +{inserted} new, {updated} updated | cursor={since_id}"
-        )
+        self.status_bar.config(text=status_text or f"Server sync active | +{inserted} new, {updated} updated | cursor={since_id}")
 
     def _server_sync_loop(self, stop_event: threading.Event):
         base_url = self._normalize_server_base_url(self._get_scraper_setting("server_api_base_url", ""))
@@ -770,14 +683,21 @@ class iPhoneFlipperGUI:
                 stop_event.wait(backoff_seconds)
 
     def _stop_server_sync(self):
-        stop_event = self.server_sync_stop_event
-        thread = self.server_sync_thread
+        coordinator = self.server_sync_coordinator
+        self.server_sync_coordinator = None
         self.server_sync_stop_event = None
         self.server_sync_thread = None
-        if stop_event:
-            stop_event.set()
-        if thread and thread.is_alive():
-            thread.join(timeout=2.0)
+        if self.server_sync_event_job is not None:
+            with suppress(Exception):
+                self.root.after_cancel(self.server_sync_event_job)
+            self.server_sync_event_job = None
+        while True:
+            try:
+                self.server_sync_event_queue.get_nowait()
+            except queue.Empty:
+                break
+        if coordinator is not None:
+            coordinator.stop()
 
     def _is_server_sync_enabled(self) -> bool:
         return self._is_truthy(self._get_scraper_setting("server_sync_enabled", "0"))
@@ -794,25 +714,58 @@ class iPhoneFlipperGUI:
         self._stop_server_sync()
         self._apply_operating_mode_to_controls()
 
-        if requests is None:
-            self.status_bar.config(text="Server sync unavailable: 'requests' dependency missing")
+        if desktop_sync.aiohttp is None:
+            self.status_bar.config(text="Server sync unavailable: 'aiohttp' dependency missing")
             return
 
         enabled = self._is_truthy(self._get_scraper_setting("server_sync_enabled", "0"))
         if not enabled:
             return
+        base_url = self._normalize_server_base_url(self._get_scraper_setting("server_api_base_url", ""))
+        if not base_url:
+            self.status_bar.config(text="Server sync disabled: API URL is empty")
+            return
 
-        stop_event = threading.Event()
-        thread = threading.Thread(
-            target=self._server_sync_loop,
-            args=(stop_event,),
-            daemon=True,
-            name="server-sync-worker",
+        poll_seconds = max(1, self._safe_int(self._get_scraper_setting("server_sync_poll_seconds", "2"), 2))
+        since_id = max(0, self._safe_int(self._get_scraper_setting("server_sync_since_id", "0"), 0))
+        config = desktop_sync.ServerSyncConfig(
+            base_url=base_url,
+            token=self._get_scraper_setting("server_api_token", ""),
+            poll_seconds=poll_seconds,
+            since_id=since_id,
         )
-        self.server_sync_stop_event = stop_event
-        self.server_sync_thread = thread
-        thread.start()
+        self.server_sync_event_queue = queue.Queue()
+        self.server_sync_coordinator = desktop_sync.ThreadedServerSyncCoordinator(
+            config=config,
+            db_path=DB_PATH,
+            event_queue=self.server_sync_event_queue,
+        )
+        self.server_sync_coordinator.start()
+        self.server_sync_event_job = self.root.after(150, self._drain_server_sync_events)
         self.status_bar.config(text="Server sync starting...")
+
+    def _drain_server_sync_events(self):
+        self.server_sync_event_job = None
+        while True:
+            try:
+                event = self.server_sync_event_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            event_type = str(event.get("type") or "")
+            if event_type == "status":
+                self.status_bar.config(text=str(event.get("text") or "Server sync active"))
+                continue
+            if event_type == "sync_applied":
+                self._refresh_after_server_sync(
+                    self._safe_int(event.get("inserted"), 0),
+                    self._safe_int(event.get("updated"), 0),
+                    self._safe_int(event.get("since_id"), 0),
+                    status_text=str(event.get("status_text") or ""),
+                )
+
+        if self.server_sync_coordinator is not None:
+            self.server_sync_event_job = self.root.after(150, self._drain_server_sync_events)
 
     def _worker_display_name(self, worker_name: str) -> str:
         worker = str(worker_name or "").strip()
@@ -3513,6 +3466,7 @@ PY
         self.status_bar.config(text="Loading listings...")
         self.root.update()
         self._refresh_model_filter_menu()
+        selection_state = desktop_sync.capture_treeview_listing_state(self.listings_tree)
         
         # Clear existing items
         for item in self.listings_tree.get_children():
@@ -3611,6 +3565,7 @@ PY
                 values=(listing_id, model, price_str, max_buy_str, profit_str, condition, score_str, status),
                 tags=row_tags,
             )
+        desktop_sync.restore_treeview_listing_state(self.listings_tree, selection_state)
         
         self.status_bar.config(text=f"Loaded {len(rows)} listings")
         
