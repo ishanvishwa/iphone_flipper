@@ -531,9 +531,36 @@ Condition accuracy is a critical decision parameter and currently constrained by
 - [x] Added targeted tests for feature flags, telemetry, worker observability, API observability, and existing notification worker coverage
 - [x] Fresh 2026-03-08 code audit found no additional undocumented features/process enhancements beyond the audit sections already captured elsewhere in this roadmap and `dev-log.md`
 
-### Planned Next Phases (Do Not Start Until Phase 0 Is Approved)
+### Phase 1 Completed (This Update)
 
-- [ ] Phase 1: durable Redis Streams event spine after persistence, with capped retention and duplicate protection
+- [x] Added shared Redis Streams schema/codec module (`server/services/common/stream_events.py`) for `stream:listings`
+- [x] Implemented durable post-persistence stream dual-write behind `ENABLE_REDIS_STREAM_EVENTS`
+- [x] Kept Postgres as source of truth and preserved existing Redis pub/sub + inline Telegram behavior
+- [x] Added meaningful-change suppression for unchanged updates using bounded hot-path comparison fields:
+  - [x] `title`
+  - [x] `price`
+  - [x] `url`
+  - [x] `model`
+  - [x] `condition`
+  - [x] `status`
+  - [x] `max_buy_price`
+  - [x] `potential_profit`
+  - [x] `location`
+- [x] Added non-fatal stream publish handling with structured failure logs and cycle telemetry for:
+  - [x] stream publish latency sum/count
+  - [x] stream publish failure count
+  - [x] `stream_event_id` / returned Redis stream IDs in observability
+- [x] Used capped retention with `XADD ... MAXLEN ~ 10000`
+- [x] Kept `notification_worker.py` dormant and unchanged:
+  - [x] no compose wiring in this phase
+  - [x] no consumer groups / `XREADGROUP`
+  - [x] no notification ledger / replay logic yet
+  - [x] no pub/sub payload-shape changes for the standalone notifier
+- [x] Added targeted tests for stream schema serialization, meaningful-change detection, worker gating/fallback behavior, and `XADD` call shape
+- [x] Fresh 2026-03-09 code audit found no newly undocumented features/process enhancements beyond the existing audit sections; only the approved Phase 1 event-spine changes required documentation updates
+
+### Planned Next Phases (Do Not Start Until Phase 1 Is Approved)
+
 - [ ] Phase 2: standalone notification consumer service with consumer-group retries, dedupe ledger, and outbound rate limiting
 - [ ] Phase 3: desktop WebSocket-first live sync with polling fallback, reconnect backfill, and GUI-thread-safe apply path
 - [ ] Phase 4: priority scheduler and route/query lanes while preserving current cooldown/reuse windows
@@ -542,7 +569,19 @@ Condition accuracy is a critical decision parameter and currently constrained by
 
 ### Upgrade-Track Notes
 
-- Current baseline remains unchanged in Phase 0: Redis pub/sub fanout stays active, inline worker Telegram notifications stay active, the API WebSocket endpoint stays available, and the GUI remains polling-first.
+- Current baseline after Phase 1 rollout: Postgres remains authoritative, Redis pub/sub fanout stays active, inline worker Telegram notifications stay active, the API WebSocket endpoint stays available, the GUI remains polling-first, and Redis Streams publishing is now available behind `ENABLE_REDIS_STREAM_EVENTS`.
+- VPS rollout state on 2026-03-09:
+  - `ENABLE_REDIS_STREAM_EVENTS=1`
+  - `ENABLE_NOTIFICATION_CONSUMER=0`
+  - `ENABLE_GUI_WEBSOCKET_PUSH=0`
+  - `ENABLE_PRIORITY_SCHEDULER=0`
+  - `ENABLE_ROUTE_LANES=0`
+- Rollout verification included:
+  - clean startup with streams disabled and `stream:listings` absent
+  - live flag enable in `flipper:flags`
+  - Redis inspection confirming `stream:listings` creation and stored flat event fields
+  - Redis pub/sub smoke confirming API-side `listing_gui_push` remained functional with streams enabled
+- Natural worker stream traffic during rollout was limited by intermittent Dolphin/browser scrape failures, so the final stream verification used a safe one-off worker-container smoke publish to validate the deployed codec and runtime Redis compatibility without touching persistence or sending Telegram alerts.
 - Pre-existing notification-worker payload-shape mismatch remains documented and deferred to the later event-spine / notification-consumer phases.
 
 ---
@@ -592,4 +631,4 @@ Fresh audit note (2026-03-08): no additional undocumented code-level features we
 
 ## Current Focus Recommendation
 
-Active priority is **V3.0 Phase 0 review/validation**. After approval, the next implementation step should be **V3.0 Phase 1** (durable Redis Streams event spine), while keeping the broader **Phase 5A** server-migration direction intact. Dolphin Anty VPS installation is now resolved (systemd autostart operational). Remaining high-impact items after Phase 0 approval: Redis Streams event spine, notification worker compose wiring/schema alignment, WebSocket desktop sync apply path, and `legacy_utils.py` test coverage.
+Active priority is **V3.0 Phase 1 review/validation**. After approval, the next implementation step should be **V3.0 Phase 2** (standalone notification consumer with consumer groups, retries, dedupe ledger, and compose wiring), while keeping the broader **Phase 5A** server-migration direction intact. Dolphin Anty VPS installation is now resolved (systemd autostart operational). Remaining high-impact items after Phase 1 approval: notification worker compose wiring/schema alignment, WebSocket desktop sync apply path, priority scheduling/route lanes, and `legacy_utils.py` test coverage.

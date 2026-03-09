@@ -22,6 +22,9 @@ class TelemetryPayloadTests(unittest.TestCase):
                 "postgres_upsert_latency_ms_count": 3,
                 "redis_publish_latency_ms_sum": 9,
                 "redis_publish_latency_ms_count": 3,
+                "redis_stream_publish_latency_ms_sum": 7,
+                "redis_stream_publish_latency_ms_count": 2,
+                "redis_stream_publish_failure_count": 1,
                 "notification_delivery_latency_ms_sum": 11,
                 "notification_delivery_latency_ms_count": 1,
                 "end_to_end_alert_latency_ms_sum": 120,
@@ -75,6 +78,9 @@ class TelemetryPayloadTests(unittest.TestCase):
         self.assertEqual(payload["postgres_upsert_latency_ms_sum"], 15)
         self.assertEqual(payload["postgres_upsert_latency_ms_count"], 3)
         self.assertEqual(payload["redis_publish_latency_ms_count"], 3)
+        self.assertEqual(payload["redis_stream_publish_latency_ms_sum"], 7)
+        self.assertEqual(payload["redis_stream_publish_latency_ms_count"], 2)
+        self.assertEqual(payload["redis_stream_publish_failure_count"], 1)
         self.assertEqual(payload["notification_delivery_latency_ms_sum"], 11)
         self.assertEqual(payload["notification_delivery_latency_ms_count"], 1)
         self.assertEqual(payload["end_to_end_alert_latency_ms_count"], 1)

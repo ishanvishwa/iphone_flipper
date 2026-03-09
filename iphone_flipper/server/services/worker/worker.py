@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import dataclass
 import functools
 import hashlib
 import inspect
@@ -42,6 +43,13 @@ from server.services.common.observability import (  # noqa: E402
     utc_now_iso,
 )
 from server.services.common.schema_ensure import ensure_worker_tables as ensure_common_worker_tables  # noqa: E402
+from server.services.common.stream_events import (  # noqa: E402
+    LISTING_STREAM_MAXLEN,
+    LISTING_STREAM_NAME,
+    build_listing_stream_event,
+    extract_listing_stream_state,
+    extract_row_stream_state,
+)
 from server.services.worker.proxy_monitor import get_proxy_health, start_monitor as start_proxy_monitor  # noqa: E402
 from server.services.worker.lease_manager import (  # noqa: E402
     canonical_proxy_key as canonical_proxy_key_from_module,
@@ -118,6 +126,12 @@ REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
 WORKER_NAME = os.getenv("WORKER_NAME", "worker_1")
 SCRAPE_INTERVAL_SECONDS = max(1, int(os.getenv("SCRAPE_INTERVAL_SECONDS", "8")))
 WORKER_USER_DATA_DIR = os.getenv("WORKER_USER_DATA_DIR", "").strip() or None
+
+
+@dataclass(frozen=True)
+class ListingUpsertResult:
+    created: bool
+    stream_state_changed: bool
 
 
 def _parse_bool(raw: str | None, default: bool = True) -> bool:
@@ -782,6 +796,17 @@ def _increment_latency_metric(metrics: dict[str, int], prefix: str, latency_ms: 
     safe_latency = max(0, int(latency_ms))
     metrics[f"{prefix}_sum"] = metrics.get(f"{prefix}_sum", 0) + safe_latency
     metrics[f"{prefix}_count"] = metrics.get(f"{prefix}_count", 0) + 1
+
+
+def _increment_counter_metric(metrics: dict[str, int], key: str, increment: int = 1) -> None:
+    metrics[key] = metrics.get(key, 0) + max(0, int(increment))
+
+
+def _normalize_upsert_result(raw_result: ListingUpsertResult | bool) -> ListingUpsertResult:
+    if isinstance(raw_result, ListingUpsertResult):
+        return raw_result
+    created = bool(raw_result)
+    return ListingUpsertResult(created=created, stream_state_changed=created)
 
 
 def _emit_cycle_telemetry(
@@ -1941,15 +1966,32 @@ async def _build_playwright_proxy(
     )
 
 
-async def _upsert_listing(pool: asyncpg.Pool, listing: dict[str, Any]) -> bool:
+async def _upsert_listing(pool: asyncpg.Pool, listing: dict[str, Any]) -> ListingUpsertResult:
     listing_id = str(listing.get("id") or "").strip()
     if not listing_id:
-        return False
+        return ListingUpsertResult(created=False, stream_state_changed=False)
 
     source_seen_at = datetime.now(timezone.utc)
+    next_stream_state = extract_listing_stream_state(listing)
 
     async with pool.acquire() as conn:
-        exists = await conn.fetchval("SELECT 1 FROM listings WHERE id = $1", listing_id)
+        existing_row = await conn.fetchrow(
+            """
+            SELECT
+                title,
+                price,
+                location,
+                url,
+                model,
+                condition,
+                max_buy_price,
+                potential_profit,
+                status
+            FROM listings
+            WHERE id = $1
+            """,
+            listing_id,
+        )
         await conn.execute(
             """
             INSERT INTO listings (
@@ -1990,7 +2032,10 @@ async def _upsert_listing(pool: asyncpg.Pool, listing: dict[str, Any]) -> bool:
             listing.get("status") or "new",
             source_seen_at,
         )
-    return not bool(exists)
+    created = existing_row is None
+    previous_stream_state = extract_row_stream_state(existing_row)
+    stream_state_changed = created or previous_stream_state != next_stream_state
+    return ListingUpsertResult(created=created, stream_state_changed=stream_state_changed)
 
 
 async def _publish_listing_event(
@@ -2014,9 +2059,24 @@ async def _publish_listing_event(
     return utc_now_iso(), monotonic_duration_ms(publish_started)
 
 
+async def _publish_listing_stream_event(
+    redis_client: Redis,
+    stream_event_payload: dict[str, str],
+) -> tuple[str, str, int]:
+    publish_started = time.monotonic()
+    stream_event_id = await redis_client.xadd(
+        LISTING_STREAM_NAME,
+        stream_event_payload,
+        maxlen=LISTING_STREAM_MAXLEN,
+        approximate=True,
+    )
+    return str(stream_event_id), utc_now_iso(), monotonic_duration_ms(publish_started)
+
+
 async def _process_listing_event(
     pool: asyncpg.Pool,
     redis_client: Redis,
+    feature_flags: RedisFeatureFlags | None,
     listing: dict[str, Any],
     metadata: dict[str, Any],
     cycle_metrics: dict[str, int],
@@ -2024,15 +2084,60 @@ async def _process_listing_event(
     listing_id = str(listing.get("id") or "").strip() or None
     listing_seen_ts = str(metadata.get("listing_seen_ts") or "").strip() or utc_now_iso()
     route_name = str(metadata.get("route_name") or "").strip() or None
-    event_id = str(metadata.get("event_id") or "").strip() or None
+    metadata_event_id = str(metadata.get("event_id") or "").strip() or None
 
     upsert_started = time.monotonic()
-    created = await _upsert_listing(pool, listing)
+    upsert_result = _normalize_upsert_result(await _upsert_listing(pool, listing))
+    created = upsert_result.created
     listing_persisted_ts = utc_now_iso()
     postgres_upsert_latency_ms = monotonic_duration_ms(upsert_started)
     _increment_latency_metric(cycle_metrics, "postgres_upsert_latency_ms", postgres_upsert_latency_ms)
 
     event_name = "listing_created" if created else "listing_updated"
+    stream_event_id: str | None = None
+    stream_event_published_ts: str | None = None
+    stream_publish_latency_ms: int | None = None
+    stream_publish_status = "disabled"
+    event_id = metadata_event_id
+    if feature_flags is not None and await feature_flags.is_enabled("ENABLE_REDIS_STREAM_EVENTS"):
+        if upsert_result.stream_state_changed:
+            stream_publish_status = "published"
+            stream_event = build_listing_stream_event(
+                event_name=event_name,
+                listing=listing,
+                metadata=metadata,
+                worker_name=WORKER_NAME,
+                persisted_at=listing_persisted_ts,
+            )
+            try:
+                stream_event_id, stream_event_published_ts, stream_publish_latency_ms = await _publish_listing_stream_event(
+                    redis_client=redis_client,
+                    stream_event_payload=stream_event.to_redis_fields(),
+                )
+                event_id = stream_event_id
+                _increment_latency_metric(
+                    cycle_metrics,
+                    "redis_stream_publish_latency_ms",
+                    stream_publish_latency_ms,
+                )
+            except Exception as exc:
+                stream_publish_status = "failed"
+                _increment_counter_metric(cycle_metrics, "redis_stream_publish_failure_count")
+                emit_json_log(
+                    "listing_stream_publish_failed",
+                    listing_id=listing_id,
+                    event_id=event_id,
+                    worker_name=WORKER_NAME,
+                    route_name=route_name,
+                    event_name=event_name,
+                    stream_name=LISTING_STREAM_NAME,
+                    listing_seen_ts=listing_seen_ts,
+                    listing_persisted_ts=listing_persisted_ts,
+                    error=str(exc)[0:500],
+                )
+        else:
+            stream_publish_status = "suppressed_unchanged"
+
     listing_event_published_ts, redis_publish_latency_ms = await _publish_listing_event(
         redis_client=redis_client,
         event_name=event_name,
@@ -2048,6 +2153,11 @@ async def _process_listing_event(
         worker_name=WORKER_NAME,
         route_name=route_name,
         event_name=event_name,
+        stream_name=LISTING_STREAM_NAME,
+        stream_event_id=stream_event_id,
+        stream_event_published_ts=stream_event_published_ts,
+        stream_publish_status=stream_publish_status,
+        redis_stream_publish_latency_ms=stream_publish_latency_ms,
         listing_seen_ts=listing_seen_ts,
         listing_persisted_ts=listing_persisted_ts,
         listing_event_published_ts=listing_event_published_ts,
@@ -2081,6 +2191,11 @@ async def _process_listing_event(
             worker_name=WORKER_NAME,
             route_name=route_name,
             event_name=event_name,
+            stream_name=LISTING_STREAM_NAME,
+            stream_event_id=stream_event_id,
+            stream_event_published_ts=stream_event_published_ts,
+            stream_publish_status=stream_publish_status,
+            redis_stream_publish_latency_ms=stream_publish_latency_ms,
             notification_channel="telegram",
             notification_status="sent" if sent else "failed",
             listing_seen_ts=listing_seen_ts,
@@ -2121,6 +2236,7 @@ def _get_bucket_queries(num_queries: int = 3) -> list[str]:
 async def _run_scrape_cycle(
     pool: asyncpg.Pool,
     redis_client: Redis,
+    feature_flags: RedisFeatureFlags | None,
     route: dict[str, Any],
 ) -> tuple[dict[str, int], dict[str, Any]]:
     raw_queries = _split_query_csv(route.get("search_queries"))
@@ -2165,6 +2281,9 @@ async def _run_scrape_cycle(
         "postgres_upsert_latency_ms_count": 0,
         "redis_publish_latency_ms_sum": 0,
         "redis_publish_latency_ms_count": 0,
+        "redis_stream_publish_latency_ms_sum": 0,
+        "redis_stream_publish_latency_ms_count": 0,
+        "redis_stream_publish_failure_count": 0,
         "notification_delivery_latency_ms_sum": 0,
         "notification_delivery_latency_ms_count": 0,
         "end_to_end_alert_latency_ms_sum": 0,
@@ -2340,10 +2459,11 @@ async def _run_scrape_cycle(
             "query": payload.get("query"),
             "query_index": payload.get("query_index"),
             "query_total": payload.get("query_total"),
+            "query_shard_key": query_shard_key,
             "listing_seen_ts": utc_now_iso(),
         }
 
-        task = asyncio.create_task(_process_listing_event(pool, redis_client, listing, metadata, metrics))
+        task = asyncio.create_task(_process_listing_event(pool, redis_client, feature_flags, listing, metadata, metrics))
         ingest_tasks.add(task)
         task.add_done_callback(lambda done_task: ingest_tasks.discard(done_task))
 
@@ -2543,6 +2663,7 @@ async def _run_scrape_cycle(
 async def _run_scrape_cycle_with_retry(
     pool: asyncpg.Pool,
     redis_client: Redis,
+    feature_flags: RedisFeatureFlags | None,
     route: dict[str, Any],
 ) -> CycleResult:
     route_name = str(route.get("route_name") or "unknown")
@@ -2560,6 +2681,9 @@ async def _run_scrape_cycle_with_retry(
         "postgres_upsert_latency_ms_count": 0,
         "redis_publish_latency_ms_sum": 0,
         "redis_publish_latency_ms_count": 0,
+        "redis_stream_publish_latency_ms_sum": 0,
+        "redis_stream_publish_latency_ms_count": 0,
+        "redis_stream_publish_failure_count": 0,
         "notification_delivery_latency_ms_sum": 0,
         "notification_delivery_latency_ms_count": 0,
         "end_to_end_alert_latency_ms_sum": 0,
@@ -2571,7 +2695,7 @@ async def _run_scrape_cycle_with_retry(
 
     for attempt in range(1, WORKER_CYCLE_RETRY_ATTEMPTS + 1):
         try:
-            metrics, cycle_meta = await _run_scrape_cycle(pool, redis_client, route)
+            metrics, cycle_meta = await _run_scrape_cycle(pool, redis_client, feature_flags, route)
             last_metrics = metrics
             cycle_details = dict(cycle_meta or {})
             if not _is_profile_failed(metrics):
@@ -2781,7 +2905,7 @@ async def _main() -> None:
 
     # Enter main scrape event loop
     try:
-        await _run_worker_loop(pool, redis_client)
+        await _run_worker_loop(pool, redis_client, feature_flags)
     except asyncio.CancelledError:
         logging.info("[%s] Worker shut down requested.", WORKER_NAME)
 
@@ -2789,6 +2913,7 @@ async def _main() -> None:
 async def _run_worker_loop(
     pool: asyncpg.Pool,
     redis_client: Redis,
+    feature_flags: RedisFeatureFlags | None,
 ) -> None:
     logging.info("[%s] worker loop online", WORKER_NAME)
     global _SINGLE_ROUTE_ENFORCEMENT_ACTIVE
@@ -2981,7 +3106,7 @@ async def _run_worker_loop(
                         )
                     continue
 
-                cycle_result = await _run_scrape_cycle_with_retry(pool, redis_client, route)
+                cycle_result = await _run_scrape_cycle_with_retry(pool, redis_client, feature_flags, route)
                 metrics = cycle_result.metrics
                 route_runtime_key = _route_key(route)
                 finished_at = datetime.now(timezone.utc)

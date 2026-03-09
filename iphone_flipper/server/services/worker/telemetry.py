@@ -43,6 +43,15 @@ def build_cycle_telemetry_payload(
         payload["postgres_upsert_latency_ms_count"] = int(metrics.get("postgres_upsert_latency_ms_count", 0) or 0)
         payload["redis_publish_latency_ms_sum"] = int(metrics.get("redis_publish_latency_ms_sum", 0) or 0)
         payload["redis_publish_latency_ms_count"] = int(metrics.get("redis_publish_latency_ms_count", 0) or 0)
+        payload["redis_stream_publish_latency_ms_sum"] = int(
+            metrics.get("redis_stream_publish_latency_ms_sum", 0) or 0
+        )
+        payload["redis_stream_publish_latency_ms_count"] = int(
+            metrics.get("redis_stream_publish_latency_ms_count", 0) or 0
+        )
+        payload["redis_stream_publish_failure_count"] = int(
+            metrics.get("redis_stream_publish_failure_count", 0) or 0
+        )
         payload["notification_delivery_latency_ms_sum"] = int(
             metrics.get("notification_delivery_latency_ms_sum", 0) or 0
         )

@@ -1827,7 +1827,94 @@ This keeps `dev-log.md` actionable for both engineering and operations.
 - Unresolved follow-ups:
   - Phase 1 is blocked pending operator review, test, and approval of this Phase 0 patch
   - notification worker still is not compose-wired as a production service
-  - worker pub/sub payload alignment with `notification_worker.py` remains deferred to later approved phases
-  - GUI still applies server changes via cursor polling; WebSocket-first apply path remains deferred to later approved phases
+- worker pub/sub payload alignment with `notification_worker.py` remains deferred to later approved phases
+- GUI still applies server changes via cursor polling; WebSocket-first apply path remains deferred to later approved phases
+
+---
+
+### §38 – V3.0 Phase 1: Durable Redis Streams Event Spine (2026-03-09)
+
+- Summary: Implemented Phase 1 of the approved V3.0 latency/responsiveness upgrade track. This phase adds a durable Redis Streams event spine after persistence, behind `ENABLE_REDIS_STREAM_EVENTS`, while keeping the current Redis pub/sub fanout, inline worker Telegram notifications, API behavior, and dormant notification worker unchanged.
+- Motivation:
+  - add a durable event log after persistence without regressing the current live fanout path
+  - prepare the later notification-consumer and replay phases while preserving strict phase ordering
+  - keep rollout measurable and reversible through the Phase 0 flag layer and structured telemetry
+- Changes:
+  - added shared Redis Streams event module (`server/services/common/stream_events.py`):
+    - stream name: `stream:listings`
+    - retention policy: `XADD ... MAXLEN ~ 10000`
+    - flat event schema: `schema_version`, `event_name`, `listing_id`, `worker_name`, `route_name`, `query`, `query_index`, `query_total`, `query_shard_key`, `persisted_at`, `price`, `potential_profit`, `title`, `url`, `source`
+    - helper paths for event serialization/deserialization and meaningful-change comparison state extraction
+  - extended worker post-upsert flow (`server/services/worker/worker.py`) to dual-write safely:
+    - Postgres remains the source of truth
+    - Redis pub/sub publish path remains active and unchanged
+    - Redis Streams publish occurs only when `ENABLE_REDIS_STREAM_EVENTS` is enabled
+    - stream emission occurs only for newly created listings or meaningful updates over the bounded hot-path fields:
+      - `title`
+      - `price`
+      - `url`
+      - `model`
+      - `condition`
+      - `status`
+      - `max_buy_price`
+      - `potential_profit`
+      - `location`
+    - unchanged updates still upsert to Postgres so `source_seen_at` / `updated_at` semantics remain intact, but stream emission is suppressed for those cases
+  - made stream publish failure non-fatal:
+    - stream publish exceptions emit `listing_stream_publish_failed`
+    - worker continues current pub/sub + inline notification flow
+    - returned Redis stream IDs are captured as `stream_event_id` / `event_id` when available
+  - extended worker observability and cycle telemetry:
+    - `listing_pipeline_observed` now includes stream name, stream publish status, stream event ID, stream publish timestamp, and stream publish latency
+    - cycle telemetry now tracks stream publish latency sum/count and stream publish failure count
+  - updated canonical documentation (`architecture.md`, `roadmap.md`, `dev-log.md`) to record:
+    - optional Phase 1 dual-write architecture
+    - retention policy and compact schema decision
+    - rollout flag state and verification approach
+    - explicit note that notification consumers remain disabled in this phase
+  - fresh audit result:
+    - no additional undocumented code-level features or process enhancements were found beyond the previously captured roadmap-drift audit sections and the newly approved Phase 1 changes above
+- Files touched:
+  - `server/services/common/stream_events.py`
+  - `server/services/worker/worker.py`
+  - `server/services/worker/telemetry.py`
+  - `server/tests/test_stream_events.py`
+  - `server/tests/test_worker_observability.py`
+  - `server/tests/test_telemetry.py`
+  - `architecture.md`
+  - `roadmap.md`
+  - `dev-log.md`
+- Decision/rationale:
+  - Phase 1 is intentionally limited to the event spine. `notification_worker.py` remains compose-unwired, consumer groups are not introduced yet, and the current pub/sub payload is not reshaped in this phase.
+  - The stream schema stays compact and uses existing runtime metadata (`query`, `query_index`, `query_total`, `query_shard_key`, `route_name`) instead of inventing new persisted route/query identifiers that do not exist in the current runtime.
+  - The rollout left `ENABLE_NOTIFICATION_CONSUMER=0`, `ENABLE_GUI_WEBSOCKET_PUSH=0`, `ENABLE_PRIORITY_SCHEDULER=0`, and `ENABLE_ROUTE_LANES=0` so later phases remain opt-in and independently reviewable.
+- Validation performed:
+  - local import/compile sanity:
+    - `./.venv/bin/python -m py_compile server/services/common/stream_events.py server/services/worker/worker.py server/services/worker/telemetry.py server/tests/test_stream_events.py server/tests/test_worker_observability.py server/tests/test_telemetry.py`
+  - targeted Phase 1 pytest suite:
+    - `./.venv/bin/python -m pytest server/tests/test_stream_events.py server/tests/test_worker_observability.py server/tests/test_telemetry.py -q`
+    - result: `13 passed`
+  - full server pytest regression:
+    - `./.venv/bin/python -m pytest server/tests -q`
+    - result: `89 passed`
+  - VPS rollout and verification:
+    - deployed Phase 1 to `ubuntu@15.235.185.32` via `server/scripts/deploy_vps.sh`
+    - verified clean startup with `ENABLE_REDIS_STREAM_EVENTS=0` and `stream:listings` absent
+    - enabled flags in Redis hash `flipper:flags`:
+      - `ENABLE_REDIS_STREAM_EVENTS=1`
+      - `ENABLE_NOTIFICATION_CONSUMER=0`
+      - `ENABLE_GUI_WEBSOCKET_PUSH=0`
+      - `ENABLE_PRIORITY_SCHEDULER=0`
+      - `ENABLE_ROUTE_LANES=0`
+    - verified Redis Streams on VPS with:
+      - `XLEN stream:listings`
+      - `XREVRANGE stream:listings + - COUNT 2`
+      - `XINFO STREAM stream:listings`
+    - verified unchanged pub/sub-driven API fanout with a safe Redis pub/sub smoke event and observed API-side `listing_gui_push`
+    - because natural worker listing traffic during rollout was sparse and intermittently blocked by existing Dolphin/browser failures, stream runtime verification used a safe one-off worker-container smoke publish that exercised the deployed stream codec and `XADD` path without touching persistence or sending Telegram alerts
+- Unresolved follow-ups:
+  - Phase 2 is still required to wire notification consumers through Redis Streams consumer groups and compose deployment
+  - pre-existing worker pub/sub payload mismatch vs `notification_worker.py` remains intentionally deferred
+  - natural production traffic should continue to be observed now that Phase 1 is live, so stream publish rates can be measured under real listing flow once Dolphin/browser stability improves
 
 ---
