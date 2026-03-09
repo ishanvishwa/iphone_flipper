@@ -54,7 +54,9 @@ from server.services.worker.proxy_monitor import get_proxy_health, start_monitor
 from server.services.worker.lease_manager import (  # noqa: E402
     canonical_proxy_key as canonical_proxy_key_from_module,
     proxy_identity as proxy_identity_from_module,
+    release_query_lock as release_query_lock_from_module,
     refresh_proxy_lease as refresh_proxy_lease_from_module,
+    try_acquire_query_lock as try_acquire_query_lock_from_module,
     release_proxy_lease as release_proxy_lease_from_module,
     try_acquire_proxy_lease as try_acquire_proxy_lease_from_module,
 )
@@ -85,6 +87,10 @@ from server.services.worker.runtime import (  # noqa: E402
     seconds_until_next_route,
 )
 from server.services.worker.scheduler import (  # noqa: E402
+    annotate_routes_with_priority as annotate_routes_with_priority_from_module,
+    lane_interval_multiplier as lane_interval_multiplier_from_module,
+    normalize_route_lane as normalize_route_lane_from_module,
+    rank_route_queries as rank_route_queries_from_module,
     route_interval_seconds as route_interval_seconds_from_module,
     schedule_route_next_run_at as schedule_route_next_run_at_from_module,
     select_next_route as select_next_route_from_module,
@@ -437,6 +443,15 @@ def _normalize_route_status(raw: str | None) -> str:
     return RouteStatus.ENABLED.value
 
 
+def _normalize_route_lane(raw: str | None, *, allow_none: bool = True) -> str | None:
+    return normalize_route_lane_from_module(raw, allow_none=allow_none)
+
+
+def _priority_query_lock_ttl_seconds() -> int:
+    # Phase 4 uses short-lived Redis query locks and relies on explicit release on success/failure.
+    return max(30, min(int(WORKER_QUERY_SHARD_LEASE_SECONDS or 30), 120))
+
+
 def _build_env_route() -> dict[str, Any]:
     return {
         "worker_name": WORKER_NAME,
@@ -456,8 +471,15 @@ def _build_env_route() -> dict[str, Any]:
         "next_run_at": None,
         "route_interval_seconds": None,
         "avg_result_count": None,
+        "profitable_hit_rate": 0.0,
+        "recent_duplicate_ratio": 0.0,
         "avg_page_load_ms": None,
         "successful_cycles": 0,
+        "lane_override": None,
+        "computed_lane": "warm",
+        "effective_lane": "warm",
+        "priority_score": None,
+        "priority_score_updated_at": None,
         "source": "env",
     }
 
@@ -681,6 +703,11 @@ def _listing_profit(listing: dict[str, Any]) -> float | None:
         return float(raw)
     except (TypeError, ValueError):
         return None
+
+
+def _is_profitable_listing_signal(listing: dict[str, Any]) -> bool:
+    profit = _listing_profit(listing)
+    return profit is not None and profit >= TELEGRAM_NOTIFY_MIN_PROFIT
 
 
 def _should_notify_telegram(created: bool, listing: dict[str, Any]) -> bool:
@@ -1124,10 +1151,17 @@ async def _load_worker_routes(pool: asyncpg.Pool) -> list[dict[str, Any]]:
             next_run_at,
             route_interval_seconds,
             avg_result_count,
+            profitable_hit_rate,
+            recent_duplicate_ratio,
             avg_page_load_ms,
             successful_cycles,
             consecutive_failures,
             cooldown_until,
+            lane_override,
+            computed_lane,
+            effective_lane,
+            priority_score,
+            priority_score_updated_at,
             manual_login_required,
             manual_login_reason,
             manual_login_required_at,
@@ -1168,10 +1202,21 @@ async def _load_worker_routes(pool: asyncpg.Pool) -> list[dict[str, Any]]:
                 "next_run_at": row["next_run_at"],
                 "route_interval_seconds": int(row["route_interval_seconds"] or 0) or None,
                 "avg_result_count": float(row["avg_result_count"]) if row["avg_result_count"] is not None else None,
+                "profitable_hit_rate": (
+                    float(row["profitable_hit_rate"]) if row["profitable_hit_rate"] is not None else 0.0
+                ),
+                "recent_duplicate_ratio": (
+                    float(row["recent_duplicate_ratio"]) if row["recent_duplicate_ratio"] is not None else 0.0
+                ),
                 "avg_page_load_ms": float(row["avg_page_load_ms"]) if row["avg_page_load_ms"] is not None else None,
                 "successful_cycles": int(row["successful_cycles"] or 0),
                 "consecutive_failures": int(row["consecutive_failures"] or 0),
                 "cooldown_until": row["cooldown_until"],
+                "lane_override": _normalize_route_lane(row["lane_override"]),
+                "computed_lane": _normalize_route_lane(row["computed_lane"], allow_none=False),
+                "effective_lane": _normalize_route_lane(row["effective_lane"], allow_none=False),
+                "priority_score": float(row["priority_score"]) if row["priority_score"] is not None else None,
+                "priority_score_updated_at": row["priority_score_updated_at"],
                 "manual_login_required": bool(row["manual_login_required"]),
                 "manual_login_reason": str(row["manual_login_reason"] or "").strip() or None,
                 "manual_login_required_at": row["manual_login_required_at"],
@@ -1276,8 +1321,76 @@ async def _release_expired_route_cooldowns(pool: asyncpg.Pool) -> int:
         return 0
 
 
-def _select_next_route(routes: list[dict[str, Any]], now: datetime | None = None) -> dict[str, Any] | None:
-    return select_next_route_from_module(routes=routes, now=now)
+def _select_next_route(
+    routes: list[dict[str, Any]],
+    now: datetime | None = None,
+    *,
+    use_priority_scheduler: bool = False,
+) -> dict[str, Any] | None:
+    return select_next_route_from_module(
+        routes=routes,
+        now=now,
+        use_priority_scheduler=use_priority_scheduler,
+    )
+
+
+def _annotate_routes_with_priority(
+    routes: list[dict[str, Any]],
+    *,
+    now: datetime,
+    fallback_interval_seconds: float,
+) -> list[dict[str, Any]]:
+    return annotate_routes_with_priority_from_module(
+        routes=routes,
+        now=now,
+        fallback_interval_seconds=fallback_interval_seconds,
+    )
+
+
+async def _persist_route_priority_state(pool: asyncpg.Pool, routes: list[dict[str, Any]]) -> None:
+    updates: list[tuple[str, str, str | None, str, str, float | None]] = []
+    for route in routes:
+        if route.get("source") != "db":
+            continue
+        route_name = str(route.get("route_name") or "").strip()
+        worker_name = str(route.get("worker_name") or "").strip()
+        if not worker_name or not route_name:
+            continue
+        stored_override = _normalize_route_lane(route.get("lane_override"))
+        stored_computed = _normalize_route_lane(route.get("computed_lane"), allow_none=False)
+        stored_effective = _normalize_route_lane(route.get("effective_lane"), allow_none=False)
+        stored_score = route.get("priority_score")
+        if stored_score is not None:
+            try:
+                stored_score = round(float(stored_score), 4)
+            except (TypeError, ValueError):
+                stored_score = None
+        updates.append(
+            (
+                worker_name,
+                route_name,
+                stored_override,
+                stored_computed,
+                stored_effective,
+                stored_score,
+            )
+        )
+    if not updates:
+        return
+    async with pool.acquire() as conn:
+        await conn.executemany(
+            """
+            UPDATE worker_routes
+            SET
+                lane_override = $3,
+                computed_lane = $4,
+                effective_lane = $5,
+                priority_score = $6,
+                priority_score_updated_at = NOW()
+            WHERE worker_name = $1 AND route_name = $2
+            """,
+            updates,
+        )
 
 
 async def _mark_route_selected(pool: asyncpg.Pool, route: dict[str, Any]) -> None:
@@ -1293,6 +1406,7 @@ async def _mark_route_selected(pool: asyncpg.Pool, route: dict[str, Any]) -> Non
             route.get("worker_name"),
             route.get("route_name"),
         )
+    route["last_selected_at"] = datetime.now(timezone.utc)
 
 
 def _route_interval_seconds(route: dict[str, Any], fallback_seconds: float) -> float:
@@ -1619,6 +1733,19 @@ async def _release_profile_lock(pool: asyncpg.Pool, route: dict[str, Any], profi
     await _release_proxy_lease(pool=pool, route=route, proxy_id=lock_id)
 
 
+def _priority_query_candidates(route: dict[str, Any]) -> list[str]:
+    raw_queries = _split_query_csv(route.get("search_queries"))
+    if not raw_queries or (len(raw_queries) == 1 and raw_queries[0].upper() == "BUCKETS"):
+        bucket_queries = [
+            *BUCKET_BROAD,
+            *BUCKET_EXACT,
+            *BUCKET_FLIPPER,
+            *BUCKET_MISSPELLING,
+        ]
+        return rank_route_queries_from_module(route=route, queries=bucket_queries)
+    return rank_route_queries_from_module(route=route, queries=raw_queries)
+
+
 def _query_shard_canonical_key(route: dict[str, Any], query_override: list[str] | None) -> str | None:
     raw_queries = query_override if query_override is not None else _split_query_csv(route.get("search_queries"))
     normalized = sorted({str(item).strip().lower() for item in (raw_queries or []) if str(item).strip()})
@@ -1687,6 +1814,47 @@ async def _release_query_shard_lock(pool: asyncpg.Pool, route: dict[str, Any], q
     if not lock_id:
         return
     await _release_proxy_lease(pool=pool, route=route, proxy_id=lock_id)
+
+
+async def _try_acquire_priority_query_lock(
+    redis_client: Redis,
+    route: dict[str, Any],
+    queries: list[str],
+) -> tuple[str | None, str | None, str | None, int]:
+    skipped_locked = 0
+    for query in queries:
+        try:
+            lock = await try_acquire_query_lock_from_module(
+                redis_client,
+                worker_name=WORKER_NAME,
+                route_name=str(route.get("route_name") or "unknown"),
+                query=query,
+                lease_seconds=_priority_query_lock_ttl_seconds(),
+            )
+        except Exception:
+            raise
+        if lock is None:
+            skipped_locked += 1
+            continue
+        return (
+            str(lock.get("query") or "").strip() or None,
+            str(lock.get("lock_key") or "").strip() or None,
+            str(lock.get("lock_token") or "").strip() or None,
+            skipped_locked,
+        )
+    return None, None, None, skipped_locked
+
+
+async def _release_priority_query_lock(
+    redis_client: Redis,
+    query_lock_key: str | None,
+    query_lock_token: str | None,
+) -> None:
+    await release_query_lock_from_module(
+        redis_client,
+        lock_key=query_lock_key,
+        lock_token=query_lock_token,
+    )
 
 
 async def _fetch_proxy_stats(pool: asyncpg.Pool, proxy_keys: list[str]) -> dict[str, dict[str, Any]]:
@@ -1868,6 +2036,55 @@ async def _record_route_signal_baseline(
         route["avg_result_count"] = float(row["avg_result_count"]) if row["avg_result_count"] is not None else None
         route["avg_page_load_ms"] = float(row["avg_page_load_ms"]) if row["avg_page_load_ms"] is not None else None
         route["successful_cycles"] = int(row["successful_cycles"] or 0)
+
+
+async def _record_route_priority_metrics(
+    pool: asyncpg.Pool,
+    route: dict[str, Any],
+    metrics: dict[str, int],
+) -> None:
+    if route.get("source") != "db":
+        return
+    listings_saved = max(0, int(metrics.get("listings_saved", 0) or 0))
+    profitable_count = max(0, int(metrics.get("profitable_listing_count", 0) or 0))
+    duplicate_count = max(0, int(metrics.get("duplicate_listing_count", 0) or 0))
+    if listings_saved <= 0:
+        profitable_ratio = 0.0
+        duplicate_ratio = 0.0
+    else:
+        profitable_ratio = min(1.0, profitable_count / float(listings_saved))
+        duplicate_ratio = min(1.0, duplicate_count / float(listings_saved))
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE worker_routes
+            SET
+                profitable_hit_rate = CASE
+                    WHEN profitable_hit_rate IS NULL THEN $3::DOUBLE PRECISION
+                    ELSE ($5::DOUBLE PRECISION * $3::DOUBLE PRECISION)
+                       + ((1 - $5::DOUBLE PRECISION) * profitable_hit_rate)
+                END,
+                recent_duplicate_ratio = CASE
+                    WHEN recent_duplicate_ratio IS NULL THEN $4::DOUBLE PRECISION
+                    ELSE ($5::DOUBLE PRECISION * $4::DOUBLE PRECISION)
+                       + ((1 - $5::DOUBLE PRECISION) * recent_duplicate_ratio)
+                END
+            WHERE worker_name = $1 AND route_name = $2
+            RETURNING profitable_hit_rate, recent_duplicate_ratio
+            """,
+            route.get("worker_name"),
+            route.get("route_name"),
+            float(profitable_ratio),
+            float(duplicate_ratio),
+            float(SIGNAL_ROLLING_ALPHA),
+        )
+    if row:
+        route["profitable_hit_rate"] = (
+            float(row["profitable_hit_rate"]) if row["profitable_hit_rate"] is not None else profitable_ratio
+        )
+        route["recent_duplicate_ratio"] = (
+            float(row["recent_duplicate_ratio"]) if row["recent_duplicate_ratio"] is not None else duplicate_ratio
+        )
 
 
 async def _upsert_worker_heartbeat(
@@ -2104,6 +2321,8 @@ async def _process_listing_event(
     upsert_started = time.monotonic()
     upsert_result = _normalize_upsert_result(await _upsert_listing(pool, listing))
     created = upsert_result.created
+    if not created:
+        _increment_counter_metric(cycle_metrics, "duplicate_listing_count")
     listing_persisted_ts = utc_now_iso()
     postgres_upsert_latency_ms = monotonic_duration_ms(upsert_started)
     _increment_latency_metric(cycle_metrics, "postgres_upsert_latency_ms", postgres_upsert_latency_ms)
@@ -2279,17 +2498,30 @@ async def _run_scrape_cycle(
     feature_flags: RedisFeatureFlags | None,
     route: dict[str, Any],
 ) -> tuple[dict[str, int], dict[str, Any]]:
+    route_lanes_enabled = False
+    priority_scheduler_enabled = False
+    if feature_flags is not None:
+        route_lanes_enabled = await feature_flags.is_enabled("ENABLE_ROUTE_LANES")
+        priority_scheduler_enabled = (
+            route.get("source") == "db"
+            and route_lanes_enabled
+            and await feature_flags.is_enabled(
+            "ENABLE_PRIORITY_SCHEDULER"
+            )
+        )
+
     raw_queries = _split_query_csv(route.get("search_queries"))
-    if not raw_queries or (len(raw_queries) == 1 and raw_queries[0].upper() == "BUCKETS"):
-        query_override = _get_bucket_queries(num_queries=3)
-    else:
-        query_override = raw_queries
-        
+    query_override: list[str] | None = None
+    selected_query: str | None = None
     profile_dir = str(route.get("user_data_dir") or WORKER_USER_DATA_DIR or "").strip() or None
     profile_lock_id: str | None = None
     dolphin_lock_id: str | None = None
     query_shard_lock_id: str | None = None
     query_shard_key: str | None = None
+    query_lock_key: str | None = None
+    query_lock_token: str | None = None
+    query_lock_status = "disabled"
+    query_lock_skipped_count = 0
     bridge_process = None
     proxy_lease_id: str | None = None
     proxy_key: str | None = None
@@ -2317,6 +2549,10 @@ async def _run_scrape_cycle(
         "max_page_cards": 0,
         "query_error_count": 0,
         "redirect_count": 0,
+        "profitable_listing_count": 0,
+        "duplicate_listing_count": 0,
+        "query_lock_skipped_count": 0,
+        "query_lock_acquired_count": 0,
         "postgres_upsert_latency_ms_sum": 0,
         "postgres_upsert_latency_ms_count": 0,
         "redis_publish_latency_ms_sum": 0,
@@ -2334,15 +2570,39 @@ async def _run_scrape_cycle(
         profile_lock_id = await _try_acquire_profile_lock(pool=pool, route=route, profile_dir=profile_dir)
         if not profile_lock_id:
             raise ProfileLockUnavailableError(f"Profile lock unavailable for {profile_dir}")
-    query_shard_key = _query_shard_canonical_key(route=route, query_override=query_override)
-    if query_shard_key:
-        query_shard_lock_id = await _try_acquire_query_shard_lock(
-            pool=pool,
+    if priority_scheduler_enabled:
+        candidate_queries = _priority_query_candidates(route)
+        selected_query, query_lock_key, query_lock_token, query_lock_skipped_count = await _try_acquire_priority_query_lock(
+            redis_client=redis_client,
             route=route,
-            query_shard_key=query_shard_key,
+            queries=candidate_queries,
         )
-        if not query_shard_lock_id:
-            raise QueryShardLockUnavailableError(f"Query shard lock unavailable for {query_shard_key}")
+        metrics["query_lock_skipped_count"] = query_lock_skipped_count
+        if selected_query:
+            query_override = [selected_query]
+            query_shard_key = query_lock_key
+            query_lock_status = "acquired"
+            metrics["query_lock_acquired_count"] = 1
+        else:
+            query_lock_status = "all_locked"
+            raise QueryShardLockUnavailableError(
+                f"Query shard lock unavailable for route {route.get('route_name')} (all candidates locked)"
+            )
+    else:
+        if not raw_queries or (len(raw_queries) == 1 and raw_queries[0].upper() == "BUCKETS"):
+            query_override = _get_bucket_queries(num_queries=3)
+        else:
+            query_override = raw_queries
+        query_shard_key = _query_shard_canonical_key(route=route, query_override=query_override)
+        if query_shard_key:
+            query_shard_lock_id = await _try_acquire_query_shard_lock(
+                pool=pool,
+                route=route,
+                query_shard_key=query_shard_key,
+            )
+            if not query_shard_lock_id:
+                raise QueryShardLockUnavailableError(f"Query shard lock unavailable for {query_shard_key}")
+            query_lock_status = "legacy_query_shard"
 
     async def _lease_keepalive_loop(lock_id: str | None, lock_name: str, lease_seconds: int) -> None:
         lock_id_value = str(lock_id or "").strip()
@@ -2494,6 +2754,8 @@ async def _run_scrape_cycle(
             return
 
         metrics["listings_saved"] = metrics.get("listings_saved", 0) + 1
+        if _is_profitable_listing_signal(listing):
+            metrics["profitable_listing_count"] = metrics.get("profitable_listing_count", 0) + 1
         metadata = {
             "route_name": route.get("route_name"),
             "query": payload.get("query"),
@@ -2646,10 +2908,22 @@ async def _run_scrape_cycle(
             "proxy_key": proxy_key,
             "duration_ms": duration_ms,
             "query_shard_key": query_shard_key,
+            "query_lock_key": query_lock_key,
+            "query_lock_status": query_lock_status,
+            "query_lock_skipped_count": query_lock_skipped_count,
+            "selected_query": selected_query,
             "page_text_sample": " ".join(query_error_text_samples)[-500:],
             "proxy_expected_ip": proxy_expected_ip,
             "proxy_observed_ip": proxy_observed_ip,
             "proxy_ip_check_status": proxy_ip_check_status,
+            "lane_override": route.get("lane_override"),
+            "computed_lane": route.get("computed_lane"),
+            "effective_lane": route.get("effective_lane"),
+            "priority_score": route.get("priority_score"),
+            "priority_components": route.get("priority_components"),
+            "route_due_age_seconds": route.get("due_age_seconds"),
+            "route_revisit_age_seconds": route.get("revisit_age_seconds"),
+            "lane_interval_multiplier": route.get("lane_interval_multiplier"),
         }
         if dolphin_profile_id:
             cycle_meta["dolphin_profile_id"] = dolphin_profile_id
@@ -2698,6 +2972,14 @@ async def _run_scrape_cycle(
             await _release_query_shard_lock(pool=pool, route=route, query_lock_id=query_shard_lock_id)
         except Exception as exc:
             logging.warning("[%s] failed to release query shard lock: %s", WORKER_NAME, exc)
+        try:
+            await _release_priority_query_lock(
+                redis_client=redis_client,
+                query_lock_key=query_lock_key,
+                query_lock_token=query_lock_token,
+            )
+        except Exception as exc:
+            logging.warning("[%s] failed to release priority query lock: %s", WORKER_NAME, exc)
 
 
 async def _run_scrape_cycle_with_retry(
@@ -2717,6 +2999,10 @@ async def _run_scrape_cycle_with_retry(
         "max_page_cards": 0,
         "query_error_count": 0,
         "redirect_count": 0,
+        "profitable_listing_count": 0,
+        "duplicate_listing_count": 0,
+        "query_lock_skipped_count": 0,
+        "query_lock_acquired_count": 0,
         "postgres_upsert_latency_ms_sum": 0,
         "postgres_upsert_latency_ms_count": 0,
         "redis_publish_latency_ms_sum": 0,
@@ -2738,6 +3024,14 @@ async def _run_scrape_cycle_with_retry(
             metrics, cycle_meta = await _run_scrape_cycle(pool, redis_client, feature_flags, route)
             last_metrics = metrics
             cycle_details = dict(cycle_meta or {})
+            cycle_details.setdefault("lane_override", route.get("lane_override"))
+            cycle_details.setdefault("computed_lane", route.get("computed_lane"))
+            cycle_details.setdefault("effective_lane", route.get("effective_lane"))
+            cycle_details.setdefault("priority_score", route.get("priority_score"))
+            cycle_details.setdefault("priority_components", route.get("priority_components"))
+            cycle_details.setdefault("route_due_age_seconds", route.get("due_age_seconds"))
+            cycle_details.setdefault("route_revisit_age_seconds", route.get("revisit_age_seconds"))
+            cycle_details.setdefault("lane_interval_multiplier", route.get("lane_interval_multiplier"))
             if not _is_profile_failed(metrics):
                 if ENABLE_SIGNAL_DETECTION:
                     successful_cycles = int(route.get("successful_cycles") or 0)
@@ -2833,6 +3127,14 @@ async def _run_scrape_cycle_with_retry(
                     details=cycle_details,
                 )
             if category == ErrorCategory.QUERY_SHARD_LOCK_UNAVAILABLE:
+                cycle_details.setdefault("lane_override", route.get("lane_override"))
+                cycle_details.setdefault("computed_lane", route.get("computed_lane"))
+                cycle_details.setdefault("effective_lane", route.get("effective_lane"))
+                cycle_details.setdefault("priority_score", route.get("priority_score"))
+                cycle_details.setdefault("priority_components", route.get("priority_components"))
+                cycle_details.setdefault("route_due_age_seconds", route.get("due_age_seconds"))
+                cycle_details.setdefault("route_revisit_age_seconds", route.get("revisit_age_seconds"))
+                cycle_details.setdefault("query_lock_status", "all_locked")
                 return CycleResult(
                     metrics=last_metrics,
                     outcome=CycleOutcome.WAIT_QUERY_SHARD,
@@ -2979,6 +3281,13 @@ async def _run_worker_loop(
                     eligible_count=eligible_route_count,
                     max_multiplier=WORKER_MAX_BACKOFF_MULTIPLIER,
                 )
+                route_lanes_enabled = False
+                priority_scheduler_enabled = False
+                if feature_flags is not None:
+                    route_lanes_enabled = await feature_flags.is_enabled("ENABLE_ROUTE_LANES")
+                    priority_scheduler_enabled = route_lanes_enabled and await feature_flags.is_enabled(
+                        "ENABLE_PRIORITY_SCHEDULER"
+                    )
                 single_route_enforcement = (
                     enabled_route_count > 0 and enabled_route_count < WORKER_MIN_ENABLED_ROUTES_WARN
                 )
@@ -3012,7 +3321,18 @@ async def _run_worker_loop(
                     )
 
                 now_dt = datetime.now(timezone.utc)
-                route = _select_next_route(routes, now=now_dt)
+                if route_lanes_enabled and routes:
+                    _annotate_routes_with_priority(
+                        routes,
+                        now=now_dt,
+                        fallback_interval_seconds=effective_interval_seconds,
+                    )
+                    await _persist_route_priority_state(pool=pool, routes=routes)
+                route = _select_next_route(
+                    routes,
+                    now=now_dt,
+                    use_priority_scheduler=priority_scheduler_enabled,
+                )
                 
                 if route is None:
                     has_db_routes = await _has_configured_worker_routes(pool)
@@ -3094,12 +3414,14 @@ async def _run_worker_loop(
                 )
 
                 logging.info(
-                    "[%s] selected route=%s source=%s profile=%s proxy_mode=%s",
+                    "[%s] selected route=%s source=%s profile=%s proxy_mode=%s lane=%s score=%s",
                     WORKER_NAME,
                     route_name,
                     route.get("source", "unknown"),
                     route.get("user_data_dir") or WORKER_USER_DATA_DIR or "(default)",
                     _normalize_proxy_mode(route.get("proxy_mode")),
+                    route.get("effective_lane") or "warm",
+                    route.get("priority_score"),
                 )
                 cycle_id = str(uuid.uuid4())
 
@@ -3155,13 +3477,22 @@ async def _run_worker_loop(
                 reason = (cycle_result.reason or "").strip()
                 _cycle_dolphin_id = (cycle_result.details or {}).get("dolphin_profile_id") if cycle_result.details else None
                 route_interval_seconds = _route_interval_seconds(route, fallback_seconds=effective_interval_seconds)
+                lane_multiplier = (
+                    lane_interval_multiplier_from_module(route.get("effective_lane"))
+                    if priority_scheduler_enabled and route.get("source") == "db"
+                    else 1.0
+                )
                 if (
                     single_route_enforcement
                     and route.get("source") == "db"
                     and route.get("route_interval_seconds")
                 ):
                     route_interval_seconds *= WORKER_SINGLE_ROUTE_REST_MULTIPLIER
-                next_interval_seconds = route_interval_seconds * route_status_interval_multiplier(route.get("status"))
+                next_interval_seconds = (
+                    route_interval_seconds
+                    * lane_multiplier
+                    * route_status_interval_multiplier(route.get("status"))
+                )
 
                 # Apply proxy provider pacing multiplier (if provider is under load).
                 if not proxy_health.is_stale and proxy_health.pacing_multiplier > 1.0:
@@ -3426,6 +3757,11 @@ async def _run_worker_loop(
                         result_count=metrics.get("listings_scraped", 0),
                         page_load_ms=int(details.get("duration_ms") or 0),
                     )
+                    await _record_route_priority_metrics(
+                        pool=pool,
+                        route=route,
+                        metrics=metrics,
+                    )
                     heartbeat_status = "ok"
                     heartbeat_error: str | None = None
                     if signal_action == "throttle":
@@ -3503,8 +3839,6 @@ async def _run_worker_loop(
                     )
                     if sleep_seconds > 0:
                         await asyncio.sleep(sleep_seconds)
-                if sleep_seconds > 0:
-                    await asyncio.sleep(sleep_seconds)
             except Exception as exc:
                 logging.exception("[%s] scrape cycle failed: %s", WORKER_NAME, exc)
                 route_name = str((route or {}).get("route_name") or "unknown")

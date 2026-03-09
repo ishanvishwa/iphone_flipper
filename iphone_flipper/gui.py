@@ -2300,10 +2300,22 @@ PY
                 )
                 last_run_display = last_run.replace("T", " ")[:19] if last_run else ""
                 enabled_display = "yes" if route.get("is_enabled", True) else "no"
+                lane_display = str(route.get("effective_lane") or route.get("computed_lane") or "warm").strip() or "warm"
+                if str(route.get("lane_override") or "").strip():
+                    lane_display = f"{lane_display}*"
+                priority_score = route.get("priority_score")
+                score_display = ""
+                if priority_score not in (None, ""):
+                    try:
+                        score_display = f"{float(priority_score):.2f}"
+                    except (TypeError, ValueError):
+                        score_display = str(priority_score)
 
                 values = (
                     worker_name,
                     str(route.get("user_data_dir") or ""),
+                    lane_display,
+                    score_display,
                     status,
                     str(max(0, self._safe_int(health.get("listings_scraped_last_minute"), 0))) if is_active_route else "-",
                     last_run_display,
@@ -2354,6 +2366,7 @@ PY
             "route_name": "",
             "is_enabled": "1",
             "priority": "100",
+            "lane_override": "auto",
             "route_interval_seconds": "",
             "user_data_dir": suggested_profile,
             "proxy_server": "",
@@ -2373,6 +2386,12 @@ PY
             "worker_lease": "",
             "worker_cooldown": "",
             "worker_last_run": "",
+            "computed_lane": "",
+            "effective_lane": "",
+            "priority_score": "",
+            "priority_score_updated_at": "",
+            "profitable_hit_rate": "",
+            "recent_duplicate_ratio": "",
         }
         for key, value in defaults.items():
             var = self.vps_scraper_form_vars.get(key)
@@ -2398,6 +2417,8 @@ PY
         self.vps_scraper_form_vars["route_name"].set(str(route.get("route_name") or ""))
         self.vps_scraper_form_vars["is_enabled"].set("1" if route.get("is_enabled", True) else "0")
         self.vps_scraper_form_vars["priority"].set(str(route.get("priority") or 100))
+        lane_override = str(route.get("lane_override") or "").strip().lower() or "auto"
+        self.vps_scraper_form_vars["lane_override"].set(lane_override)
         route_interval_value = route.get("route_interval_seconds")
         self.vps_scraper_form_vars["route_interval_seconds"].set(
             str(route_interval_value) if route_interval_value not in (None, "") else ""
@@ -2432,6 +2453,23 @@ PY
         )
         self.vps_scraper_form_vars["worker_lease"].set(str(data.get("lease_display") or "no active lease"))
         self.vps_scraper_form_vars["worker_cooldown"].set(str(data.get("cooldown_display") or "no cooldown"))
+        self.vps_scraper_form_vars["computed_lane"].set(str(route.get("computed_lane") or ""))
+        self.vps_scraper_form_vars["effective_lane"].set(str(route.get("effective_lane") or ""))
+        priority_score = route.get("priority_score")
+        self.vps_scraper_form_vars["priority_score"].set(
+            f"{float(priority_score):.2f}" if priority_score not in (None, "") else ""
+        )
+        self.vps_scraper_form_vars["priority_score_updated_at"].set(
+            str(route.get("priority_score_updated_at") or "")
+        )
+        profitable_hit_rate = route.get("profitable_hit_rate")
+        self.vps_scraper_form_vars["profitable_hit_rate"].set(
+            f"{float(profitable_hit_rate):.2f}" if profitable_hit_rate not in (None, "") else ""
+        )
+        recent_duplicate_ratio = route.get("recent_duplicate_ratio")
+        self.vps_scraper_form_vars["recent_duplicate_ratio"].set(
+            f"{float(recent_duplicate_ratio):.2f}" if recent_duplicate_ratio not in (None, "") else ""
+        )
 
         last_run = str(
             health.get("last_run_finished_at")
@@ -2564,6 +2602,11 @@ PY
             "user_data_dir": profile_dir or None,
             "search_queries": self.vps_scraper_form_vars["search_queries"].get().strip() or None,
             "priority": priority,
+            "lane_override": (
+                None
+                if str(self.vps_scraper_form_vars["lane_override"].get() or "").strip().lower() in {"", "auto"}
+                else str(self.vps_scraper_form_vars["lane_override"].get() or "").strip().lower()
+            ),
             "route_interval_seconds": route_interval_seconds,
             "manual_login_required": manual_login_required,
             "manual_login_reason": manual_login_reason,
@@ -6244,6 +6287,7 @@ PY
             "route_name": tk.StringVar(),
             "is_enabled": tk.StringVar(value="1"),
             "priority": tk.StringVar(value="100"),
+            "lane_override": tk.StringVar(value="auto"),
             "route_interval_seconds": tk.StringVar(),
             "user_data_dir": tk.StringVar(),
             "proxy_profile": tk.StringVar(value="Custom (manual proxy)"),
@@ -6263,6 +6307,12 @@ PY
             "worker_lease": tk.StringVar(),
             "worker_cooldown": tk.StringVar(),
             "worker_last_run": tk.StringVar(),
+            "computed_lane": tk.StringVar(),
+            "effective_lane": tk.StringVar(),
+            "priority_score": tk.StringVar(),
+            "priority_score_updated_at": tk.StringVar(),
+            "profitable_hit_rate": tk.StringVar(),
+            "recent_duplicate_ratio": tk.StringVar(),
         }
 
         window = tk.Toplevel(self.root)
@@ -6492,6 +6542,8 @@ PY
             columns=(
                 "Worker",
                 "Profile",
+                "Lane",
+                "Score",
                 "Status",
                 "Scraped (1m)",
                 "Last run",
@@ -6502,6 +6554,8 @@ PY
         for col, width in [
             ("Worker", 160),
             ("Profile", 260),
+            ("Lane", 100),
+            ("Score", 90),
             ("Status", 180),
             ("Scraped (1m)", 140),
             ("Last run", 180),
@@ -6524,7 +6578,7 @@ PY
         """Open a modal popup to add or edit a VPS Scraper route."""
         editor = tk.Toplevel(self.settings_window)
         editor.title("VPS Route Settings")
-        editor.geometry("450x640")
+        editor.geometry("470x760")
         editor.grab_set()
 
         form_frame = ttk.Frame(editor, padding=10)
@@ -6545,6 +6599,15 @@ PY
         for idx, (label, key) in enumerate(fields):
             ttk.Label(form_frame, text=label + ":").pack(anchor="w", pady=(8, 2))
             ttk.Entry(form_frame, textvariable=self.vps_scraper_form_vars[key]).pack(fill="x")
+
+        ttk.Label(form_frame, text="Lane Override:").pack(anchor="w", pady=(8, 2))
+        lane_override_dropdown = ttk.Combobox(
+            form_frame,
+            textvariable=self.vps_scraper_form_vars["lane_override"],
+            state="readonly",
+        )
+        lane_override_dropdown["values"] = ("auto", "hot", "warm", "sweep")
+        lane_override_dropdown.pack(fill="x")
 
         ttk.Label(form_frame, text="Proxy Profile:").pack(anchor="w", pady=(8, 2))
         proxy_dropdown = ttk.Combobox(
@@ -6575,6 +6638,21 @@ PY
             onvalue="1",
             offvalue="0"
         ).pack(anchor="w", pady=(5, 0))
+
+        computed_lane_frame = ttk.LabelFrame(form_frame, text="Computed Scheduler State")
+        computed_lane_frame.pack(fill="x", pady=(12, 0), ipady=4)
+        for label, key in (
+            ("Computed Lane", "computed_lane"),
+            ("Effective Lane", "effective_lane"),
+            ("Priority Score", "priority_score"),
+            ("Profitable Hit Rate", "profitable_hit_rate"),
+            ("Duplicate Ratio", "recent_duplicate_ratio"),
+            ("Score Updated At", "priority_score_updated_at"),
+        ):
+            row = ttk.Frame(computed_lane_frame)
+            row.pack(fill="x", padx=6, pady=2)
+            ttk.Label(row, text=f"{label}:").pack(side=tk.LEFT)
+            ttk.Label(row, textvariable=self.vps_scraper_form_vars[key]).pack(side=tk.LEFT, padx=(6, 0))
 
         # Actions
         btn_frame = ttk.Frame(form_frame)

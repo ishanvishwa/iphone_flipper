@@ -9,7 +9,7 @@ This is a living development log tracking:
 - roadmap drift (manual/additional features)
 - current status and active risks
 
-Last updated: **2026-03-09**
+Last updated: **2026-03-10**
 Author: Codex implementation/update pass
 
 ---
@@ -2122,5 +2122,119 @@ This keeps `dev-log.md` actionable for both engineering and operations.
   - Phase 4 is still required for priority scheduling and route/query lanes
   - Phase 6 still owns operator replay tooling, backlog visibility, and live-push rollback controls beyond the current flag
   - broader GUI test coverage is still light outside the new sync helper path because most existing GUI behavior remains Tk-driven and integration-heavy
+
+---
+
+### §41 – V3.0 Phase 4: Priority Scheduler + Route/Query Lanes (2026-03-10)
+
+- Summary: Implemented Phase 4 of the approved V3.0 latency/responsiveness upgrade track. DB-backed worker routes now support persisted route lanes (`hot`, `warm`, `sweep`), score-based dispatch, lane-aware query ranking, and Redis per-query locks behind `ENABLE_ROUTE_LANES` and `ENABLE_PRIORITY_SCHEDULER`. Final rollout required a controlled VPS acceptance window on `worker_3` to prove that hot-route coverage improves without increasing hot-route cadence, then the temporary smoke routes were removed so production returned to the normal env-backed route set with both Phase 4 flags left enabled.
+- Motivation:
+  - prioritize high-value routes without increasing per-profile request intensity
+  - keep current cooldown/throttle/quiet-hours/session pacing intact while changing selection order only
+  - prevent workers from racing the same query when DB-backed routes use multiple overlapping search terms
+- Changes:
+  - added dedicated Phase 4 scheduler/lane modules:
+    - `server/services/worker/scheduler.py` now owns route score calculation, computed/effective lanes, lane interval multipliers, due-route selection, and lane-aware query ranking
+    - `server/services/common/route_lanes.py` now owns shared lane validation/normalization for worker + API surfaces
+  - extended worker route persistence and runtime state:
+    - added `lane_override`, `computed_lane`, `effective_lane`, `priority_score`, and `priority_score_updated_at` to `worker_routes`
+    - promoted `profitable_hit_rate` and `recent_duplicate_ratio` into persisted route metrics so scheduling can use bounded historical signals without a second aggregation system
+    - worker now recomputes/persists lane + score snapshots whenever `ENABLE_ROUTE_LANES=1`
+  - added priority scheduler and query locking behavior in `server/services/worker/worker.py`:
+    - DB routes still use the legacy due-time path when Phase 4 flags are off
+    - when both Phase 4 flags are on, the worker selects the next due route by `effective_lane`, then `priority_score`, then legacy tie-breakers
+    - candidate queries are ranked by lane intent and duplicate pressure
+    - Redis query locks use `query-lock:<sha1>` keys with `SET NX EX` semantics and explicit release on cycle exit
+    - if the preferred query is locked, the worker falls through to the next candidate instead of blocking
+    - if all candidate queries are locked, the cycle returns a scheduler WAIT outcome rather than a false scrape failure
+    - env-backed fallback routes intentionally remain on the legacy scheduling path
+  - extended telemetry/observability:
+    - cycle JSON now carries `lane_override`, `computed_lane`, `effective_lane`, `priority_score`, compact score components, `selected_query`, `query_lock_key`, `query_lock_status`, `route_due_age_seconds`, `route_revisit_age_seconds`, and `lane_interval_multiplier`
+    - cycle counters now include profitable/duplicate listing counts and query-lock acquired/skipped totals
+  - extended API + GUI operator surfaces:
+    - `/worker-routes` now serializes all lane/score fields
+    - route upsert validation permits only `lane_override` edits (`hot`, `warm`, `sweep`, or clear)
+    - GUI VPS route table/editor now shows lane + score state and exposes `auto/hot/warm/sweep` pinning without making computed/effective fields editable
+  - rollout fixes discovered during implementation:
+    - moved route-lane normalization into shared `server/services/common/route_lanes.py` because importing it from the worker package broke the slimmer API image
+    - fixed a worker loop bug where DB-backed routes could hit `UnboundLocalError: sleep_seconds referenced before assignment` after a cycle finished
+  - fresh audit result:
+    - no additional undocumented code-level features or process enhancements were found beyond the approved Phase 4 work and the earlier audit sections
+- Files touched:
+  - `server/services/common/route_lanes.py`
+  - `server/services/common/schema_ensure.py`
+  - `server/services/api/sql/001_init.sql`
+  - `server/services/api/app/main.py`
+  - `server/services/worker/scheduler.py`
+  - `server/services/worker/lease_manager.py`
+  - `server/services/worker/worker.py`
+  - `server/services/worker/telemetry.py`
+  - `gui.py`
+  - `server/tests/test_priority_scheduler.py`
+  - `server/tests/test_api_route_lanes.py`
+  - `server/tests/test_worker_observability.py`
+  - `server/tests/test_telemetry.py`
+  - `architecture.md`
+  - `roadmap.md`
+  - `dev-log.md`
+- Decision/rationale:
+  - route priority uses only already-available signals or small derived aggregates, keeping Phase 4 bounded to scheduling rather than introducing a separate analytics subsystem
+  - operator lane pinning is intentionally narrow: only `lane_override` is editable; computed/effective lane and score stay server-derived to avoid control-plane drift
+  - route cadence remains bounded by the configured route interval; Phase 4 differentiates revisit timing by stretching lower-value lanes, not by shortening hot-route cadence
+  - the production acceptance run used temporary DB routes on `worker_3` because the real VPS currently has no persisted `worker_routes`; after the smoke test these routes were deleted so the deployed server returned to the normal env-backed behavior while leaving the new flags enabled
+- Validation performed:
+  - local import/compile sanity:
+    - `python3 -m py_compile server/services/common/route_lanes.py server/services/worker/scheduler.py server/services/worker/lease_manager.py server/services/worker/worker.py server/services/worker/telemetry.py server/services/api/app/main.py gui.py`
+  - full server pytest regression:
+    - `PYTHONPATH=iphone_flipper /tmp/iphone_flipper_phase4_venv/bin/python -m pytest iphone_flipper/server/tests -q`
+    - result: `107 passed`
+  - VPS rollout and acceptance verification:
+    - deployed the Phase 4 code to `ubuntu@15.235.185.32`
+    - verified baseline behavior with `ENABLE_ROUTE_LANES=0` and `ENABLE_PRIORITY_SCHEDULER=0`
+    - seeded three temporary DB routes only for acceptance on `worker_3`:
+      - `phase4_hot_w3` (`priority=300`, `lane_override=hot`, query `iPhone 15 Pro`)
+      - `phase4_sweep_w3` (`priority=100`, `lane_override=sweep`, query `iPhone 13 mini`)
+      - `phase4_sweep2_w3` (`priority=110`, `lane_override=sweep`, query `iPhone 12 mini`)
+    - temporarily isolated `worker_3` while `worker` and `worker_2` were stopped to avoid unrelated Dolphin profile contention during the comparison window
+    - cleaned stale `worker_proxy_leases` rows and Redis `query-lock:*` keys between smoke runs so acceptance used fresh lease state
+    - flags-off baseline (`ENABLE_ROUTE_LANES=0`, `ENABLE_PRIORITY_SCHEDULER=0`):
+      - `phase4_sweep_w3` selected first at `2026-03-09 22:21:23 UTC`
+      - `phase4_sweep2_w3` selected second at `2026-03-09 22:22:04 UTC`
+      - `phase4_hot_w3` selected third at `2026-03-09 22:22:37 UTC`
+      - hot-route first-coverage delay from baseline start (`2026-03-09 22:20:40 UTC`) was `117.355s`
+    - route-lanes-only verification (`ENABLE_ROUTE_LANES=1`, `ENABLE_PRIORITY_SCHEDULER=0`):
+      - `/worker-routes` returned non-null `priority_score`, `computed_lane`, and `effective_lane`
+      - worker cycle logs carried score components and `lane_interval_multiplier` while dispatch order remained legacy
+    - final priority-scheduler verification (`ENABLE_ROUTE_LANES=1`, `ENABLE_PRIORITY_SCHEDULER=1`):
+      - verified all three temporary routes shared the same persisted `next_run_at` before starting the worker
+      - `phase4_hot_w3` was selected first at `2026-03-09 22:34:58 UTC`
+      - hot-route first-coverage delay from Phase 4 start (`2026-03-09 22:34:57 UTC`) dropped to `1.866s`
+      - first hot-route cycle emitted `query_lock_status=acquired` with `query_lock_key=query-lock:a37b7398f5d5cdd2099f30b6`
+      - hot route was selected again at `2026-03-09 22:37:28 UTC`, yielding a hot-route revisit gap of `149.646s`
+      - `phase4_sweep2_w3` later completed with `query_lock_status=acquired` and persisted `next_run_at - last_selected_at = 229.610s`
+      - post-cycle `/worker-routes` showed hot-route `next_run_at - last_selected_at = 149.570s`
+    - cleanup after acceptance:
+      - deleted all temporary Phase 4 routes from Postgres
+      - truncated `worker_proxy_leases`
+      - cleared Redis `query-lock:*`
+      - restarted `worker`, `worker_2`, and `worker_3`
+      - verified final rollout state:
+        - `ENABLE_REDIS_STREAM_EVENTS=1`
+        - `ENABLE_NOTIFICATION_CONSUMER=1`
+        - `ENABLE_GUI_WEBSOCKET_PUSH=1`
+        - `ENABLE_PRIORITY_SCHEDULER=1`
+        - `ENABLE_ROUTE_LANES=1`
+      - verified `/worker-routes?worker_name=worker_3` returned `count=0` after cleanup, confirming the temporary acceptance routes were removed
+- Acceptance criteria status:
+  - `Hot routes show shorter revisit intervals than sweep routes.`  
+    Met. In the final flags-on run, `phase4_hot_w3` persisted a revisit interval of `149.570s`, while `phase4_sweep2_w3` persisted `229.610s`.
+  - `Per-profile request intensity does not exceed the current baseline cadence.`  
+    Met. The hot route’s actual repeat-selection gap in the final run was `149.646s`, which stayed aligned with the existing `150s` route interval rather than going faster.
+  - `High-value route coverage time decreases measurably versus the pre-enable baseline.`  
+    Met. Hot-route first coverage improved from `117.355s` in the flags-off baseline to `1.866s` in the final flags-on run, a reduction of `115.489s`.
+- Unresolved follow-ups:
+  - Phase 5 still owns hot-path slimming/background enrichment so lower-value field fetches can move off the scrape hot path
+  - Phase 6 still owns operator replay/backlog controls and explicit rollback tooling for live scheduler behavior
+  - production currently has no persisted `worker_routes` after the acceptance cleanup, so Phase 4 remains enabled but inert until operators create DB-backed routes again through the API/GUI
 
 ---

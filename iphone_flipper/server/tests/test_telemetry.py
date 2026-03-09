@@ -18,6 +18,10 @@ class TelemetryPayloadTests(unittest.TestCase):
                 "listings_parsed": 5,
                 "query_count": 2,
                 "query_result_count": 2,
+                "profitable_listing_count": 2,
+                "duplicate_listing_count": 1,
+                "query_lock_skipped_count": 1,
+                "query_lock_acquired_count": 1,
                 "postgres_upsert_latency_ms_sum": 15,
                 "postgres_upsert_latency_ms_count": 3,
                 "redis_publish_latency_ms_sum": 9,
@@ -35,6 +39,17 @@ class TelemetryPayloadTests(unittest.TestCase):
             details={
                 "proxy_key": "socks5:1.2.3.4:1080:",
                 "query_shard_key": "iphone_15",
+                "query_lock_key": "query-lock:abc",
+                "query_lock_status": "acquired",
+                "selected_query": "iPhone 15 Pro",
+                "lane_override": "hot",
+                "computed_lane": "warm",
+                "effective_lane": "hot",
+                "priority_score": 6.25,
+                "priority_components": {"profit": 1.5, "due_pressure": 2.0},
+                "route_due_age_seconds": 12.5,
+                "route_revisit_age_seconds": 18.0,
+                "lane_interval_multiplier": 1.0,
                 "signal_action": "throttle",
                 "signal_risk_score": 0.32,
                 "soft_signals": ["LOW_RESULTS"],
@@ -75,6 +90,10 @@ class TelemetryPayloadTests(unittest.TestCase):
         self.assertEqual(payload["listings_scraped"], 5)
         self.assertEqual(payload["listings_parsed"], 5)
         self.assertEqual(payload["query_count"], 2)
+        self.assertEqual(payload["profitable_listing_count"], 2)
+        self.assertEqual(payload["duplicate_listing_count"], 1)
+        self.assertEqual(payload["query_lock_skipped_count"], 1)
+        self.assertEqual(payload["query_lock_acquired_count"], 1)
         self.assertEqual(payload["postgres_upsert_latency_ms_sum"], 15)
         self.assertEqual(payload["postgres_upsert_latency_ms_count"], 3)
         self.assertEqual(payload["redis_publish_latency_ms_count"], 3)
@@ -86,6 +105,17 @@ class TelemetryPayloadTests(unittest.TestCase):
         self.assertEqual(payload["end_to_end_alert_latency_ms_count"], 1)
         self.assertEqual(payload["signal_action"], "throttle")
         self.assertEqual(payload["query_shard_key"], "iphone_15")
+        self.assertEqual(payload["query_lock_key"], "query-lock:abc")
+        self.assertEqual(payload["query_lock_status"], "acquired")
+        self.assertEqual(payload["selected_query"], "iPhone 15 Pro")
+        self.assertEqual(payload["lane_override"], "hot")
+        self.assertEqual(payload["computed_lane"], "warm")
+        self.assertEqual(payload["effective_lane"], "hot")
+        self.assertEqual(payload["priority_score"], 6.25)
+        self.assertEqual(payload["priority_components"]["profit"], 1.5)
+        self.assertEqual(payload["route_due_age_seconds"], 12.5)
+        self.assertEqual(payload["route_revisit_age_seconds"], 18.0)
+        self.assertEqual(payload["lane_interval_multiplier"], 1.0)
         self.assertEqual(payload["soft_signals"], ["LOW_RESULTS"])
         self.assertEqual(payload["persona_hash"], "abc123")
         self.assertEqual(payload["persona"]["timezone_id"], "America/Los_Angeles")

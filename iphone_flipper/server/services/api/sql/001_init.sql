@@ -56,12 +56,19 @@ CREATE TABLE IF NOT EXISTS worker_routes (
     next_run_at TIMESTAMPTZ,
     route_interval_seconds INTEGER,
     avg_result_count DOUBLE PRECISION,
+    profitable_hit_rate DOUBLE PRECISION,
+    recent_duplicate_ratio DOUBLE PRECISION,
     avg_page_load_ms DOUBLE PRECISION,
     successful_cycles INTEGER NOT NULL DEFAULT 0,
     last_selected_at TIMESTAMPTZ,
     last_success_at TIMESTAMPTZ,
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
     cooldown_until TIMESTAMPTZ,
+    lane_override TEXT,
+    computed_lane TEXT NOT NULL DEFAULT 'warm',
+    effective_lane TEXT NOT NULL DEFAULT 'warm',
+    priority_score DOUBLE PRECISION,
+    priority_score_updated_at TIMESTAMPTZ,
     manual_login_required BOOLEAN NOT NULL DEFAULT FALSE,
     manual_login_reason TEXT,
     manual_login_required_at TIMESTAMPTZ,
@@ -84,10 +91,17 @@ ALTER TABLE worker_routes ADD COLUMN IF NOT EXISTS status_since TIMESTAMPTZ;
 ALTER TABLE worker_routes ADD COLUMN IF NOT EXISTS next_run_at TIMESTAMPTZ;
 ALTER TABLE worker_routes ADD COLUMN IF NOT EXISTS route_interval_seconds INTEGER;
 ALTER TABLE worker_routes ADD COLUMN IF NOT EXISTS avg_result_count DOUBLE PRECISION;
+ALTER TABLE worker_routes ADD COLUMN IF NOT EXISTS profitable_hit_rate DOUBLE PRECISION;
+ALTER TABLE worker_routes ADD COLUMN IF NOT EXISTS recent_duplicate_ratio DOUBLE PRECISION;
 ALTER TABLE worker_routes ADD COLUMN IF NOT EXISTS avg_page_load_ms DOUBLE PRECISION;
 ALTER TABLE worker_routes ADD COLUMN IF NOT EXISTS successful_cycles INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE worker_routes ADD COLUMN IF NOT EXISTS consecutive_failures INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE worker_routes ADD COLUMN IF NOT EXISTS cooldown_until TIMESTAMPTZ;
+ALTER TABLE worker_routes ADD COLUMN IF NOT EXISTS lane_override TEXT;
+ALTER TABLE worker_routes ADD COLUMN IF NOT EXISTS computed_lane TEXT NOT NULL DEFAULT 'warm';
+ALTER TABLE worker_routes ADD COLUMN IF NOT EXISTS effective_lane TEXT NOT NULL DEFAULT 'warm';
+ALTER TABLE worker_routes ADD COLUMN IF NOT EXISTS priority_score DOUBLE PRECISION;
+ALTER TABLE worker_routes ADD COLUMN IF NOT EXISTS priority_score_updated_at TIMESTAMPTZ;
 ALTER TABLE worker_routes ADD COLUMN IF NOT EXISTS manual_login_required BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE worker_routes ADD COLUMN IF NOT EXISTS manual_login_reason TEXT;
 ALTER TABLE worker_routes ADD COLUMN IF NOT EXISTS manual_login_required_at TIMESTAMPTZ;
@@ -111,6 +125,25 @@ SET
     quarantined_at = COALESCE(quarantined_at, manual_login_required_at),
     quarantine_reason = COALESCE(NULLIF(BTRIM(quarantine_reason), ''), manual_login_reason)
 WHERE COALESCE(manual_login_required, FALSE) = TRUE;
+UPDATE worker_routes
+SET
+    profitable_hit_rate = COALESCE(profitable_hit_rate, 0.0),
+    recent_duplicate_ratio = COALESCE(recent_duplicate_ratio, 0.0),
+    computed_lane = CASE
+        WHEN LOWER(COALESCE(computed_lane, '')) IN ('hot', 'warm', 'sweep')
+            THEN LOWER(computed_lane)
+        ELSE 'warm'
+    END,
+    effective_lane = CASE
+        WHEN LOWER(COALESCE(effective_lane, '')) IN ('hot', 'warm', 'sweep')
+            THEN LOWER(effective_lane)
+        ELSE 'warm'
+    END,
+    lane_override = CASE
+        WHEN LOWER(COALESCE(lane_override, '')) IN ('hot', 'warm', 'sweep')
+            THEN LOWER(lane_override)
+        ELSE NULL
+    END;
 
 CREATE INDEX IF NOT EXISTS idx_worker_routes_worker ON worker_routes (worker_name, is_enabled, priority, route_name);
 CREATE INDEX IF NOT EXISTS idx_worker_routes_schedule

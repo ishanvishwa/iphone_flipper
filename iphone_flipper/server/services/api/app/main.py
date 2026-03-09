@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 from server.services.common.feature_flags import FLAG_HASH_KEY, RedisFeatureFlags
 from server.services.common.observability import emit_json_log, monotonic_duration_ms, utc_now_iso
+from server.services.common.route_lanes import normalize_route_lane
 from server.services.common.schema_ensure import ensure_worker_tables as ensure_common_worker_tables
 
 APP_ENV = os.getenv("APP_ENV", "production")
@@ -114,6 +115,7 @@ class WorkerRouteUpsert(BaseModel):
     user_data_dir: str | None = None
     search_queries: str | None = None
     priority: int = Field(default=100, ge=0, le=100000)
+    lane_override: str | None = Field(default=None, max_length=16)
     route_interval_seconds: int | None = Field(default=None, ge=1, le=86400)
     route_status: str | None = Field(default=None, max_length=32)
     status_reason: str | None = None
@@ -147,6 +149,14 @@ def _assert_api_token(token: str | None) -> None:
 
 async def _auth_rest(x_api_token: str | None) -> None:
     _assert_api_token(x_api_token)
+
+
+def _payload_field_is_set(payload: BaseModel, field_name: str) -> bool:
+    fields = getattr(payload, "model_fields_set", None)
+    if isinstance(fields, set):
+        return field_name in fields
+    legacy_fields = getattr(payload, "__fields_set__", set())
+    return field_name in legacy_fields
 
 
 def _serialize_datetimes(item: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
@@ -632,12 +642,19 @@ async def get_worker_routes(
                 r.next_run_at,
                 r.route_interval_seconds,
                 r.avg_result_count,
+                r.profitable_hit_rate,
+                r.recent_duplicate_ratio,
                 r.avg_page_load_ms,
                 r.successful_cycles,
                 r.last_selected_at,
                 r.last_success_at,
                 r.consecutive_failures,
                 r.cooldown_until,
+                r.lane_override,
+                r.computed_lane,
+                r.effective_lane,
+                r.priority_score,
+                r.priority_score_updated_at,
                 r.manual_login_required,
                 r.manual_login_reason,
                 r.manual_login_required_at,
@@ -675,12 +692,19 @@ async def get_worker_routes(
                 r.next_run_at,
                 r.route_interval_seconds,
                 r.avg_result_count,
+                r.profitable_hit_rate,
+                r.recent_duplicate_ratio,
                 r.avg_page_load_ms,
                 r.successful_cycles,
                 r.last_selected_at,
                 r.last_success_at,
                 r.consecutive_failures,
                 r.cooldown_until,
+                r.lane_override,
+                r.computed_lane,
+                r.effective_lane,
+                r.priority_score,
+                r.priority_score_updated_at,
                 r.manual_login_required,
                 r.manual_login_reason,
                 r.manual_login_required_at,
@@ -707,6 +731,7 @@ async def get_worker_routes(
                 "status_since",
                 "next_run_at",
                 "cooldown_until",
+                "priority_score_updated_at",
                 "manual_login_required_at",
                 "quarantined_at",
                 "preferred_proxy_updated_at",
@@ -748,6 +773,9 @@ async def upsert_worker_route(
             search_queries,
             priority,
             route_interval_seconds,
+            lane_override,
+            computed_lane,
+            effective_lane,
             status,
             status_reason,
             status_since,
@@ -760,6 +788,7 @@ async def upsert_worker_route(
             $1, $2, $3, $4, $5, $6, $7, $8,
             NULL, NULL,
             $9, $10, $11, $12,
+            $17, 'warm', COALESCE($17, 'warm'),
             CASE
                 WHEN $3::BOOLEAN = FALSE THEN 'DISABLED'
                 WHEN COALESCE($15, FALSE) THEN 'NEEDS_LOGIN'
@@ -800,6 +829,14 @@ async def upsert_worker_route(
             search_queries = EXCLUDED.search_queries,
             priority = EXCLUDED.priority,
             route_interval_seconds = EXCLUDED.route_interval_seconds,
+            lane_override = CASE
+                WHEN $18::BOOLEAN THEN $17
+                ELSE worker_routes.lane_override
+            END,
+            effective_lane = CASE
+                WHEN $18::BOOLEAN THEN COALESCE($17, worker_routes.computed_lane, 'warm')
+                ELSE worker_routes.effective_lane
+            END,
             status = CASE
                 WHEN EXCLUDED.is_enabled = FALSE THEN 'DISABLED'
                 WHEN COALESCE($15, worker_routes.manual_login_required) THEN 'NEEDS_LOGIN'
@@ -873,12 +910,19 @@ async def upsert_worker_route(
             next_run_at,
             route_interval_seconds,
             avg_result_count,
+            profitable_hit_rate,
+            recent_duplicate_ratio,
             avg_page_load_ms,
             successful_cycles,
             last_selected_at,
             last_success_at,
             consecutive_failures,
             cooldown_until,
+            lane_override,
+            computed_lane,
+            effective_lane,
+            priority_score,
+            priority_score_updated_at,
             manual_login_required,
             manual_login_reason,
             manual_login_required_at,
@@ -895,6 +939,16 @@ async def upsert_worker_route(
     user_data_dir = (payload.user_data_dir or "").strip() or None
     route_status = _normalize_route_status(payload.route_status)
     status_reason = (payload.status_reason or "").strip() or None
+    lane_override_provided = _payload_field_is_set(payload, "lane_override")
+    lane_override = normalize_route_lane(payload.lane_override) if lane_override_provided else None
+    raw_lane_override = (payload.lane_override or "").strip()
+    if (
+        lane_override_provided
+        and raw_lane_override
+        and raw_lane_override.lower() not in {"auto", "default", "computed"}
+        and lane_override is None
+    ):
+        raise HTTPException(status_code=400, detail="lane_override must be one of hot, warm, sweep, or null.")
 
     async with app.state.db_pool.acquire() as conn:
         await _assert_unique_profile_dir(
@@ -922,6 +976,8 @@ async def upsert_worker_route(
             status_reason,
             payload.manual_login_required,
             (payload.manual_login_reason or "").strip() or None,
+            lane_override,
+            lane_override_provided,
         )
         warnings = await _build_route_config_warnings(conn=conn, worker_name=worker_name_clean)
 
@@ -937,6 +993,7 @@ async def upsert_worker_route(
                 "status_since",
                 "next_run_at",
                 "cooldown_until",
+                "priority_score_updated_at",
                 "manual_login_required_at",
                 "quarantined_at",
                 "preferred_proxy_updated_at",

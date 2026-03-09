@@ -458,3 +458,100 @@ class WorkerObservabilityTests(unittest.IsolatedAsyncioTestCase):
             )
 
         stream_mock.assert_awaited_once()
+
+    async def test_try_acquire_priority_query_lock_skips_locked_candidate(self) -> None:
+        redis_client = AsyncMock()
+        redis_client.set = AsyncMock(side_effect=[None, True])
+
+        selected_query, lock_key, lock_token, skipped = await worker._try_acquire_priority_query_lock(
+            redis_client=redis_client,
+            route={"route_name": "profile_hot"},
+            queries=["iPhone", "iPhone 15 Pro"],
+        )
+
+        self.assertEqual(selected_query, "iPhone 15 Pro")
+        self.assertEqual(skipped, 1)
+        self.assertTrue(str(lock_key).startswith("query-lock:"))
+        self.assertTrue(bool(lock_token))
+
+    async def test_run_scrape_cycle_uses_selected_priority_query(self) -> None:
+        route = {
+            "route_name": "profile_priority",
+            "worker_name": "worker",
+            "user_data_dir": "/profiles/priority",
+            "search_queries": "iPhone, iPhone 15 Pro",
+            "effective_lane": "hot",
+            "computed_lane": "hot",
+            "lane_override": "hot",
+            "priority_score": 6.5,
+            "priority_components": {"profit": 1.5},
+            "due_age_seconds": 12.0,
+            "revisit_age_seconds": 18.0,
+            "lane_interval_multiplier": 1.0,
+            "status": "ENABLED",
+            "source": "db",
+        }
+        feature_flags = MagicMock()
+
+        async def _flag_enabled(flag_name: str) -> bool:
+            return flag_name in {"ENABLE_ROUTE_LANES", "ENABLE_PRIORITY_SCHEDULER"}
+
+        feature_flags.is_enabled = AsyncMock(side_effect=_flag_enabled)
+
+        with (
+            patch.dict(worker.os.environ, {"DOLPHIN_PROFILE_ID": "phase4-test-profile"}, clear=False),
+            patch.object(worker, "_try_acquire_profile_lock", AsyncMock(return_value="profile-lock")),
+            patch.object(worker, "_build_playwright_proxy", AsyncMock(return_value=(None, None, None, None, None, None))),
+            patch.object(worker, "_try_acquire_priority_query_lock", AsyncMock(return_value=("iPhone 15 Pro", "query-lock:1", "token-1", 1))),
+            patch.object(worker, "_release_proxy_lease", AsyncMock()),
+            patch.object(worker, "_release_profile_lock", AsyncMock()),
+            patch.object(worker, "_release_query_shard_lock", AsyncMock()),
+            patch.object(worker, "_release_priority_query_lock", AsyncMock()),
+            patch.object(worker, "_cleanup_old_scrape_events", AsyncMock()),
+            patch.object(worker, "_record_proxy_success", AsyncMock()),
+            patch.object(worker, "_persist_route_preferred_proxy_key", AsyncMock()),
+            patch.object(worker, "scrape_marketplace", AsyncMock(return_value=None)) as scrape_mock,
+        ):
+            metrics, details = await worker._run_scrape_cycle(
+                pool=AsyncMock(),
+                redis_client=AsyncMock(),
+                feature_flags=feature_flags,
+                route=route,
+            )
+
+        self.assertEqual(metrics["query_lock_acquired_count"], 1)
+        self.assertEqual(metrics["query_lock_skipped_count"], 1)
+        self.assertEqual(details["selected_query"], "iPhone 15 Pro")
+        self.assertEqual(details["query_lock_status"], "acquired")
+        self.assertEqual(details["query_lock_key"], "query-lock:1")
+        self.assertEqual(scrape_mock.await_args.kwargs["search_queries"], ["iPhone 15 Pro"])
+
+    async def test_run_scrape_cycle_with_retry_waits_when_all_priority_queries_are_locked(self) -> None:
+        route = {
+            "route_name": "profile_locked",
+            "effective_lane": "hot",
+            "computed_lane": "hot",
+            "lane_override": None,
+            "priority_score": 6.2,
+            "priority_components": {"profit": 1.2},
+            "due_age_seconds": 10.0,
+            "revisit_age_seconds": 10.0,
+        }
+        feature_flags = MagicMock()
+        feature_flags.is_enabled = AsyncMock(return_value=True)
+
+        with patch.object(
+            worker,
+            "_run_scrape_cycle",
+            AsyncMock(side_effect=worker.QueryShardLockUnavailableError("Query shard lock unavailable for route profile_locked")),
+        ):
+            result = await worker._run_scrape_cycle_with_retry(
+                pool=AsyncMock(),
+                redis_client=AsyncMock(),
+                feature_flags=feature_flags,
+                route=route,
+            )
+
+        self.assertEqual(result.outcome, worker.CycleOutcome.WAIT_QUERY_SHARD)
+        self.assertEqual(result.error_category, worker.ErrorCategory.QUERY_SHARD_LOCK_UNAVAILABLE)
+        self.assertEqual(result.details["query_lock_status"], "all_locked")

@@ -31,7 +31,8 @@ async def ensure_worker_tables(pool: asyncpg.Pool, include_triggers: bool = Fals
                 (3, 'Route status, quarantine, cooldown columns'),
                 (4, 'Worker proxy leases and proxy stats tables'),
                 (5, 'Schema versioning table'),
-                (6, 'Notification delivery ledger')
+                (6, 'Notification delivery ledger'),
+                (7, 'Priority scheduler route lanes and metrics')
             ON CONFLICT (version) DO NOTHING;
             """
         )
@@ -71,12 +72,19 @@ async def ensure_worker_tables(pool: asyncpg.Pool, include_triggers: bool = Fals
                 next_run_at TIMESTAMPTZ,
                 route_interval_seconds INTEGER,
                 avg_result_count DOUBLE PRECISION,
+                profitable_hit_rate DOUBLE PRECISION,
+                recent_duplicate_ratio DOUBLE PRECISION,
                 avg_page_load_ms DOUBLE PRECISION,
                 successful_cycles INTEGER NOT NULL DEFAULT 0,
                 last_selected_at TIMESTAMPTZ,
                 last_success_at TIMESTAMPTZ,
                 consecutive_failures INTEGER NOT NULL DEFAULT 0,
                 cooldown_until TIMESTAMPTZ,
+                lane_override TEXT,
+                computed_lane TEXT NOT NULL DEFAULT 'warm',
+                effective_lane TEXT NOT NULL DEFAULT 'warm',
+                priority_score DOUBLE PRECISION,
+                priority_score_updated_at TIMESTAMPTZ,
                 manual_login_required BOOLEAN NOT NULL DEFAULT FALSE,
                 manual_login_reason TEXT,
                 manual_login_required_at TIMESTAMPTZ,
@@ -139,6 +147,12 @@ async def ensure_worker_tables(pool: asyncpg.Pool, include_triggers: bool = Fals
             "ALTER TABLE worker_routes ADD COLUMN IF NOT EXISTS avg_result_count DOUBLE PRECISION;"
         )
         await conn.execute(
+            "ALTER TABLE worker_routes ADD COLUMN IF NOT EXISTS profitable_hit_rate DOUBLE PRECISION;"
+        )
+        await conn.execute(
+            "ALTER TABLE worker_routes ADD COLUMN IF NOT EXISTS recent_duplicate_ratio DOUBLE PRECISION;"
+        )
+        await conn.execute(
             "ALTER TABLE worker_routes ADD COLUMN IF NOT EXISTS avg_page_load_ms DOUBLE PRECISION;"
         )
         await conn.execute(
@@ -149,6 +163,21 @@ async def ensure_worker_tables(pool: asyncpg.Pool, include_triggers: bool = Fals
         )
         await conn.execute(
             "ALTER TABLE worker_routes ADD COLUMN IF NOT EXISTS cooldown_until TIMESTAMPTZ;"
+        )
+        await conn.execute(
+            "ALTER TABLE worker_routes ADD COLUMN IF NOT EXISTS lane_override TEXT;"
+        )
+        await conn.execute(
+            "ALTER TABLE worker_routes ADD COLUMN IF NOT EXISTS computed_lane TEXT NOT NULL DEFAULT 'warm';"
+        )
+        await conn.execute(
+            "ALTER TABLE worker_routes ADD COLUMN IF NOT EXISTS effective_lane TEXT NOT NULL DEFAULT 'warm';"
+        )
+        await conn.execute(
+            "ALTER TABLE worker_routes ADD COLUMN IF NOT EXISTS priority_score DOUBLE PRECISION;"
+        )
+        await conn.execute(
+            "ALTER TABLE worker_routes ADD COLUMN IF NOT EXISTS priority_score_updated_at TIMESTAMPTZ;"
         )
         await conn.execute(
             "ALTER TABLE worker_routes ADD COLUMN IF NOT EXISTS manual_login_required BOOLEAN NOT NULL DEFAULT FALSE;"
@@ -195,6 +224,29 @@ async def ensure_worker_tables(pool: asyncpg.Pool, include_triggers: bool = Fals
                 quarantined_at = COALESCE(quarantined_at, manual_login_required_at),
                 quarantine_reason = COALESCE(NULLIF(BTRIM(quarantine_reason), ''), manual_login_reason)
             WHERE COALESCE(manual_login_required, FALSE) = TRUE
+            """
+        )
+        await conn.execute(
+            """
+            UPDATE worker_routes
+            SET
+                profitable_hit_rate = COALESCE(profitable_hit_rate, 0.0),
+                recent_duplicate_ratio = COALESCE(recent_duplicate_ratio, 0.0),
+                computed_lane = CASE
+                    WHEN LOWER(COALESCE(computed_lane, '')) IN ('hot', 'warm', 'sweep')
+                        THEN LOWER(computed_lane)
+                    ELSE 'warm'
+                END,
+                effective_lane = CASE
+                    WHEN LOWER(COALESCE(effective_lane, '')) IN ('hot', 'warm', 'sweep')
+                        THEN LOWER(effective_lane)
+                    ELSE 'warm'
+                END,
+                lane_override = CASE
+                    WHEN LOWER(COALESCE(lane_override, '')) IN ('hot', 'warm', 'sweep')
+                        THEN LOWER(lane_override)
+                    ELSE NULL
+                END
             """
         )
 

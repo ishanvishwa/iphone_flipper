@@ -39,6 +39,10 @@ def build_cycle_telemetry_payload(
         payload["listings_parsed"] = int(metrics.get("listings_parsed", metrics.get("listings_scraped", 0)) or 0)
         payload["query_count"] = int(metrics.get("query_count", 0) or 0)
         payload["query_result_count"] = int(metrics.get("query_result_count", 0) or 0)
+        payload["profitable_listing_count"] = int(metrics.get("profitable_listing_count", 0) or 0)
+        payload["duplicate_listing_count"] = int(metrics.get("duplicate_listing_count", 0) or 0)
+        payload["query_lock_skipped_count"] = int(metrics.get("query_lock_skipped_count", 0) or 0)
+        payload["query_lock_acquired_count"] = int(metrics.get("query_lock_acquired_count", 0) or 0)
         payload["postgres_upsert_latency_ms_sum"] = int(metrics.get("postgres_upsert_latency_ms_sum", 0) or 0)
         payload["postgres_upsert_latency_ms_count"] = int(metrics.get("postgres_upsert_latency_ms_count", 0) or 0)
         payload["redis_publish_latency_ms_sum"] = int(metrics.get("redis_publish_latency_ms_sum", 0) or 0)
@@ -79,6 +83,57 @@ def build_cycle_telemetry_payload(
         query_shard_key = str(details.get("query_shard_key") or "").strip()
         if query_shard_key:
             payload["query_shard_key"] = query_shard_key
+        query_lock_key = str(details.get("query_lock_key") or "").strip()
+        if query_lock_key:
+            payload["query_lock_key"] = query_lock_key
+        query_lock_status = str(details.get("query_lock_status") or "").strip()
+        if query_lock_status:
+            payload["query_lock_status"] = query_lock_status
+        selected_query = str(details.get("selected_query") or "").strip()
+        if selected_query:
+            payload["selected_query"] = selected_query
+        lane_override = details.get("lane_override")
+        if lane_override is None or str(lane_override).strip() == "":
+            payload["lane_override"] = None
+        else:
+            payload["lane_override"] = str(lane_override).strip()
+        computed_lane = str(details.get("computed_lane") or "").strip()
+        if computed_lane:
+            payload["computed_lane"] = computed_lane
+        effective_lane = str(details.get("effective_lane") or "").strip()
+        if effective_lane:
+            payload["effective_lane"] = effective_lane
+        priority_score = details.get("priority_score")
+        if priority_score is not None:
+            try:
+                payload["priority_score"] = round(float(priority_score), 4)
+            except (TypeError, ValueError):
+                pass
+        priority_components = details.get("priority_components")
+        if isinstance(priority_components, dict):
+            payload["priority_components"] = {
+                str(key): round(float(value), 4)
+                for key, value in priority_components.items()
+                if value is not None
+            }
+        route_due_age_seconds = details.get("route_due_age_seconds")
+        if route_due_age_seconds is not None:
+            try:
+                payload["route_due_age_seconds"] = round(float(route_due_age_seconds), 3)
+            except (TypeError, ValueError):
+                pass
+        route_revisit_age_seconds = details.get("route_revisit_age_seconds")
+        if route_revisit_age_seconds is not None:
+            try:
+                payload["route_revisit_age_seconds"] = round(float(route_revisit_age_seconds), 3)
+            except (TypeError, ValueError):
+                pass
+        lane_interval_multiplier = details.get("lane_interval_multiplier")
+        if lane_interval_multiplier is not None:
+            try:
+                payload["lane_interval_multiplier"] = round(float(lane_interval_multiplier), 3)
+            except (TypeError, ValueError):
+                pass
         persona_hash = str(details.get("persona_hash") or "").strip()
         if persona_hash:
             payload["persona_hash"] = persona_hash

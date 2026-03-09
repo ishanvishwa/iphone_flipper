@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import re
+import uuid
 from urllib.parse import unquote, urlparse
 
 import asyncpg
@@ -18,6 +21,59 @@ def proxy_identity(server: str, username: str, password: str = "") -> str:
     _ = password
     # Keep password out of identity so fixed/auto routes cannot collide on endpoint+username.
     return canonical_proxy_key(server=server, username=username)
+
+
+def normalize_query_lock_key(query: str) -> str:
+    normalized_query = re.sub(r"\s+", " ", str(query or "").strip().lower())
+    digest = hashlib.sha1(normalized_query.encode("utf-8")).hexdigest()[:24]
+    return f"query-lock:{digest}"
+
+
+async def try_acquire_query_lock(
+    redis_client: object,
+    *,
+    worker_name: str,
+    route_name: str,
+    query: str,
+    lease_seconds: int,
+) -> dict[str, str] | None:
+    query_text = str(query or "").strip()
+    if not query_text:
+        return None
+    lock_key = normalize_query_lock_key(query_text)
+    lock_token = f"{(worker_name or 'worker').strip()}:{(route_name or 'route').strip()}:{uuid.uuid4().hex[:12]}"
+    safe_lease_seconds = max(30, int(lease_seconds or 30))
+    acquired = await redis_client.set(lock_key, lock_token, ex=safe_lease_seconds, nx=True)
+    if not acquired:
+        return None
+    return {
+        "lock_key": lock_key,
+        "lock_token": lock_token,
+        "query": query_text,
+    }
+
+
+async def release_query_lock(
+    redis_client: object,
+    *,
+    lock_key: str | None,
+    lock_token: str | None,
+) -> None:
+    key = str(lock_key or "").strip()
+    token = str(lock_token or "").strip()
+    if not key or not token:
+        return
+    await redis_client.eval(
+        """
+        if redis.call('get', KEYS[1]) == ARGV[1] then
+            return redis.call('del', KEYS[1])
+        end
+        return 0
+        """,
+        1,
+        key,
+        token,
+    )
 
 
 async def try_acquire_proxy_lease(

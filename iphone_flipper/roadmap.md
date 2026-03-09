@@ -10,7 +10,7 @@ This roadmap is a comprehensive implementation plan that combines:
 - Remaining work needed for stability, condition accuracy, and safe automation
 
 Audit date: **2026-03-08**
-Last implementation update: **2026-03-09**
+Last implementation update: **2026-03-10**
 
 ## Roadmap Structure
 
@@ -615,21 +615,72 @@ Condition accuracy is a critical decision parameter and currently constrained by
   - [x] tree selection/focus preservation
 - [x] Fresh 2026-03-09 code audit found no newly undocumented features/process enhancements beyond the approved Phase 3 work and the existing audit sections
 
-### Planned Next Phases (Do Not Start Until Phase 3 Is Approved)
+### Phase 4 Completed (This Update)
 
-- [ ] Phase 4: priority scheduler and route/query lanes while preserving current cooldown/reuse windows
+- [x] Added dedicated scheduler/lane helpers:
+  - [x] `server/services/worker/scheduler.py` for route scoring, lane assignment, route selection, query ranking, and lane interval multipliers
+  - [x] `server/services/common/route_lanes.py` for shared lane validation/normalization used by worker + API
+- [x] Added persisted Phase 4 route state on `worker_routes`:
+  - [x] `lane_override`
+  - [x] `computed_lane`
+  - [x] `effective_lane`
+  - [x] `priority_score`
+  - [x] `priority_score_updated_at`
+  - [x] `profitable_hit_rate`
+  - [x] `recent_duplicate_ratio`
+- [x] Added auto lane/score calculation from bounded existing signals:
+  - [x] operator `priority`
+  - [x] route due-age / revisit-age
+  - [x] `avg_result_count`
+  - [x] profitable-hit rate
+  - [x] duplicate ratio
+  - [x] failure/status penalties
+- [x] Added operator pin override semantics:
+  - [x] auto lanes default to computed `hot` / `warm` / `sweep`
+  - [x] `lane_override` pins effective lane when set
+  - [x] only `lane_override` is operator-editable; computed/effective lane and score remain server-derived
+- [x] Added Redis per-query locking for priority mode:
+  - [x] normalized lock key namespace `query-lock:<sha1>`
+  - [x] `SET NX EX` short-TTL acquisition
+  - [x] explicit release on cycle exit
+  - [x] fallback to next candidate query when the top choice is already locked
+  - [x] non-fatal scheduler skip when all candidate queries are locked
+- [x] Preserved flags-off compatibility:
+  - [x] DB routes still use the existing due-time + priority ordering when `ENABLE_PRIORITY_SCHEDULER=0`
+  - [x] env-fallback routes remain on the legacy path
+  - [x] existing cooldown / throttle / quiet-hours / single-route-rest / browser reuse semantics remain intact
+- [x] Extended worker telemetry and structured logs with scheduler observability:
+  - [x] `lane_override`, `computed_lane`, `effective_lane`
+  - [x] `priority_score` + compact score components
+  - [x] selected query + query lock key/status
+  - [x] route due-age / revisit-age
+  - [x] profitable/duplicate counts feeding route metrics
+- [x] Extended API + GUI operator surfaces:
+  - [x] `/worker-routes` now returns lane/score fields
+  - [x] route update validation only permits `lane_override` edits
+  - [x] GUI VPS Scrapers route table/editor now shows lane + score and supports `auto/hot/warm/sweep` pinning
+- [x] Added targeted tests for:
+  - [x] deterministic score/lane calculation and hot-over-sweep route choice
+  - [x] lane-override precedence
+  - [x] Redis query lock acquisition / fallback / scheduler skip
+  - [x] route API lane validation + omitted-vs-null payload handling
+  - [x] telemetry field coverage for Phase 4 scheduler data
+- [x] Fresh 2026-03-10 code audit found no newly undocumented code-level features/process enhancements beyond the approved Phase 4 work and the earlier audit sections
+
+### Planned Next Phases
+
 - [ ] Phase 5: hot-path payload slimming and background enrichment for non-critical fields
 - [ ] Phase 6: reliability/replay/operator controls (health endpoints, backlog visibility, replay tooling, live push rollback switches)
 
 ### Upgrade-Track Notes
 
-- Current baseline after Phase 3 rollout: Postgres remains authoritative, Redis pub/sub fanout stays active as the API trigger for normalized WebSocket fanout, the desktop GUI now runs WebSocket-first with automatic poll fallback and reconnect backfill, Redis Streams publishing remains enabled, and notification delivery is handled by the dedicated notification consumer when `ENABLE_NOTIFICATION_CONSUMER=1`.
-- VPS rollout state on 2026-03-09:
+- Current baseline after Phase 4 rollout: Postgres remains authoritative, Redis pub/sub fanout stays active as the API trigger for normalized WebSocket fanout, Redis Streams publishing remains enabled, notification delivery remains on the dedicated notification consumer, and priority scheduling / route lanes are now enabled in production even though `worker_3` currently has no persisted DB routes after the controlled acceptance smoke cleanup.
+- VPS rollout state on 2026-03-10:
   - `ENABLE_REDIS_STREAM_EVENTS=1`
   - `ENABLE_NOTIFICATION_CONSUMER=1`
   - `ENABLE_GUI_WEBSOCKET_PUSH=1`
-  - `ENABLE_PRIORITY_SCHEDULER=0`
-  - `ENABLE_ROUTE_LANES=0`
+  - `ENABLE_PRIORITY_SCHEDULER=1`
+  - `ENABLE_ROUTE_LANES=1`
 - Rollout verification included:
   - clean startup with `ENABLE_GUI_WEBSOCKET_PUSH=0` proving the desktop remained poll-only
   - live flag enable in `flipper:flags` for `ENABLE_GUI_WEBSOCKET_PUSH=1`
@@ -646,6 +697,29 @@ Condition accuracy is a critical decision parameter and currently constrained by
   - `phase3-smoke-reconnect-pass-1773067812` proved disconnect/reconnect backfill does not lose listings and returns to live mode afterward
   - `phase3-smoke-pollonly-pass-1773067877` proved poll fallback still works when `ENABLE_GUI_WEBSOCKET_PUSH=0`
   - synthetic Phase 3 rows were removed after verification
+- controlled Phase 4 scheduler smoke on `worker_3`:
+  - isolated `worker_3` temporarily while `worker` and `worker_2` were stopped to avoid Dolphin profile contention during the scheduler comparison window
+  - seeded three temporary DB routes only for acceptance:
+    - `phase4_hot_w3` (`priority=300`, `lane_override=hot`, query `iPhone 15 Pro`)
+    - `phase4_sweep_w3` (`priority=100`, `lane_override=sweep`, query `iPhone 13 mini`)
+    - `phase4_sweep2_w3` (`priority=110`, `lane_override=sweep`, query `iPhone 12 mini`)
+  - cleaned stale `worker_proxy_leases` and Redis `query-lock:*` keys between runs so the comparison used equal `next_run_at` values and fresh lease state
+  - flags-off baseline (`ENABLE_ROUTE_LANES=0`, `ENABLE_PRIORITY_SCHEDULER=0`) selected routes in plain priority order:
+    - `phase4_sweep_w3` at `2026-03-09 22:21:23 UTC`
+    - `phase4_sweep2_w3` at `2026-03-09 22:22:04 UTC`
+    - `phase4_hot_w3` at `2026-03-09 22:22:37 UTC`
+  - verified intermediate `ENABLE_ROUTE_LANES=1`, `ENABLE_PRIORITY_SCHEDULER=0` behavior:
+    - `/worker-routes` exposed non-null `priority_score`, `computed_lane`, and `effective_lane`
+    - worker logs included lane/score components while dispatch order remained legacy
+  - final flags-on verification (`ENABLE_ROUTE_LANES=1`, `ENABLE_PRIORITY_SCHEDULER=1`) used a verified equal `next_run_at` reset and produced:
+    - first selection `phase4_hot_w3` at `2026-03-09 22:34:58 UTC`
+    - Redis query-lock acquisition on the hot route (`query_lock_status=acquired`, `query_lock_key=query-lock:a37b7398f5d5cdd2099f30b6`)
+    - second hot-route selection at `2026-03-09 22:37:28 UTC`, proving the hot-route revisit gap stayed at the current baseline cadence (`149.646s`)
+    - successful sweep selection later with `query_lock_status=acquired` on `phase4_sweep2_w3`
+    - persisted post-cycle interval evidence from `/worker-routes`:
+      - hot route `next_run_at - last_selected_at = 149.570s`
+      - sweep route `phase4_sweep2_w3 next_run_at - last_selected_at = 229.610s`
+  - temporary Phase 4 routes were deleted afterward and the full worker pool was restarted; `worker_3` returned to env-backed routing and `/worker-routes?worker_name=worker_3` returned `count=0`
 - Acceptance criteria now expected to hold together after Phase 1 + Phase 2:
   - newly persisted listings generate exactly one stream event in the happy path
   - consumer restart does not lose unread events
@@ -654,6 +728,10 @@ Condition accuracy is a critical decision parameter and currently constrained by
   - new listing appears in GUI without waiting for the next poll interval
   - disconnect/reconnect does not lose listings
   - poll fallback still works with WebSocket disabled
+- Acceptance criteria now met after Phase 4:
+  - hot routes show shorter revisit intervals than sweep routes
+  - per-profile request intensity does not exceed the current baseline cadence
+  - high-value route coverage time decreases measurably versus the flags-off baseline
 
 ---
 
@@ -698,8 +776,8 @@ Note: Specifically, an external `patch_core.py` was used to dynamically patch `s
 
 Action taken: all above are now documented in `roadmap.md` as completed scope.
 
-Fresh audit note (2026-03-08): no additional undocumented code-level features were found beyond the items already captured in this summary and the later V3.0 upgrade-track section above.
+Fresh audit note (2026-03-10): no additional undocumented code-level features were found beyond the items already captured in this summary and the later V3.0 upgrade-track section above.
 
 ## Current Focus Recommendation
 
-Active priority is **V3.0 Phase 4 approval/readiness**. The next implementation step, once approved, should be **V3.0 Phase 4** (priority scheduling and route/query lanes), while keeping the broader **Phase 5A** server-migration direction intact. Dolphin Anty VPS installation remains operational. Remaining high-impact items after Phase 3 acceptance: priority scheduling/route lanes, hot-path slimming/background enrichment, replay/operator tooling, and `legacy_utils.py` test coverage.
+Active priority is **V3.0 Phase 5**. The next implementation step should be hot-path slimming/background enrichment for non-critical fields while keeping the broader **Phase 5A** server-migration direction intact. Dolphin Anty VPS installation remains operational. Remaining high-impact items after Phase 4 acceptance: hot-path slimming/background enrichment, replay/operator tooling, and `legacy_utils.py` test coverage.
