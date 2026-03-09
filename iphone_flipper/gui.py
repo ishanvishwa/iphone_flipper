@@ -90,6 +90,7 @@ class iPhoneFlipperGUI:
         self.account_tree = None
         self.proxy_tree = None
         self.vps_scraper_tree = None
+        self.vps_worker_summary_tree = None
         self.account_form_vars = {}
         self.proxy_form_vars = {}
         self.vps_scraper_form_vars = {}
@@ -99,6 +100,7 @@ class iPhoneFlipperGUI:
         self.selected_vps_scraper_key = None
         self.proxy_options_by_id = {}
         self.vps_scraper_records_by_key = {}
+        self.vps_worker_summary_records_by_key = {}
         self.vps_proxy_profile_options = {}
         self.active_scraper_account_var = None
         self.server_sync_thread = None
@@ -2112,6 +2114,26 @@ PY
                 candidate += 1
         return f"/app/runtime/browser_profile_{candidate}"
 
+    @staticmethod
+    def _profile_display_name(profile_dir: str) -> str:
+        profile_text = str(profile_dir or "").strip()
+        if not profile_text:
+            return "-"
+        name = Path(profile_text).name.strip()
+        return name or profile_text
+
+    def _lane_mix_display(self, worker_routes: list[dict]) -> str:
+        if not worker_routes:
+            return "env-only"
+        counts = {"hot": 0, "warm": 0, "sweep": 0}
+        for route in worker_routes:
+            lane = str(route.get("effective_lane") or route.get("computed_lane") or "warm").strip().lower() or "warm"
+            if lane not in counts:
+                lane = "warm"
+            counts[lane] += 1
+        parts = [f"{counts['hot']} hot", f"{counts['warm']} warm", f"{counts['sweep']} sweep"]
+        return " | ".join(parts)
+
     def _existing_route_names_for_worker(self, worker_name: str) -> set[str]:
         names = set()
         target = (worker_name or "").strip()
@@ -2216,6 +2238,129 @@ PY
             return key, parts[0].strip(), parts[1].strip()
         return key, None, None
 
+    def _selected_vps_summary_worker(self) -> str | None:
+        if not self.vps_worker_summary_tree:
+            return None
+        selection = self.vps_worker_summary_tree.selection()
+        if not selection:
+            return None
+        worker_name = str(selection[0] or "").strip()
+        return worker_name or None
+
+    def _refresh_vps_worker_summary_tree(
+        self,
+        *,
+        routes: list[dict],
+        health_by_worker: dict[str, dict],
+    ) -> None:
+        if not self.vps_worker_summary_tree:
+            return
+
+        selected_worker_name = self._selected_vps_summary_worker()
+        for item in self.vps_worker_summary_tree.get_children():
+            self.vps_worker_summary_tree.delete(item)
+        self.vps_worker_summary_records_by_key = {}
+
+        grouped_routes: dict[str, list[dict]] = {}
+        for route in routes:
+            worker_name = str(route.get("worker_name") or "").strip()
+            route_name = str(route.get("route_name") or "").strip()
+            if not worker_name or not route_name:
+                continue
+            grouped_routes.setdefault(worker_name, []).append(route)
+
+        worker_names = sorted(set(grouped_routes) | set(health_by_worker))
+        matched_selected = None
+        for worker_name in worker_names:
+            worker_routes = grouped_routes.get(worker_name, [])
+            health = health_by_worker.get(worker_name) or {}
+            status = str(health.get("status") or ("configured" if worker_routes else "unknown")).strip() or "unknown"
+            active_route_name = str(health.get("route_name") or "").strip()
+            active_route = None
+            if active_route_name:
+                for route in worker_routes:
+                    if str(route.get("route_name") or "").strip() == active_route_name:
+                        active_route = route
+                        break
+            if active_route is None and worker_routes:
+                active_route = sorted(
+                    worker_routes,
+                    key=lambda route: (
+                        0 if bool(route.get("is_enabled", True)) else 1,
+                        self._safe_int(route.get("priority"), 100),
+                        str(route.get("route_name") or ""),
+                    ),
+                )[0]
+            if active_route is not None and not active_route_name:
+                active_route_name = str(active_route.get("route_name") or "").strip()
+
+            active_lane = "env"
+            if active_route is not None:
+                active_lane = str(active_route.get("effective_lane") or active_route.get("computed_lane") or "warm").strip() or "warm"
+            enabled_count = sum(1 for route in worker_routes if bool(route.get("is_enabled", True)))
+            route_count_display = f"{enabled_count}/{len(worker_routes)}"
+            last_run = str(
+                health.get("last_run_finished_at")
+                or health.get("last_run_started_at")
+                or health.get("updated_at")
+                or ""
+            )
+            last_run_display = last_run.replace("T", " ")[:19] if last_run else ""
+            values = (
+                worker_name,
+                active_route_name or "env-backed",
+                active_lane,
+                route_count_display,
+                self._lane_mix_display(worker_routes),
+                status,
+                str(max(0, self._safe_int(health.get("listings_scraped_last_minute"), 0))),
+                last_run_display,
+            )
+            self.vps_worker_summary_tree.insert("", tk.END, iid=worker_name, values=values)
+            self.vps_worker_summary_records_by_key[worker_name] = {
+                "worker_name": worker_name,
+                "active_route_name": active_route_name,
+                "health": health,
+                "routes": worker_routes,
+            }
+            if selected_worker_name == worker_name:
+                matched_selected = worker_name
+
+        if matched_selected and matched_selected in self.vps_worker_summary_tree.get_children():
+            self.vps_worker_summary_tree.selection_set(matched_selected)
+            self.vps_worker_summary_tree.focus(matched_selected)
+            self.vps_worker_summary_tree.see(matched_selected)
+
+    def _on_vps_worker_summary_selected(self, event=None):
+        if not self.vps_worker_summary_tree or not self.vps_scraper_tree:
+            return
+        selection = self.vps_worker_summary_tree.selection()
+        if not selection:
+            return
+        worker_name = str(selection[0] or "").strip()
+        if not worker_name:
+            return
+
+        summary = self.vps_worker_summary_records_by_key.get(worker_name) or {}
+        active_route_name = str(summary.get("active_route_name") or "").strip()
+        candidate_key = None
+        for key, data in self.vps_scraper_records_by_key.items():
+            route = data.get("route") or {}
+            if str(route.get("worker_name") or "").strip() != worker_name:
+                continue
+            route_name = str(route.get("route_name") or "").strip()
+            if active_route_name and route_name == active_route_name:
+                candidate_key = key
+                break
+            if candidate_key is None:
+                candidate_key = key
+
+        if candidate_key and candidate_key in self.vps_scraper_tree.get_children():
+            self.vps_scraper_tree.selection_set(candidate_key)
+            self.vps_scraper_tree.focus(candidate_key)
+            self.vps_scraper_tree.see(candidate_key)
+            self._on_vps_scraper_selected()
+
     def _insert_vps_health_only_row(
         self,
         *,
@@ -2244,6 +2389,7 @@ PY
         last_run_display = last_run.replace("T", " ")[:19] if last_run else ""
         values = (
             worker_name_clean,
+            route_name or "env_default",
             "env-backed",
             "env",
             "-",
@@ -2312,6 +2458,7 @@ PY
             if self.settings_window and self.settings_window.winfo_exists():
                 messagebox.showwarning("VPS Scrapers", error)
             return
+        self._refresh_vps_worker_summary_tree(routes=routes, health_by_worker=health_by_worker)
         proxy_options = self._build_vps_proxy_profile_options(routes)
         proxy_widget = self.vps_scraper_form_vars.get("proxy_profile_widget")
         if proxy_widget is not None:
@@ -2389,7 +2536,8 @@ PY
 
                 values = (
                     worker_name,
-                    str(route.get("user_data_dir") or ""),
+                    route_name,
+                    self._profile_display_name(str(route.get("user_data_dir") or "")),
                     lane_display,
                     score_display,
                     status,
@@ -6342,6 +6490,7 @@ PY
         self.selected_proxy_id = None
         self.selected_vps_scraper_key = None
         self.vps_scraper_records_by_key = {}
+        self.vps_worker_summary_records_by_key = {}
         self.vps_proxy_profile_options = {}
         self.proxy_form_vars = {
             "name": tk.StringVar(),
@@ -6437,6 +6586,7 @@ PY
         def on_close():
             self.settings_window = None
             self.vps_scraper_tree = None
+            self.vps_worker_summary_tree = None
             self.proxy_tree = None
             window.destroy()
 
@@ -6642,11 +6792,52 @@ PY
         content = ttk.Frame(vps_inner)
         content.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 10))
         content.columnconfigure(0, weight=1)
-        content.rowconfigure(0, weight=3)
-        content.rowconfigure(1, weight=2)
+        content.rowconfigure(0, weight=1)
+        content.rowconfigure(1, weight=3)
+
+        summary_frame = ttk.LabelFrame(content, text="Worker Summary")
+        summary_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
+        summary_frame.rowconfigure(0, weight=1)
+        summary_frame.columnconfigure(0, weight=1)
+
+        self.vps_worker_summary_tree = ttk.Treeview(
+            summary_frame,
+            columns=(
+                "Worker",
+                "Active Route",
+                "Active Lane",
+                "Routes",
+                "Lane Mix",
+                "Status",
+                "Scraped (1m)",
+                "Last run",
+            ),
+            show="headings",
+            selectmode="browse",
+            height=4,
+        )
+        for col, width in [
+            ("Worker", 120),
+            ("Active Route", 220),
+            ("Active Lane", 110),
+            ("Routes", 90),
+            ("Lane Mix", 220),
+            ("Status", 160),
+            ("Scraped (1m)", 120),
+            ("Last run", 170),
+        ]:
+            self.vps_worker_summary_tree.heading(col, text=col)
+            self.vps_worker_summary_tree.column(col, width=width, anchor=tk.W)
+        summary_vsb = ttk.Scrollbar(summary_frame, orient="vertical", command=self.vps_worker_summary_tree.yview)
+        summary_hsb = ttk.Scrollbar(summary_frame, orient="horizontal", command=self.vps_worker_summary_tree.xview)
+        self.vps_worker_summary_tree.configure(yscrollcommand=summary_vsb.set, xscrollcommand=summary_hsb.set)
+        self.vps_worker_summary_tree.grid(row=0, column=0, sticky="nsew")
+        summary_vsb.grid(row=0, column=1, sticky="ns")
+        summary_hsb.grid(row=1, column=0, sticky="ew")
+        self.vps_worker_summary_tree.bind("<<TreeviewSelect>>", self._on_vps_worker_summary_selected)
 
         table_frame = ttk.Frame(content)
-        table_frame.grid(row=0, column=0, sticky="nsew")
+        table_frame.grid(row=1, column=0, sticky="nsew")
         table_frame.rowconfigure(0, weight=1)
         table_frame.columnconfigure(0, weight=1)
 
@@ -6654,6 +6845,7 @@ PY
             table_frame,
             columns=(
                 "Worker",
+                "Route",
                 "Profile",
                 "Lane",
                 "Score",
@@ -6666,7 +6858,8 @@ PY
         )
         for col, width in [
             ("Worker", 160),
-            ("Profile", 260),
+            ("Route", 220),
+            ("Profile", 180),
             ("Lane", 100),
             ("Score", 90),
             ("Status", 180),
