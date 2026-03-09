@@ -1914,7 +1914,109 @@ This keeps `dev-log.md` actionable for both engineering and operations.
     - because natural worker listing traffic during rollout was sparse and intermittently blocked by existing Dolphin/browser failures, stream runtime verification used a safe one-off worker-container smoke publish that exercised the deployed stream codec and `XADD` path without touching persistence or sending Telegram alerts
 - Unresolved follow-ups:
   - Phase 2 is still required to wire notification consumers through Redis Streams consumer groups and compose deployment
-  - pre-existing worker pub/sub payload mismatch vs `notification_worker.py` remains intentionally deferred
-  - natural production traffic should continue to be observed now that Phase 1 is live, so stream publish rates can be measured under real listing flow once Dolphin/browser stability improves
+- pre-existing worker pub/sub payload mismatch vs `notification_worker.py` remains intentionally deferred
+- natural production traffic should continue to be observed now that Phase 1 is live, so stream publish rates can be measured under real listing flow once Dolphin/browser stability improves
+
+---
+
+### §39 – V3.0 Phase 2: Redis Streams Notification Consumer + Acceptance Hardening (2026-03-09)
+
+- Summary: Implemented Phase 2 of the approved V3.0 latency/responsiveness upgrade track and added the minimum Phase 1 hardening needed to satisfy the combined event-spine + notification acceptance criteria. Notification delivery now runs through a dedicated Redis Streams consumer service with durable PostgreSQL dedupe, while worker-side exact-once behavior for same-listing creation is hardened with a transaction-level advisory lock.
+- Motivation:
+  - move notification I/O off the scrape worker hot path
+  - make notification delivery restart-safe and deduplicated across duplicate stream delivery
+  - close the remaining Phase 1 acceptance gaps around same-listing races and duplicate alerts
+- Changes:
+  - hardened worker persistence / stream publication (`server/services/worker/worker.py`):
+    - added PostgreSQL transaction-level advisory lock on `listing_id` before the read/upsert decision
+    - preserved Postgres as source of truth and kept Redis pub/sub fanout unchanged
+    - retained Phase 1 stream publish rules (`listing_created` or meaningful hot-path change only)
+    - when `ENABLE_NOTIFICATION_CONSUMER=1` and stream publish succeeds, worker now emits `notification_delivery_delegated` instead of blocking on inline Telegram send
+  - replaced the old pub/sub notification worker with a Redis Streams consumer-group service (`server/services/worker/notification_worker.py`):
+    - consumer group: `listing_notifications`
+    - startup bootstrap: `XGROUP CREATE ... MKSTREAM` with `BUSYGROUP` ignored
+    - reads new entries via `XREADGROUP`
+    - reclaims pending/restart-surviving work via `XAUTOCLAIM`
+    - terminal ack outcomes: `sent`, `suppressed`, `duplicate_already_sent`
+    - Telegram send is authoritative; FCM remains best-effort only
+    - outbound pacing changed to immediate send with minimum 1 second spacing
+    - transient failures retry with backoff and remain pending when retries are exhausted
+  - added durable notification ledger (`notification_delivery_ledger`) to shared schema/bootstrap:
+    - key: `listing_id`
+    - stores `first_stream_event_id`, `last_stream_event_id`, `status`, `attempt_count`, `last_error`, `last_attempt_at`, `sent_at`, `updated_at`
+    - suppresses re-sends after restart or duplicate stream delivery
+  - wired the dedicated `notification_worker` into Docker Compose and the standard VPS deploy path
+  - updated canonical docs (`architecture.md`, `roadmap.md`, `dev-log.md`) to reflect:
+    - consumer-group notification architecture
+    - exact-once producer hardening
+    - rollout state and acceptance verification
+  - fresh audit result:
+    - no additional undocumented code-level features or process enhancements were found beyond the approved Phase 2 work and the existing roadmap-drift audit sections
+- Files touched:
+  - `server/services/worker/worker.py`
+  - `server/services/worker/notification_worker.py`
+  - `server/services/common/schema_ensure.py`
+  - `server/services/api/sql/001_init.sql`
+  - `server/infra/docker-compose.yml`
+  - `server/scripts/deploy_vps.sh`
+  - `server/tests/test_worker_observability.py`
+  - `server/tests/test_notification_worker.py`
+  - `architecture.md`
+  - `roadmap.md`
+  - `dev-log.md`
+- Decision/rationale:
+  - durable dedupe is keyed by `listing_id` in Postgres rather than Redis memory so duplicate stream delivery and consumer restarts do not resend already-sent alerts
+  - Redis pub/sub remains active for API fanout in this phase; notifications move to the stream consumer path without changing public API/WebSocket contracts
+  - the worker keeps inline notification as a fallback only when the dedicated consumer is disabled or stream delegation is unavailable, avoiding silent alert loss during misconfiguration or publish failure
+- Validation performed:
+  - local import/compile sanity:
+    - `./.venv/bin/python -m py_compile server/services/worker/worker.py server/services/worker/notification_worker.py server/services/common/schema_ensure.py server/tests/test_worker_observability.py server/tests/test_notification_worker.py`
+  - targeted Phase 2 pytest suite:
+    - `./.venv/bin/python -m pytest server/tests/test_worker_observability.py server/tests/test_notification_worker.py -q`
+    - result: `18 passed`
+  - full server pytest regression:
+    - `./.venv/bin/python -m pytest server/tests -q`
+    - result: `85 passed`
+  - VPS rollout and acceptance verification:
+    - deployed Phase 2 to `ubuntu@15.235.185.32` via `server/scripts/deploy_vps.sh`
+    - verified clean startup with:
+      - `ENABLE_REDIS_STREAM_EVENTS=1`
+      - `ENABLE_NOTIFICATION_CONSUMER=0`
+      - `ENABLE_GUI_WEBSOCKET_PUSH=0`
+      - `ENABLE_PRIORITY_SCHEDULER=0`
+      - `ENABLE_ROUTE_LANES=0`
+    - verified `notification_worker` startup and consumer-group bootstrap via `XINFO GROUPS stream:listings`
+    - enabled `ENABLE_NOTIFICATION_CONSUMER=1` live in `flipper:flags`
+    - observed the consumer drain existing backlog and reach zero lag
+    - controlled unread-event smoke:
+      - stopped `notification_worker`
+      - appended synthetic stream event `phase2-smoke-unread-1`
+      - restarted `notification_worker`
+      - verified exactly one `notification_delivery_result` with `notification_status=sent`
+    - controlled duplicate smoke:
+      - appended a second synthetic `listing_created` event for the same `listing_id`
+      - verified `notification_status=duplicate_already_sent` and no second send
+    - controlled restart smoke:
+      - stopped `notification_worker`
+      - appended synthetic stream event `phase2-smoke-unread-restart-1`
+      - restarted `notification_worker`
+      - verified the unread event was delivered successfully after restart
+    - controlled worker-delegation smoke:
+      - invoked `_process_listing_event` with synthetic listing `phase2-worker-delegate-1` inside the running worker container
+      - observed `notification_delivery_delegated` from worker code
+      - observed corresponding consumer-side `notification_delivery_result` with `notification_status=sent`
+    - inspected `notification_delivery_ledger` rows for all three synthetic listing IDs and confirmed `status=sent`, `attempt_count=1`, and expected `last_stream_event_id`
+    - cleaned the synthetic persisted listing row `phase2-worker-delegate-1` from the `listings` table after verification
+- Acceptance criteria status:
+  - `Newly persisted listings generate exactly one stream event in the happy path.`  
+    Met via advisory-lock serialization plus unchanged-update suppression, with targeted concurrent worker test coverage.
+  - `Consumer restart does not lose unread events.`  
+    Met via Redis Streams consumer groups plus unread/pending recovery behavior, verified in controlled restart smoke.
+  - `Duplicate unchanged listings do not generate duplicate alerts.`  
+    Met via producer unchanged-event suppression, worker delegation when the consumer is enabled, and PostgreSQL ledger dedupe by `listing_id`.
+- Unresolved follow-ups:
+  - Phase 3 is still required for WebSocket-first desktop sync and reconnect/backfill behavior
+  - dead-letter handling and operator replay tooling remain Phase 6 scope
+  - natural production measurements should continue to confirm latency improvement under real worker discoveries once Dolphin/browser stability improves
 
 ---

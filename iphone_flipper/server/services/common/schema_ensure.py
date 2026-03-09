@@ -30,7 +30,8 @@ async def ensure_worker_tables(pool: asyncpg.Pool, include_triggers: bool = Fals
                 (2, 'Proxy mode, pool, preferred proxy columns'),
                 (3, 'Route status, quarantine, cooldown columns'),
                 (4, 'Worker proxy leases and proxy stats tables'),
-                (5, 'Schema versioning table')
+                (5, 'Schema versioning table'),
+                (6, 'Notification delivery ledger')
             ON CONFLICT (version) DO NOTHING;
             """
         )
@@ -290,5 +291,26 @@ async def ensure_worker_tables(pool: asyncpg.Pool, include_triggers: bool = Fals
             """
             CREATE INDEX IF NOT EXISTS idx_proxy_stats_banned_until
             ON proxy_stats (banned_until, consecutive_failures, last_success_at);
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS notification_delivery_ledger (
+                listing_id TEXT PRIMARY KEY,
+                first_stream_event_id TEXT NOT NULL,
+                last_stream_event_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                last_attempt_at TIMESTAMPTZ,
+                sent_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_notification_delivery_ledger_status
+            ON notification_delivery_ledger (status, updated_at DESC);
             """
         )

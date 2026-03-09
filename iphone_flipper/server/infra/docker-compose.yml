@@ -88,6 +88,36 @@ services:
       timeout: 5s
       retries: 10
 
+  notification_worker:
+    build:
+      context: ../..
+      dockerfile: server/services/worker/Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "server.services.worker.notification_worker"]
+    env_file:
+      - ../.env
+    environment:
+      TZ: ${TZ:-UTC}
+      APP_ENV: ${APP_ENV:-production}
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: ${POSTGRES_DB}
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      TELEGRAM_NOTIFY_MIN_PROFIT: ${TELEGRAM_NOTIFY_MIN_PROFIT:-0}
+      FCM_SERVICE_ACCOUNT_PATH: ${FCM_SERVICE_ACCOUNT_PATH:-firebase-adminsdk.json}
+      FCM_TOPIC: ${FCM_TOPIC:-new_iphones}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
   worker:
     build:
       context: ../..

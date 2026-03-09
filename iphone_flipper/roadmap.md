@@ -559,9 +559,31 @@ Condition accuracy is a critical decision parameter and currently constrained by
 - [x] Added targeted tests for stream schema serialization, meaningful-change detection, worker gating/fallback behavior, and `XADD` call shape
 - [x] Fresh 2026-03-09 code audit found no newly undocumented features/process enhancements beyond the existing audit sections; only the approved Phase 1 event-spine changes required documentation updates
 
-### Planned Next Phases (Do Not Start Until Phase 1 Is Approved)
+### Phase 2 Completed (This Update)
 
-- [ ] Phase 2: standalone notification consumer service with consumer-group retries, dedupe ledger, and outbound rate limiting
+- [x] Converted `notification_worker.py` from Redis pub/sub to a Redis Streams consumer-group service over `stream:listings`
+- [x] Added consumer-group bootstrap with `XGROUP CREATE ... MKSTREAM` and `BUSYGROUP` handling
+- [x] Added restart-safe unread/pending recovery with `XREADGROUP` + `XAUTOCLAIM`
+- [x] Added durable PostgreSQL notification ledger (`notification_delivery_ledger`) keyed by `listing_id`
+- [x] Replaced in-memory dedupe with durable ledger-backed dedupe so duplicate stream deliveries and consumer restarts do not resend already-sent listings
+- [x] Moved notification delivery off the worker hot path when `ENABLE_NOTIFICATION_CONSUMER=1`
+- [x] Added worker-side exact-once hardening for same-listing persistence by serializing `listing_id` upsert decisions with a PostgreSQL advisory lock
+- [x] Added delegated-notification worker logs so stream-published created listings can be handed off without blocking on external Telegram I/O
+- [x] Added immediate-send pacing of at most one Telegram notification per second plus transient retry/backoff handling
+- [x] Added compose wiring and deploy-path support for the dedicated `notification_worker` service
+- [x] Added targeted tests for:
+  - [x] consumer-group bootstrap
+  - [x] stream ack flow
+  - [x] `XAUTOCLAIM` recovery path
+  - [x] durable ledger dedupe
+  - [x] retry/backoff behavior
+  - [x] one-per-second pacing
+  - [x] worker delegation when the consumer flag is enabled
+  - [x] concurrent duplicate processing producing one stream publish in the happy path
+- [x] Fresh 2026-03-09 code audit found no newly undocumented features/process enhancements beyond the approved Phase 2 work and the previously recorded audit sections
+
+### Planned Next Phases (Do Not Start Until Phase 2 Is Approved)
+
 - [ ] Phase 3: desktop WebSocket-first live sync with polling fallback, reconnect backfill, and GUI-thread-safe apply path
 - [ ] Phase 4: priority scheduler and route/query lanes while preserving current cooldown/reuse windows
 - [ ] Phase 5: hot-path payload slimming and background enrichment for non-critical fields
@@ -569,20 +591,25 @@ Condition accuracy is a critical decision parameter and currently constrained by
 
 ### Upgrade-Track Notes
 
-- Current baseline after Phase 1 rollout: Postgres remains authoritative, Redis pub/sub fanout stays active, inline worker Telegram notifications stay active, the API WebSocket endpoint stays available, the GUI remains polling-first, and Redis Streams publishing is now available behind `ENABLE_REDIS_STREAM_EVENTS`.
+- Current baseline after Phase 2 rollout: Postgres remains authoritative, Redis pub/sub fanout stays active for API/WebSocket fanout, the GUI remains polling-first, Redis Streams publishing is enabled, and notification delivery is handled by the dedicated notification consumer when `ENABLE_NOTIFICATION_CONSUMER=1`.
 - VPS rollout state on 2026-03-09:
   - `ENABLE_REDIS_STREAM_EVENTS=1`
-  - `ENABLE_NOTIFICATION_CONSUMER=0`
+  - `ENABLE_NOTIFICATION_CONSUMER=1`
   - `ENABLE_GUI_WEBSOCKET_PUSH=0`
   - `ENABLE_PRIORITY_SCHEDULER=0`
   - `ENABLE_ROUTE_LANES=0`
 - Rollout verification included:
-  - clean startup with streams disabled and `stream:listings` absent
+  - clean startup with the notification consumer service running but `ENABLE_NOTIFICATION_CONSUMER=0`
   - live flag enable in `flipper:flags`
-  - Redis inspection confirming `stream:listings` creation and stored flat event fields
-  - Redis pub/sub smoke confirming API-side `listing_gui_push` remained functional with streams enabled
-- Natural worker stream traffic during rollout was limited by intermittent Dolphin/browser scrape failures, so the final stream verification used a safe one-off worker-container smoke publish to validate the deployed codec and runtime Redis compatibility without touching persistence or sending Telegram alerts.
-- Pre-existing notification-worker payload-shape mismatch remains documented and deferred to the later event-spine / notification-consumer phases.
+  - Redis verification of `stream:listings`, consumer-group presence, and zero lag after catch-up
+  - controlled unread-event smoke with `phase2-smoke-unread-1` proving exactly one alert send
+  - duplicate synthetic stream event for the same listing proving `duplicate_already_sent` dedupe via the PostgreSQL ledger
+  - controlled restart smoke with `phase2-smoke-unread-restart-1` proving unread events are consumed after the consumer restarts
+  - controlled worker-process smoke with `phase2-worker-delegate-1` proving worker-side `notification_delivery_delegated` instead of inline Telegram delivery when the consumer flag is enabled
+- Acceptance criteria now expected to hold together after Phase 1 + Phase 2:
+  - newly persisted listings generate exactly one stream event in the happy path
+  - consumer restart does not lose unread events
+  - duplicate unchanged listings do not generate duplicate alerts
 
 ---
 
@@ -631,4 +658,4 @@ Fresh audit note (2026-03-08): no additional undocumented code-level features we
 
 ## Current Focus Recommendation
 
-Active priority is **V3.0 Phase 1 review/validation**. After approval, the next implementation step should be **V3.0 Phase 2** (standalone notification consumer with consumer groups, retries, dedupe ledger, and compose wiring), while keeping the broader **Phase 5A** server-migration direction intact. Dolphin Anty VPS installation is now resolved (systemd autostart operational). Remaining high-impact items after Phase 1 approval: notification worker compose wiring/schema alignment, WebSocket desktop sync apply path, priority scheduling/route lanes, and `legacy_utils.py` test coverage.
+Active priority is **V3.0 Phase 2 review/validation**. After approval, the next implementation step should be **V3.0 Phase 3** (desktop WebSocket-first live sync with polling fallback and reconnect/backfill behavior), while keeping the broader **Phase 5A** server-migration direction intact. Dolphin Anty VPS installation is now resolved (systemd autostart operational). Remaining high-impact items after Phase 2 approval: WebSocket desktop sync apply path, priority scheduling/route lanes, hot-path slimming/background enrichment, and `legacy_utils.py` test coverage.

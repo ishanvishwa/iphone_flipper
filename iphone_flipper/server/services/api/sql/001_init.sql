@@ -180,3 +180,18 @@ CREATE TABLE IF NOT EXISTS proxy_stats (
 
 CREATE INDEX IF NOT EXISTS idx_proxy_stats_banned_until
 ON proxy_stats (banned_until, consecutive_failures, last_success_at);
+
+CREATE TABLE IF NOT EXISTS notification_delivery_ledger (
+    listing_id TEXT PRIMARY KEY,
+    first_stream_event_id TEXT NOT NULL,
+    last_stream_event_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    last_attempt_at TIMESTAMPTZ,
+    sent_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_notification_delivery_ledger_status
+ON notification_delivery_ledger (status, updated_at DESC);

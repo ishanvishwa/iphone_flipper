@@ -134,6 +134,19 @@ class ListingUpsertResult:
     stream_state_changed: bool
 
 
+async def _acquire_listing_advisory_lock(
+    conn: asyncpg.Connection,
+    listing_id: str,
+) -> None:
+    listing_id_clean = str(listing_id or "").strip()
+    if not listing_id_clean:
+        return
+    await conn.fetchval(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0));",
+        listing_id_clean,
+    )
+
+
 def _parse_bool(raw: str | None, default: bool = True) -> bool:
     if raw is None:
         return default
@@ -1975,63 +1988,65 @@ async def _upsert_listing(pool: asyncpg.Pool, listing: dict[str, Any]) -> Listin
     next_stream_state = extract_listing_stream_state(listing)
 
     async with pool.acquire() as conn:
-        existing_row = await conn.fetchrow(
-            """
-            SELECT
-                title,
-                price,
-                location,
-                url,
-                model,
-                condition,
-                max_buy_price,
-                potential_profit,
-                status
-            FROM listings
-            WHERE id = $1
-            """,
-            listing_id,
-        )
-        await conn.execute(
-            """
-            INSERT INTO listings (
-                id, title, price, location, url, description, seller_name,
-                model, condition, max_buy_price, potential_profit, status,
-                source_seen_at, created_at, updated_at
-            ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7,
-                $8, $9, $10, $11, $12,
-                $13, NOW(), NOW()
+        async with conn.transaction():
+            await _acquire_listing_advisory_lock(conn, listing_id)
+            existing_row = await conn.fetchrow(
+                """
+                SELECT
+                    title,
+                    price,
+                    location,
+                    url,
+                    model,
+                    condition,
+                    max_buy_price,
+                    potential_profit,
+                    status
+                FROM listings
+                WHERE id = $1
+                """,
+                listing_id,
             )
-            ON CONFLICT (id) DO UPDATE SET
-                title = EXCLUDED.title,
-                price = EXCLUDED.price,
-                location = EXCLUDED.location,
-                url = EXCLUDED.url,
-                description = EXCLUDED.description,
-                seller_name = EXCLUDED.seller_name,
-                model = EXCLUDED.model,
-                condition = EXCLUDED.condition,
-                max_buy_price = EXCLUDED.max_buy_price,
-                potential_profit = EXCLUDED.potential_profit,
-                status = EXCLUDED.status,
-                source_seen_at = EXCLUDED.source_seen_at,
-                updated_at = NOW()
-            """,
-            listing_id,
-            listing.get("title") or "Untitled listing",
-            listing.get("price"),
-            listing.get("location"),
-            listing.get("url"),
-            listing.get("description"),
-            listing.get("seller_name"),
-            listing.get("model"),
-            listing.get("condition"),
-            listing.get("max_offer"),
-            listing.get("potential_profit"),
-            listing.get("status") or "new",
-            source_seen_at,
-        )
+            await conn.execute(
+                """
+                INSERT INTO listings (
+                    id, title, price, location, url, description, seller_name,
+                    model, condition, max_buy_price, potential_profit, status,
+                    source_seen_at, created_at, updated_at
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7,
+                    $8, $9, $10, $11, $12,
+                    $13, NOW(), NOW()
+                )
+                ON CONFLICT (id) DO UPDATE SET
+                    title = EXCLUDED.title,
+                    price = EXCLUDED.price,
+                    location = EXCLUDED.location,
+                    url = EXCLUDED.url,
+                    description = EXCLUDED.description,
+                    seller_name = EXCLUDED.seller_name,
+                    model = EXCLUDED.model,
+                    condition = EXCLUDED.condition,
+                    max_buy_price = EXCLUDED.max_buy_price,
+                    potential_profit = EXCLUDED.potential_profit,
+                    status = EXCLUDED.status,
+                    source_seen_at = EXCLUDED.source_seen_at,
+                    updated_at = NOW()
+                """,
+                listing_id,
+                listing.get("title") or "Untitled listing",
+                listing.get("price"),
+                listing.get("location"),
+                listing.get("url"),
+                listing.get("description"),
+                listing.get("seller_name"),
+                listing.get("model"),
+                listing.get("condition"),
+                listing.get("max_offer"),
+                listing.get("potential_profit"),
+                listing.get("status") or "new",
+                source_seen_at,
+            )
     created = existing_row is None
     previous_stream_state = extract_row_stream_state(existing_row)
     stream_state_changed = created or previous_stream_state != next_stream_state
@@ -2099,6 +2114,7 @@ async def _process_listing_event(
     stream_publish_latency_ms: int | None = None
     stream_publish_status = "disabled"
     event_id = metadata_event_id
+    notification_consumer_enabled = False
     if feature_flags is not None and await feature_flags.is_enabled("ENABLE_REDIS_STREAM_EVENTS"):
         if upsert_result.stream_state_changed:
             stream_publish_status = "published"
@@ -2165,7 +2181,31 @@ async def _process_listing_event(
         redis_publish_latency_ms=redis_publish_latency_ms,
     )
 
+    if feature_flags is not None:
+        notification_consumer_enabled = await feature_flags.is_enabled("ENABLE_NOTIFICATION_CONSUMER")
+
     if _should_notify_telegram(created, listing):
+        if notification_consumer_enabled and stream_publish_status == "published":
+            emit_json_log(
+                "notification_delivery_delegated",
+                listing_id=listing_id,
+                event_id=event_id,
+                worker_name=WORKER_NAME,
+                route_name=route_name,
+                event_name=event_name,
+                stream_name=LISTING_STREAM_NAME,
+                stream_event_id=stream_event_id,
+                stream_event_published_ts=stream_event_published_ts,
+                stream_publish_status=stream_publish_status,
+                notification_channel="telegram",
+                notification_status="delegated",
+                notification_delegated_ts=utc_now_iso(),
+                listing_seen_ts=listing_seen_ts,
+                listing_persisted_ts=listing_persisted_ts,
+                listing_event_published_ts=listing_event_published_ts,
+            )
+            return
+
         notification_started = time.monotonic()
         sent = await asyncio.get_running_loop().run_in_executor(
             None, _send_telegram_listing_notification, listing
