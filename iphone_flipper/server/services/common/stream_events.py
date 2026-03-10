@@ -121,6 +121,7 @@ class ListingStreamEvent:
     potential_profit: float | None
     title: str
     url: str
+    thumbnail_url: str
     source: str
 
     def to_redis_fields(self) -> dict[str, str]:
@@ -139,6 +140,7 @@ class ListingStreamEvent:
             "potential_profit": _normalize_numeric(self.potential_profit),
             "title": _normalize_text(self.title or "Untitled listing"),
             "url": _normalize_text(self.url),
+            "thumbnail_url": _normalize_text(self.thumbnail_url),
             "source": _normalize_text(self.source),
         }
 
@@ -159,6 +161,7 @@ class ListingStreamEvent:
             potential_profit=_parse_optional_float(fields.get("potential_profit")),
             title=_normalize_text(fields.get("title") or "Untitled listing"),
             url=_normalize_text(fields.get("url")),
+            thumbnail_url=_normalize_text(fields.get("thumbnail_url")),
             source=_normalize_text(fields.get("source")),
         )
 
@@ -186,5 +189,6 @@ def build_listing_stream_event(
         potential_profit=_parse_optional_float(listing.get("potential_profit")),
         title=_normalize_text(listing.get("title") or "Untitled listing"),
         url=_normalize_text(listing.get("url")),
+        thumbnail_url=_normalize_text(listing.get("thumbnail_url")),
         source=_normalize_text(listing.get("source") or metadata.get("source")),
     )

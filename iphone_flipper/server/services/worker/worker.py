@@ -14,7 +14,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import unquote, urlparse
 
 import asyncpg
@@ -35,6 +35,14 @@ from scraper import (  # noqa: E402
 )
 from notifications import notify_telegram_listing_card, send_telegram  # noqa: E402
 from server.services.common.feature_flags import FLAG_HASH_KEY, RedisFeatureFlags  # noqa: E402
+from server.services.common.enrichment_events import (  # noqa: E402
+    LISTING_ENRICHMENT_STREAM_MAXLEN,
+    LISTING_ENRICHMENT_STREAM_NAME,
+    build_listing_enrichment_event,
+    build_enrichment_source_hash,
+    has_cold_enrichment_payload,
+    split_listing_for_fast_path,
+)
 from server.services.common.observability import (  # noqa: E402
     emit_json_log,
     emit_json_payload,
@@ -138,6 +146,8 @@ WORKER_USER_DATA_DIR = os.getenv("WORKER_USER_DATA_DIR", "").strip() or None
 class ListingUpsertResult:
     created: bool
     stream_state_changed: bool
+    should_enqueue_enrichment: bool = False
+    enrichment_source_hash: str | None = None
 
 
 async def _acquire_listing_advisory_lock(
@@ -847,6 +857,37 @@ def _normalize_upsert_result(raw_result: ListingUpsertResult | bool) -> ListingU
         return raw_result
     created = bool(raw_result)
     return ListingUpsertResult(created=created, stream_state_changed=created)
+
+
+def _normalize_optional_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _listing_max_buy_price(listing: dict[str, Any]) -> Any:
+    if "max_buy_price" in listing:
+        return listing.get("max_buy_price")
+    return listing.get("max_offer")
+
+
+def _listing_needs_enrichment(existing_row: Mapping[str, Any] | None, cold_fields: dict[str, str], source_hash: str) -> bool:
+    if existing_row is None:
+        return True
+
+    previous_hash = _normalize_optional_text(existing_row.get("enrichment_source_hash"))
+    previous_status = _normalize_optional_text(existing_row.get("enrichment_status")).lower()
+    description_missing = not _normalize_optional_text(existing_row.get("description"))
+    seller_missing = not _normalize_optional_text(existing_row.get("seller_name"))
+    thumbnail_missing = not (
+        _normalize_optional_text(cold_fields.get("thumbnail_url")) or _normalize_optional_text(existing_row.get("thumbnail_url"))
+    )
+
+    if previous_hash != source_hash:
+        return True
+    if description_missing or seller_missing or thumbnail_missing:
+        return previous_status in {"", "failed"}
+    return False
 
 
 def _emit_cycle_telemetry(
@@ -2196,13 +2237,22 @@ async def _build_playwright_proxy(
     )
 
 
-async def _upsert_listing(pool: asyncpg.Pool, listing: dict[str, Any]) -> ListingUpsertResult:
+async def _upsert_listing(
+    pool: asyncpg.Pool,
+    listing: dict[str, Any],
+    *,
+    background_enrichment_enabled: bool = False,
+) -> ListingUpsertResult:
     listing_id = str(listing.get("id") or "").strip()
     if not listing_id:
         return ListingUpsertResult(created=False, stream_state_changed=False)
 
     source_seen_at = datetime.now(timezone.utc)
     next_stream_state = extract_listing_stream_state(listing)
+    hot_listing, cold_fields, enrichment_source_hash = split_listing_for_fast_path(listing)
+    hot_thumbnail_url = hot_listing.get("thumbnail_url")
+    max_buy_price_value = _listing_max_buy_price(hot_listing if background_enrichment_enabled else listing)
+    should_enqueue_enrichment = False
 
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -2214,60 +2264,149 @@ async def _upsert_listing(pool: asyncpg.Pool, listing: dict[str, Any]) -> Listin
                     price,
                     location,
                     url,
+                    description,
+                    seller_name,
+                    thumbnail_url,
                     model,
                     condition,
                     max_buy_price,
                     potential_profit,
-                    status
+                    status,
+                    enrichment_status,
+                    enrichment_source_hash
                 FROM listings
                 WHERE id = $1
                 """,
                 listing_id,
             )
-            await conn.execute(
-                """
-                INSERT INTO listings (
-                    id, title, price, location, url, description, seller_name,
-                    model, condition, max_buy_price, potential_profit, status,
-                    source_seen_at, created_at, updated_at
-                ) VALUES (
-                    $1, $2, $3, $4, $5, $6, $7,
-                    $8, $9, $10, $11, $12,
-                    $13, NOW(), NOW()
+
+            if background_enrichment_enabled:
+                should_enqueue_enrichment = _listing_needs_enrichment(
+                    existing_row=existing_row,
+                    cold_fields=cold_fields,
+                    source_hash=enrichment_source_hash,
                 )
-                ON CONFLICT (id) DO UPDATE SET
-                    title = EXCLUDED.title,
-                    price = EXCLUDED.price,
-                    location = EXCLUDED.location,
-                    url = EXCLUDED.url,
-                    description = EXCLUDED.description,
-                    seller_name = EXCLUDED.seller_name,
-                    model = EXCLUDED.model,
-                    condition = EXCLUDED.condition,
-                    max_buy_price = EXCLUDED.max_buy_price,
-                    potential_profit = EXCLUDED.potential_profit,
-                    status = EXCLUDED.status,
-                    source_seen_at = EXCLUDED.source_seen_at,
-                    updated_at = NOW()
-                """,
-                listing_id,
-                listing.get("title") or "Untitled listing",
-                listing.get("price"),
-                listing.get("location"),
-                listing.get("url"),
-                listing.get("description"),
-                listing.get("seller_name"),
-                listing.get("model"),
-                listing.get("condition"),
-                listing.get("max_offer"),
-                listing.get("potential_profit"),
-                listing.get("status") or "new",
-                source_seen_at,
-            )
+                enriched_at = source_seen_at if not should_enqueue_enrichment and has_cold_enrichment_payload(cold_fields) else None
+                await conn.execute(
+                    """
+                    INSERT INTO listings (
+                        id, title, price, location, url, description, seller_name,
+                        thumbnail_url, model, condition, max_buy_price, potential_profit, status,
+                        enrichment_status, enrichment_source_hash, enriched_at, enrichment_last_error,
+                        source_seen_at, created_at, updated_at
+                    ) VALUES (
+                        $1, $2, $3, $4, $5, NULL, NULL,
+                        $6, $7, $8, $9, $10, $11,
+                        $12, $13, $14, NULL,
+                        $15, NOW(), NOW()
+                    )
+                    ON CONFLICT (id) DO UPDATE SET
+                        title = EXCLUDED.title,
+                        price = EXCLUDED.price,
+                        location = EXCLUDED.location,
+                        url = EXCLUDED.url,
+                        thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, listings.thumbnail_url),
+                        model = EXCLUDED.model,
+                        condition = EXCLUDED.condition,
+                        max_buy_price = EXCLUDED.max_buy_price,
+                        potential_profit = EXCLUDED.potential_profit,
+                        status = EXCLUDED.status,
+                        enrichment_status = CASE
+                            WHEN $16::BOOLEAN THEN 'pending'
+                            ELSE COALESCE(NULLIF(BTRIM(listings.enrichment_status), ''), 'complete')
+                        END,
+                        enrichment_source_hash = CASE
+                            WHEN $16::BOOLEAN OR listings.enrichment_source_hash IS NULL THEN $13
+                            ELSE listings.enrichment_source_hash
+                        END,
+                        enriched_at = CASE
+                            WHEN $16::BOOLEAN THEN listings.enriched_at
+                            ELSE COALESCE(listings.enriched_at, $14)
+                        END,
+                        enrichment_last_error = CASE
+                            WHEN $16::BOOLEAN THEN NULL
+                            ELSE listings.enrichment_last_error
+                        END,
+                        source_seen_at = EXCLUDED.source_seen_at,
+                        updated_at = NOW()
+                    """,
+                    listing_id,
+                    hot_listing.get("title") or "Untitled listing",
+                    hot_listing.get("price"),
+                    hot_listing.get("location"),
+                    hot_listing.get("url"),
+                    hot_thumbnail_url,
+                    hot_listing.get("model"),
+                    hot_listing.get("condition"),
+                    max_buy_price_value,
+                    hot_listing.get("potential_profit"),
+                    hot_listing.get("status") or "new",
+                    "pending" if should_enqueue_enrichment else "complete",
+                    enrichment_source_hash,
+                    enriched_at,
+                    source_seen_at,
+                    should_enqueue_enrichment,
+                )
+            else:
+                await conn.execute(
+                    """
+                    INSERT INTO listings (
+                        id, title, price, location, url, description, seller_name,
+                        thumbnail_url, model, condition, max_buy_price, potential_profit, status,
+                        enrichment_status, enrichment_source_hash, enriched_at, enrichment_last_error,
+                        source_seen_at, created_at, updated_at
+                    ) VALUES (
+                        $1, $2, $3, $4, $5, $6, $7,
+                        $8, $9, $10, $11, $12, $13,
+                        'complete', $14, $15, NULL,
+                        $16, NOW(), NOW()
+                    )
+                    ON CONFLICT (id) DO UPDATE SET
+                        title = EXCLUDED.title,
+                        price = EXCLUDED.price,
+                        location = EXCLUDED.location,
+                        url = EXCLUDED.url,
+                        description = EXCLUDED.description,
+                        seller_name = EXCLUDED.seller_name,
+                        thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, listings.thumbnail_url),
+                        model = EXCLUDED.model,
+                        condition = EXCLUDED.condition,
+                        max_buy_price = EXCLUDED.max_buy_price,
+                        potential_profit = EXCLUDED.potential_profit,
+                        status = EXCLUDED.status,
+                        enrichment_status = 'complete',
+                        enrichment_source_hash = EXCLUDED.enrichment_source_hash,
+                        enriched_at = EXCLUDED.enriched_at,
+                        enrichment_last_error = NULL,
+                        source_seen_at = EXCLUDED.source_seen_at,
+                        updated_at = NOW()
+                    """,
+                    listing_id,
+                    listing.get("title") or "Untitled listing",
+                    listing.get("price"),
+                    listing.get("location"),
+                    listing.get("url"),
+                    listing.get("description"),
+                    listing.get("seller_name"),
+                    hot_thumbnail_url,
+                    listing.get("model"),
+                    listing.get("condition"),
+                    _listing_max_buy_price(listing),
+                    listing.get("potential_profit"),
+                    listing.get("status") or "new",
+                    enrichment_source_hash,
+                    source_seen_at if has_cold_enrichment_payload(cold_fields) else None,
+                    source_seen_at,
+                )
     created = existing_row is None
     previous_stream_state = extract_row_stream_state(existing_row)
     stream_state_changed = created or previous_stream_state != next_stream_state
-    return ListingUpsertResult(created=created, stream_state_changed=stream_state_changed)
+    return ListingUpsertResult(
+        created=created,
+        stream_state_changed=stream_state_changed,
+        should_enqueue_enrichment=should_enqueue_enrichment,
+        enrichment_source_hash=enrichment_source_hash,
+    )
 
 
 async def _publish_listing_event(
@@ -2305,6 +2444,20 @@ async def _publish_listing_stream_event(
     return str(stream_event_id), utc_now_iso(), monotonic_duration_ms(publish_started)
 
 
+async def _publish_listing_enrichment_event(
+    redis_client: Redis,
+    enrichment_event_payload: dict[str, str],
+) -> tuple[str, str, int]:
+    publish_started = time.monotonic()
+    stream_event_id = await redis_client.xadd(
+        LISTING_ENRICHMENT_STREAM_NAME,
+        enrichment_event_payload,
+        maxlen=LISTING_ENRICHMENT_STREAM_MAXLEN,
+        approximate=True,
+    )
+    return str(stream_event_id), utc_now_iso(), monotonic_duration_ms(publish_started)
+
+
 async def _process_listing_event(
     pool: asyncpg.Pool,
     redis_client: Redis,
@@ -2317,9 +2470,18 @@ async def _process_listing_event(
     listing_seen_ts = str(metadata.get("listing_seen_ts") or "").strip() or utc_now_iso()
     route_name = str(metadata.get("route_name") or "").strip() or None
     metadata_event_id = str(metadata.get("event_id") or "").strip() or None
+    background_enrichment_enabled = False
+    if feature_flags is not None:
+        background_enrichment_enabled = await feature_flags.is_enabled("ENABLE_BACKGROUND_ENRICHMENT")
 
     upsert_started = time.monotonic()
-    upsert_result = _normalize_upsert_result(await _upsert_listing(pool, listing))
+    upsert_result = _normalize_upsert_result(
+        await _upsert_listing(
+            pool,
+            listing,
+            background_enrichment_enabled=background_enrichment_enabled,
+        )
+    )
     created = upsert_result.created
     if not created:
         _increment_counter_metric(cycle_metrics, "duplicate_listing_count")
@@ -2381,6 +2543,67 @@ async def _process_listing_event(
     )
     _increment_latency_metric(cycle_metrics, "redis_publish_latency_ms", redis_publish_latency_ms)
 
+    enrichment_event_id: str | None = None
+    enrichment_enqueued_ts: str | None = None
+    enrichment_enqueue_latency_ms: int | None = None
+    enrichment_publish_status = "disabled"
+    enrichment_source_hash = upsert_result.enrichment_source_hash
+    if background_enrichment_enabled and upsert_result.should_enqueue_enrichment:
+        enrichment_publish_status = "queued"
+        _, cold_fields, computed_enrichment_source_hash = split_listing_for_fast_path(listing)
+        if not enrichment_source_hash:
+            enrichment_source_hash = computed_enrichment_source_hash
+        enrichment_event = build_listing_enrichment_event(
+            listing_id=str(listing_id or ""),
+            metadata=metadata,
+            worker_name=WORKER_NAME,
+            persisted_at=listing_persisted_ts,
+            enqueued_at=utc_now_iso(),
+            cold_fields=cold_fields,
+            enrichment_source_hash=str(enrichment_source_hash or build_enrichment_source_hash(cold_fields)),
+        )
+        try:
+            enrichment_event_id, enrichment_enqueued_ts, enrichment_enqueue_latency_ms = await _publish_listing_enrichment_event(
+                redis_client=redis_client,
+                enrichment_event_payload=enrichment_event.to_redis_fields(),
+            )
+            _increment_latency_metric(
+                cycle_metrics,
+                "enrichment_enqueue_latency_ms",
+                enrichment_enqueue_latency_ms,
+            )
+            emit_json_log(
+                "listing_enrichment_enqueued",
+                listing_id=listing_id,
+                event_id=event_id,
+                worker_name=WORKER_NAME,
+                route_name=route_name,
+                event_name=event_name,
+                enrichment_stream_name=LISTING_ENRICHMENT_STREAM_NAME,
+                enrichment_event_id=enrichment_event_id,
+                enrichment_enqueued_ts=enrichment_enqueued_ts,
+                enrichment_enqueue_latency_ms=enrichment_enqueue_latency_ms,
+                enrichment_source_hash=enrichment_event.enrichment_source_hash,
+                listing_persisted_ts=listing_persisted_ts,
+            )
+        except Exception as exc:
+            enrichment_publish_status = "failed"
+            _increment_counter_metric(cycle_metrics, "enrichment_enqueue_failure_count")
+            emit_json_log(
+                "listing_enrichment_enqueue_failed",
+                listing_id=listing_id,
+                event_id=event_id,
+                worker_name=WORKER_NAME,
+                route_name=route_name,
+                event_name=event_name,
+                enrichment_stream_name=LISTING_ENRICHMENT_STREAM_NAME,
+                enrichment_source_hash=enrichment_source_hash,
+                listing_persisted_ts=listing_persisted_ts,
+                error=str(exc)[:500],
+            )
+    elif background_enrichment_enabled:
+        enrichment_publish_status = "suppressed_unchanged"
+
     emit_json_log(
         "listing_pipeline_observed",
         listing_id=listing_id,
@@ -2398,6 +2621,12 @@ async def _process_listing_event(
         listing_event_published_ts=listing_event_published_ts,
         postgres_upsert_latency_ms=postgres_upsert_latency_ms,
         redis_publish_latency_ms=redis_publish_latency_ms,
+        background_enrichment_enabled=background_enrichment_enabled,
+        enrichment_publish_status=enrichment_publish_status,
+        enrichment_source_hash=enrichment_source_hash,
+        enrichment_event_id=enrichment_event_id,
+        enrichment_enqueued_ts=enrichment_enqueued_ts,
+        enrichment_enqueue_latency_ms=enrichment_enqueue_latency_ms,
     )
 
     if feature_flags is not None:

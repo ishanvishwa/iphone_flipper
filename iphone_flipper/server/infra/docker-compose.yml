@@ -118,6 +118,32 @@ services:
       redis:
         condition: service_healthy
 
+  enrichment_worker:
+    build:
+      context: ../..
+      dockerfile: server/services/worker/Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "server.services.worker.enrichment_worker"]
+    env_file:
+      - ../.env
+    environment:
+      TZ: ${TZ:-UTC}
+      APP_ENV: ${APP_ENV:-production}
+      LISTING_EVENT_CHANNEL: ${LISTING_EVENT_CHANNEL:-listing_events}
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: ${POSTGRES_DB}
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
   worker:
     build:
       context: ../..

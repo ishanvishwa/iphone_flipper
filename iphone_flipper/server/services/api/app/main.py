@@ -48,6 +48,7 @@ LISTING_SELECT_COLUMNS = """
     url,
     description,
     seller_name,
+    thumbnail_url,
     model,
     condition,
     max_buy_price,

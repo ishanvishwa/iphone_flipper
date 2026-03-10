@@ -34,6 +34,23 @@ _accessory_filter_cache: Dict[str, Any] = {
     "max_price": float(DEFAULT_ACCESSORY_MAX_PRICE),
 }
 
+_LISTING_COLUMN_DEFINITIONS: Dict[str, str] = {
+    "thumbnail_url": "TEXT",
+    "enrichment_status": "TEXT DEFAULT 'complete'",
+    "enrichment_source_hash": "TEXT",
+    "enriched_at": "TEXT",
+    "enrichment_last_error": "TEXT",
+}
+
+
+def _ensure_listing_columns(cursor: sqlite3.Cursor) -> None:
+    cursor.execute("PRAGMA table_info(listings)")
+    existing_columns = {str(row[1]) for row in cursor.fetchall()}
+    for column_name, definition in _LISTING_COLUMN_DEFINITIONS.items():
+        if column_name in existing_columns:
+            continue
+        cursor.execute(f"ALTER TABLE listings ADD COLUMN {column_name} {definition}")
+
 # ---------------------------------------------------------------------------
 # Database initialisation
 # ---------------------------------------------------------------------------
@@ -52,15 +69,21 @@ def init_db() -> None:
             url TEXT,
             description TEXT,
             seller_name TEXT,
+            thumbnail_url TEXT,
             model TEXT,
             condition TEXT,
             max_buy_price REAL,
             potential_profit REAL,
             status TEXT DEFAULT 'new',
+            enrichment_status TEXT DEFAULT 'complete',
+            enrichment_source_hash TEXT,
+            enriched_at TEXT,
+            enrichment_last_error TEXT,
             created_at TEXT,
             updated_at TEXT
         )
     """)
+    _ensure_listing_columns(cursor)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS scraper_settings (
             setting_key TEXT PRIMARY KEY,
@@ -555,8 +578,9 @@ def save_listing(cursor: sqlite3.Cursor, listing: Dict[str, Any]) -> bool:
         """
         INSERT OR IGNORE INTO listings (
             id, title, price, location, url, description, seller_name,
-            model, condition, max_buy_price, potential_profit, status, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            thumbnail_url, model, condition, max_buy_price, potential_profit, status,
+            enrichment_status, enrichment_source_hash, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             listing["id"],
@@ -566,11 +590,15 @@ def save_listing(cursor: sqlite3.Cursor, listing: Dict[str, Any]) -> bool:
             listing.get("url"),
             listing.get("description"),
             listing.get("seller_name"),
+            listing.get("thumbnail_url"),
             listing.get("model"),
             listing.get("condition"),
             listing.get("max_offer"),
             listing.get("potential_profit"),
             listing.get("status", "new"),
+            listing.get("enrichment_status", "complete"),
+            listing.get("enrichment_source_hash"),
+            datetime.now().isoformat(),
             datetime.now().isoformat(),
         ),
     )

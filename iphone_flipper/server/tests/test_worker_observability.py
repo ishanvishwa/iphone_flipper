@@ -56,16 +56,28 @@ class _FakeConnection:
 
     async def execute(self, query: str, *args) -> str:
         listing_id = str(args[0])
+        if len(args) >= 13:
+            model_index = 8
+            condition_index = 9
+            max_buy_price_index = 10
+            potential_profit_index = 11
+            status_index = 12
+        else:
+            model_index = 7
+            condition_index = 8
+            max_buy_price_index = 9
+            potential_profit_index = 10
+            status_index = 11
         self.rows[listing_id] = {
             "title": args[1],
             "price": args[2],
             "location": args[3],
             "url": args[4],
-            "model": args[7],
-            "condition": args[8],
-            "max_buy_price": args[9],
-            "potential_profit": args[10],
-            "status": args[11],
+            "model": args[model_index],
+            "condition": args[condition_index],
+            "max_buy_price": args[max_buy_price_index],
+            "potential_profit": args[potential_profit_index],
+            "status": args[status_index],
         }
         await asyncio.sleep(0)
         return "OK"
@@ -399,6 +411,156 @@ class WorkerObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cycle_metrics["notification_delivery_latency_ms_count"], 0)
         self.assertEqual(emit_mock.call_args_list[1].args[0], "notification_delivery_delegated")
         self.assertEqual(emit_mock.call_args_list[1].kwargs["notification_status"], "delegated")
+
+    async def test_process_listing_event_enqueues_background_enrichment_after_pubsub(self) -> None:
+        cycle_metrics = {
+            "postgres_upsert_latency_ms_sum": 0,
+            "postgres_upsert_latency_ms_count": 0,
+            "redis_publish_latency_ms_sum": 0,
+            "redis_publish_latency_ms_count": 0,
+            "redis_stream_publish_latency_ms_sum": 0,
+            "redis_stream_publish_latency_ms_count": 0,
+            "redis_stream_publish_failure_count": 0,
+            "notification_delivery_latency_ms_sum": 0,
+            "notification_delivery_latency_ms_count": 0,
+            "end_to_end_alert_latency_ms_sum": 0,
+            "end_to_end_alert_latency_ms_count": 0,
+            "enrichment_enqueue_latency_ms_sum": 0,
+            "enrichment_enqueue_latency_ms_count": 0,
+            "enrichment_enqueue_failure_count": 0,
+        }
+        feature_flags = MagicMock()
+
+        async def _flag_enabled(flag_name: str) -> bool:
+            return flag_name == "ENABLE_BACKGROUND_ENRICHMENT"
+
+        feature_flags.is_enabled = AsyncMock(side_effect=_flag_enabled)
+        metadata = {
+            "route_name": "profile_enrichment",
+            "query": "iPhone 15 Pro",
+            "query_index": 1,
+            "query_total": 2,
+            "query_shard_key": "QUERY_SHARD:enrich",
+            "listing_seen_ts": "2026-03-10T00:05:00+00:00",
+        }
+        listing = {
+            "id": "listing-enrich-1",
+            "title": "iPhone 15 Pro",
+            "price": 950,
+            "url": "https://example.com/listing-enrich-1",
+            "description": "Battery 89%",
+            "seller_name": "Seller A",
+            "thumbnail_url": "https://example.com/thumb.jpg",
+            "model": "iPhone 15 Pro",
+            "condition": "used",
+            "potential_profit": 150,
+        }
+        publish_order: list[str] = []
+
+        async def _publish_listing(*_args, **_kwargs):
+            publish_order.append("pubsub")
+            return ("2026-03-10T00:05:00.300000+00:00", 5)
+
+        async def _publish_enrichment(*_args, **_kwargs):
+            publish_order.append("enrichment")
+            return ("1741601100000-1", "2026-03-10T00:05:00.450000+00:00", 7)
+
+        with (
+            patch.object(
+                worker,
+                "_upsert_listing",
+                AsyncMock(
+                    return_value=worker.ListingUpsertResult(
+                        created=True,
+                        stream_state_changed=True,
+                        should_enqueue_enrichment=True,
+                        enrichment_source_hash="hash-1",
+                    )
+                ),
+            ),
+            patch.object(worker, "_publish_listing_event", AsyncMock(side_effect=_publish_listing)),
+            patch.object(worker, "_publish_listing_enrichment_event", AsyncMock(side_effect=_publish_enrichment)) as enrichment_mock,
+            patch.object(worker, "_should_notify_telegram", return_value=False),
+            patch.object(worker, "monotonic_duration_ms", return_value=9),
+            patch.object(worker, "utc_now_iso", side_effect=["2026-03-10T00:05:00.100000+00:00", "2026-03-10T00:05:00.400000+00:00"]),
+            patch.object(worker, "emit_json_log") as emit_mock,
+        ):
+            await worker._process_listing_event(object(), object(), feature_flags, listing, metadata, cycle_metrics)
+
+        enrichment_mock.assert_awaited_once()
+        self.assertEqual(publish_order, ["pubsub", "enrichment"])
+        self.assertEqual(cycle_metrics["enrichment_enqueue_latency_ms_sum"], 7)
+        self.assertEqual(cycle_metrics["enrichment_enqueue_latency_ms_count"], 1)
+        self.assertEqual(emit_mock.call_args_list[0].args[0], "listing_enrichment_enqueued")
+        self.assertEqual(emit_mock.call_args_list[1].kwargs["enrichment_publish_status"], "queued")
+
+    async def test_process_listing_event_keeps_current_behavior_when_background_enrichment_is_off(self) -> None:
+        cycle_metrics = {
+            "postgres_upsert_latency_ms_sum": 0,
+            "postgres_upsert_latency_ms_count": 0,
+            "redis_publish_latency_ms_sum": 0,
+            "redis_publish_latency_ms_count": 0,
+            "redis_stream_publish_latency_ms_sum": 0,
+            "redis_stream_publish_latency_ms_count": 0,
+            "redis_stream_publish_failure_count": 0,
+            "notification_delivery_latency_ms_sum": 0,
+            "notification_delivery_latency_ms_count": 0,
+            "end_to_end_alert_latency_ms_sum": 0,
+            "end_to_end_alert_latency_ms_count": 0,
+            "enrichment_enqueue_latency_ms_sum": 0,
+            "enrichment_enqueue_latency_ms_count": 0,
+            "enrichment_enqueue_failure_count": 0,
+        }
+        feature_flags = MagicMock()
+        feature_flags.is_enabled = AsyncMock(return_value=False)
+        metadata = {
+            "route_name": "profile_off",
+            "listing_seen_ts": "2026-03-10T00:06:00+00:00",
+        }
+        listing = {"id": "listing-enrich-2", "model": "iPhone 15", "potential_profit": 15}
+
+        with (
+            patch.object(
+                worker,
+                "_upsert_listing",
+                AsyncMock(
+                    return_value=worker.ListingUpsertResult(
+                        created=True,
+                        stream_state_changed=True,
+                        should_enqueue_enrichment=True,
+                        enrichment_source_hash="hash-2",
+                    )
+                ),
+            ),
+            patch.object(worker, "_publish_listing_event", AsyncMock(return_value=("2026-03-10T00:06:00.300000+00:00", 5))),
+            patch.object(worker, "_publish_listing_enrichment_event", AsyncMock()) as enrichment_mock,
+            patch.object(worker, "_should_notify_telegram", return_value=False),
+            patch.object(worker, "monotonic_duration_ms", return_value=8),
+            patch.object(worker, "utc_now_iso", return_value="2026-03-10T00:06:00.100000+00:00"),
+            patch.object(worker, "emit_json_log") as emit_mock,
+        ):
+            await worker._process_listing_event(object(), object(), feature_flags, listing, metadata, cycle_metrics)
+
+        enrichment_mock.assert_not_awaited()
+        self.assertEqual(cycle_metrics["enrichment_enqueue_latency_ms_count"], 0)
+        self.assertEqual(emit_mock.call_args_list[0].kwargs["background_enrichment_enabled"], False)
+
+    def test_listing_needs_enrichment_suppresses_duplicate_hash_for_completed_listing(self) -> None:
+        existing_row = {
+            "description": "",
+            "seller_name": "",
+            "thumbnail_url": "",
+            "enrichment_status": "complete",
+            "enrichment_source_hash": "hash-3",
+        }
+
+        should_enqueue = worker._listing_needs_enrichment(
+            existing_row=existing_row,
+            cold_fields={"description": "", "seller_name": "", "thumbnail_url": ""},
+            source_hash="hash-3",
+        )
+
+        self.assertFalse(should_enqueue)
 
     async def test_concurrent_duplicate_listing_processing_publishes_one_stream_event(self) -> None:
         pool = _FakePool()

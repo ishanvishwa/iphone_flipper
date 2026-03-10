@@ -59,6 +59,23 @@ def _get_nested(mapping: Any, *keys: str) -> Any:
     return current
 
 
+def _extract_media_url(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ("uri", "url", "src", "image", "photo_image", "thumbnail_image"):
+            candidate = _extract_media_url(value.get(key))
+            if candidate:
+                return candidate
+        return ""
+    if isinstance(value, list):
+        for item in value:
+            candidate = _extract_media_url(item)
+            if candidate:
+                return candidate
+    return ""
+
+
 def _normalize_marketplace_url(raw_url: Any, listing_id: str) -> str:
     normalized_id = _extract_text_value(listing_id)
     if normalized_id:
@@ -97,6 +114,7 @@ def _extract_graphql_listing_candidates(payload: Any) -> List[Dict[str, Any]]:
                 or "listing_price" in node
                 or "marketplace_listing_seller" in node
                 or "redacted_description" in node
+                or "listing_photo" in node
             ):
                 candidates.append(node)
 
@@ -165,6 +183,17 @@ def _normalize_graphql_listing(candidate: Dict[str, Any]) -> Optional[Dict[str, 
 
     seller_data = candidate.get("marketplace_listing_seller") or candidate.get("seller")
     seller_name = _extract_text_value(_get_nested(seller_data, "name") if isinstance(seller_data, dict) else seller_data)
+    thumbnail_url = _extract_media_url(
+        candidate.get("thumbnail_url")
+        or candidate.get("listing_photo")
+        or candidate.get("primary_listing_photo")
+        or candidate.get("primary_photo")
+        or candidate.get("photo")
+        or candidate.get("image")
+        or candidate.get("cover_photo")
+        or candidate.get("listing_photos")
+        or candidate.get("photos")
+    )
 
     location_data = candidate.get("location") or {}
     location_name = _extract_text_value(
@@ -182,6 +211,7 @@ def _normalize_graphql_listing(candidate: Dict[str, Any]) -> Optional[Dict[str, 
         "location": location_name,
         "description": description,
         "seller_name": seller_name,
+        "thumbnail_url": thumbnail_url,
     }
 
 
@@ -202,13 +232,15 @@ def _listing_quality_score(listing: Dict[str, Any]) -> int:
         score += 1
     if _has_value(listing.get("seller_name")):
         score += 1
+    if _has_value(listing.get("thumbnail_url")):
+        score += 1
     return score
 
 
 def merge_listing_candidates(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Merge duplicate listing IDs, preserving richer values."""
     merged: Dict[str, Dict[str, Any]] = {}
-    fields = ("title", "url", "price", "location", "description", "seller_name")
+    fields = ("title", "url", "price", "location", "description", "seller_name", "thumbnail_url")
 
     for candidate in candidates:
         listing_id = _extract_text_value(candidate.get("id"))
@@ -595,11 +627,24 @@ async def _extract_dom_listing_candidates(page) -> List[Dict[str, str]]:
                     if (price) score += 3;
                     if (title.length > 15) score += 1;
 
+                    const imageEl = container
+                        ? container.querySelector('img[src], img[data-imgsrc], image[href]')
+                        : null;
+                    const thumbnailUrl = imageEl
+                        ? (
+                            imageEl.getAttribute('src') ||
+                            imageEl.getAttribute('data-imgsrc') ||
+                            imageEl.getAttribute('href') ||
+                            ''
+                        )
+                        : '';
+
                     const candidate = {
                         id: listingId,
                         title,
                         url: linkEl.href,
                         price,
+                        thumbnail_url: cleanText(thumbnailUrl),
                         _score: score,
                     };
 
@@ -615,6 +660,7 @@ async def _extract_dom_listing_candidates(page) -> List[Dict[str, str]]:
                 title: item.title,
                 url: item.url,
                 price: item.price,
+                thumbnail_url: item.thumbnail_url,
             }));
         }
     """)
@@ -733,6 +779,7 @@ def _store_listing_candidate(
     location_text = (listing.get("location") or "").strip() or None
     seller_name = (listing.get("seller_name") or "").strip() or None
     listing_url = _normalize_marketplace_url(listing.get("url"), listing_id)
+    thumbnail_url = _extract_media_url(listing.get("thumbnail_url")) or None
 
     price_value = parse_listing_price(listing.get("price"))
     inferred_price = (
@@ -773,8 +820,9 @@ def _store_listing_candidate(
         """
         INSERT OR IGNORE INTO listings (
             id, title, price, location, url, description, seller_name,
-            model, condition, max_buy_price, potential_profit, status, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            thumbnail_url, model, condition, max_buy_price, potential_profit, status,
+            enrichment_status, enrichment_source_hash, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             listing_id,
@@ -784,11 +832,15 @@ def _store_listing_candidate(
             listing_url,
             description_text,
             seller_name,
+            thumbnail_url,
             model,
             condition,
             max_offer,
             profit,
             status,
+            "complete",
+            None,
+            created_at,
             created_at,
         ),
     )
@@ -806,8 +858,8 @@ def _store_listing_candidate(
         "potential_profit": profit,
         "location": location_text,
         "seller_name": seller_name,
+        "thumbnail_url": thumbnail_url,
         "url": listing_url,
         "status": status,
     }
-
 

@@ -32,7 +32,8 @@ async def ensure_worker_tables(pool: asyncpg.Pool, include_triggers: bool = Fals
                 (4, 'Worker proxy leases and proxy stats tables'),
                 (5, 'Schema versioning table'),
                 (6, 'Notification delivery ledger'),
-                (7, 'Priority scheduler route lanes and metrics')
+                (7, 'Priority scheduler route lanes and metrics'),
+                (8, 'Background enrichment fields and ledger')
             ON CONFLICT (version) DO NOTHING;
             """
         )
@@ -46,6 +47,87 @@ async def ensure_worker_tables(pool: asyncpg.Pool, include_triggers: bool = Fals
                   RETURN NEW;
                 END;
                 $$ LANGUAGE plpgsql;
+                """
+            )
+
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS listings (
+                seq_id BIGSERIAL PRIMARY KEY,
+                id TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                price NUMERIC,
+                location TEXT,
+                url TEXT,
+                description TEXT,
+                seller_name TEXT,
+                thumbnail_url TEXT,
+                model TEXT,
+                condition TEXT,
+                max_buy_price NUMERIC,
+                potential_profit NUMERIC,
+                status TEXT DEFAULT 'new',
+                enrichment_status TEXT NOT NULL DEFAULT 'complete',
+                enrichment_source_hash TEXT,
+                enriched_at TIMESTAMPTZ,
+                enrichment_last_error TEXT,
+                source_seen_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        await conn.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS thumbnail_url TEXT;")
+        await conn.execute(
+            "ALTER TABLE listings ADD COLUMN IF NOT EXISTS enrichment_status TEXT NOT NULL DEFAULT 'complete';"
+        )
+        await conn.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS enrichment_source_hash TEXT;")
+        await conn.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS enriched_at TIMESTAMPTZ;")
+        await conn.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS enrichment_last_error TEXT;")
+        await conn.execute(
+            """
+            UPDATE listings
+            SET enrichment_status = CASE
+                WHEN LOWER(COALESCE(enrichment_status, '')) IN ('pending', 'complete', 'failed')
+                    THEN LOWER(enrichment_status)
+                ELSE 'complete'
+            END
+            WHERE enrichment_status IS NULL
+               OR LOWER(COALESCE(enrichment_status, '')) NOT IN ('pending', 'complete', 'failed');
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_listings_created_at
+            ON listings (created_at DESC);
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_listings_status
+            ON listings (status);
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_listings_profit
+            ON listings (potential_profit DESC);
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_listings_enrichment_status
+            ON listings (enrichment_status, updated_at DESC);
+            """
+        )
+        if include_triggers:
+            await conn.execute("DROP TRIGGER IF EXISTS trg_set_updated_at ON listings;")
+            await conn.execute(
+                """
+                CREATE TRIGGER trg_set_updated_at
+                BEFORE UPDATE ON listings
+                FOR EACH ROW
+                EXECUTE FUNCTION set_updated_at_timestamp();
                 """
             )
 
@@ -364,5 +446,27 @@ async def ensure_worker_tables(pool: asyncpg.Pool, include_triggers: bool = Fals
             """
             CREATE INDEX IF NOT EXISTS idx_notification_delivery_ledger_status
             ON notification_delivery_ledger (status, updated_at DESC);
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS listing_enrichment_ledger (
+                listing_id TEXT PRIMARY KEY,
+                first_stream_event_id TEXT NOT NULL,
+                last_stream_event_id TEXT NOT NULL,
+                enrichment_source_hash TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                last_attempt_at TIMESTAMPTZ,
+                enriched_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_listing_enrichment_ledger_status
+            ON listing_enrichment_ledger (status, updated_at DESC);
             """
         )

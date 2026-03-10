@@ -12,6 +12,7 @@ DEFAULT_FEATURE_FLAGS: dict[str, bool] = {
     "ENABLE_GUI_WEBSOCKET_PUSH": False,
     "ENABLE_PRIORITY_SCHEDULER": False,
     "ENABLE_ROUTE_LANES": False,
+    "ENABLE_BACKGROUND_ENRICHMENT": False,
 }
 
 _TRUE_VALUES = {"1", "true", "yes", "on", "enabled"}

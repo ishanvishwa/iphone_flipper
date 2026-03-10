@@ -2234,8 +2234,109 @@ This keeps `dev-log.md` actionable for both engineering and operations.
   - `High-value route coverage time decreases measurably versus the pre-enable baseline.`  
     Met. Hot-route first coverage improved from `117.355s` in the flags-off baseline to `1.866s` in the final flags-on run, a reduction of `115.489s`.
 - Unresolved follow-ups:
-  - Phase 5 still owns hot-path slimming/background enrichment so lower-value field fetches can move off the scrape hot path
   - Phase 6 still owns operator replay/backlog controls and explicit rollback tooling for live scheduler behavior
   - production currently has no persisted `worker_routes` after the acceptance cleanup, so Phase 4 remains enabled but inert until operators create DB-backed routes again through the API/GUI
+
+### §42 – V3.0 Phase 5: Fast-Path Slimming + Background Enrichment (2026-03-10)
+
+- Summary: Implemented Phase 5 of the approved V3.0 latency/responsiveness upgrade track. The worker now keeps the first persistence/fanout path lean and decision-ready while deferring non-critical listing enrichment (`description`, `seller_name`, thumbnail backfill) to a separate Redis Streams consumer service behind `ENABLE_BACKGROUND_ENRICHMENT`. Public listing payloads remain backward compatible; only nullable `thumbnail_url` was added to `/listings`, WebSocket snapshots, and desktop sync.
+- Motivation:
+  - keep discovery-to-alert latency focused on fields needed for immediate buy/no-buy decisions
+  - move cold-field persistence work out of the scrape hot path without inventing a new scraper transport
+  - preserve the existing Redis pub/sub + Redis Streams + notification + desktop sync architecture from Phases 1-4
+- Changes:
+  - added shared enrichment contracts in `server/services/common/enrichment_events.py`:
+    - hot-path field partition (`id`, `title`, `price`, `url`, `location`, `thumbnail_url`, `model`, `condition`, `max_buy_price`, `potential_profit`, `status`, timestamps)
+    - cold-path field partition (`description`, `seller_name`, thumbnail backfill)
+    - normalized `thumbnail_url` extraction helpers
+    - deterministic `enrichment_source_hash`
+    - flat Redis Stream schema for `stream:listing_enrichment`
+  - added new shared rollout flag:
+    - `ENABLE_BACKGROUND_ENRICHMENT`
+  - extended authoritative listing schema in Postgres and local SQLite:
+    - nullable `thumbnail_url`
+    - `enrichment_status` (`pending`, `complete`, `failed`)
+    - `enrichment_source_hash`
+    - `enriched_at`
+    - `enrichment_last_error`
+  - extended worker hot path in `server/services/worker/worker.py`:
+    - hot row still persists first and remains the source for Redis pub/sub, Redis Streams event publication, notification delegation, and GUI/API fanout
+    - when background enrichment is enabled, description/seller persistence is deferred and only the decision-ready row is written on the first pass
+    - enrichment jobs are enqueued only when the listing is new, the cold-field fingerprint changed, or a prior failed/unknown enrichment state still leaves enrichable fields missing
+    - unchanged listings do not repeatedly enqueue enrichment work for the same cold snapshot
+    - worker logs now emit `listing_enrichment_enqueued` and cycle telemetry now records enrichment enqueue latency/failure counters
+  - added dedicated background consumer service in `server/services/worker/enrichment_worker.py`:
+    - Redis consumer group `listing_enrichment` over `stream:listing_enrichment`
+    - `XGROUP CREATE ... MKSTREAM`, `XREADGROUP`, and `XAUTOCLAIM`
+    - bounded retry/backoff with terminal `failed` bookkeeping
+    - PostgreSQL ledger `listing_enrichment_ledger` for duplicate job suppression by `listing_id + enrichment_source_hash`
+    - successful enrichment updates listing rows, marks status/ledger state, and republishes lightweight pub/sub `listing_updated` triggers so API/WebSocket clients can merge later cold-field updates
+  - preserved public interfaces and alert sufficiency:
+    - `/listings` and WebSocket snapshots now add only nullable `thumbnail_url`
+    - Telegram listing cards remain text-first and now include optional thumbnail preview metadata when present
+    - desktop sync still uses idempotent upserts and now accepts same-cursor websocket updates when `updated_at` is newer or cold fields were previously blank
+  - infra/deploy wiring:
+    - added `enrichment_worker` to `server/infra/docker-compose.yml`
+    - added `enrichment_worker` to the default `server/scripts/deploy_vps.sh` rollout service set
+  - fresh audit result:
+    - no additional undocumented code-level features or process enhancements were found beyond the approved Phase 5 work and the previously captured audit sections
+- Files touched:
+  - `server/services/common/enrichment_events.py`
+  - `server/services/common/feature_flags.py`
+  - `server/services/common/schema_ensure.py`
+  - `server/services/common/stream_events.py`
+  - `server/services/worker/worker.py`
+  - `server/services/worker/enrichment_worker.py`
+  - `server/services/worker/notification_worker.py`
+  - `server/services/worker/telemetry.py`
+  - `server/services/api/app/main.py`
+  - `server/services/api/sql/001_init.sql`
+  - `server/infra/docker-compose.yml`
+  - `server/scripts/deploy_vps.sh`
+  - `desktop_sync.py`
+  - `scraper/storage.py`
+  - `scraper/legacy_utils.py`
+  - `notifications.py`
+  - `server/tests/test_enrichment_events.py`
+  - `server/tests/test_enrichment_worker.py`
+  - `server/tests/test_stream_events.py`
+  - `server/tests/test_worker_observability.py`
+  - `server/tests/test_notification_worker.py`
+  - `server/tests/test_desktop_sync.py`
+  - `server/tests/test_api_observability.py`
+  - `server/tests/test_telemetry.py`
+  - `architecture.md`
+  - `roadmap.md`
+  - `dev-log.md`
+- Decision/rationale:
+  - `thumbnail_url` is implemented now as a nullable listing field because it is cheap when present in discovery payloads and does not require a second transport or blocking media upload
+  - the worker continues computing `model`, `condition`, `max_buy_price`, and `potential_profit` on the first pass so alerts remain decision-ready even before enrichment completes
+  - cold enrichment intentionally reuses already-captured discovery data and does not introduce a raw HTTP/detail-page fetch architecture in this phase
+  - later GUI cold-field updates reuse the existing listing row / `seq_id` contract rather than introducing a second desktop payload type
+- Validation performed:
+  - local import/compile sanity:
+    - `python3 -m py_compile server/services/common/enrichment_events.py server/services/common/feature_flags.py server/services/common/schema_ensure.py server/services/common/stream_events.py server/services/worker/worker.py server/services/worker/enrichment_worker.py server/services/worker/notification_worker.py server/services/worker/telemetry.py server/services/api/app/main.py desktop_sync.py scraper/storage.py scraper/legacy_utils.py notifications.py`
+  - focused Phase 5 pytest coverage:
+    - `PYTHONPATH=iphone_flipper ./.venv/bin/python -m pytest iphone_flipper/server/tests/test_enrichment_events.py iphone_flipper/server/tests/test_enrichment_worker.py iphone_flipper/server/tests/test_stream_events.py iphone_flipper/server/tests/test_notification_worker.py iphone_flipper/server/tests/test_worker_observability.py iphone_flipper/server/tests/test_desktop_sync.py iphone_flipper/server/tests/test_api_observability.py iphone_flipper/server/tests/test_telemetry.py -q`
+    - result: `57 passed`
+  - full server regression:
+    - `PYTHONPATH=iphone_flipper ./.venv/bin/python -m pytest iphone_flipper/server/tests -q`
+  - VPS rollout and acceptance verification:
+    - deployed the Phase 5 code to `ubuntu@15.235.185.32`
+    - verified clean worker/API/notification/enrichment startup with `ENABLE_BACKGROUND_ENRICHMENT=0`
+    - enabled `ENABLE_BACKGROUND_ENRICHMENT=1` in `flipper:flags`
+    - confirmed `stream:listing_enrichment` activity, active consumer group `listing_enrichment`, and live `listing_enrichment_enqueued` / `listing_enrichment_completed` logs
+    - verified later cold-field updates continue to reach API/WebSocket/desktop consumers through pub/sub-triggered `listing_updated`
+    - compared worker CPU/memory and cycle telemetry before/after enable; worker resource usage remained flat while enrichment work moved to `enrichment_worker`
+- Acceptance criteria status:
+  - `Alert pipeline does not block on deep enrichment.`  
+    Met. In rollout logs, new-listing GUI push / notification delegation occurred before the corresponding `listing_enrichment_completed` entries.
+  - `CPU and memory usage per worker decrease or remain flat.`  
+    Met. Worker resource usage and scrape-cycle duration remained flat in the enable window while enrichment work shifted onto the separate enrichment service.
+  - `Notification payload remains sufficient for decision-making.`  
+    Met. Alerts still include title, price, projected profit, and URL, with optional thumbnail preview metadata when available.
+- Unresolved follow-ups:
+  - Phase 6 still owns operator replay/backlog controls and explicit rollback tooling for live scheduler + enrichment behavior
+  - production still has no persisted `worker_routes` after the Phase 4 acceptance cleanup, so Phase 4 remains enabled but inert until operators create DB-backed routes again through the API/GUI
 
 ---

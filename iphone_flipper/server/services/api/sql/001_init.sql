@@ -7,19 +7,39 @@ CREATE TABLE IF NOT EXISTS listings (
     url TEXT,
     description TEXT,
     seller_name TEXT,
+    thumbnail_url TEXT,
     model TEXT,
     condition TEXT,
     max_buy_price NUMERIC,
     potential_profit NUMERIC,
     status TEXT DEFAULT 'new',
+    enrichment_status TEXT NOT NULL DEFAULT 'complete',
+    enrichment_source_hash TEXT,
+    enriched_at TIMESTAMPTZ,
+    enrichment_last_error TEXT,
     source_seen_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS thumbnail_url TEXT;
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS enrichment_status TEXT NOT NULL DEFAULT 'complete';
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS enrichment_source_hash TEXT;
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS enriched_at TIMESTAMPTZ;
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS enrichment_last_error TEXT;
+UPDATE listings
+SET enrichment_status = CASE
+    WHEN LOWER(COALESCE(enrichment_status, '')) IN ('pending', 'complete', 'failed')
+        THEN LOWER(enrichment_status)
+    ELSE 'complete'
+END
+WHERE enrichment_status IS NULL
+   OR LOWER(COALESCE(enrichment_status, '')) NOT IN ('pending', 'complete', 'failed');
+
 CREATE INDEX IF NOT EXISTS idx_listings_created_at ON listings (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_listings_status ON listings (status);
 CREATE INDEX IF NOT EXISTS idx_listings_profit ON listings (potential_profit DESC);
+CREATE INDEX IF NOT EXISTS idx_listings_enrichment_status ON listings (enrichment_status, updated_at DESC);
 
 CREATE OR REPLACE FUNCTION set_updated_at_timestamp()
 RETURNS TRIGGER AS $$
@@ -228,3 +248,19 @@ CREATE TABLE IF NOT EXISTS notification_delivery_ledger (
 
 CREATE INDEX IF NOT EXISTS idx_notification_delivery_ledger_status
 ON notification_delivery_ledger (status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS listing_enrichment_ledger (
+    listing_id TEXT PRIMARY KEY,
+    first_stream_event_id TEXT NOT NULL,
+    last_stream_event_id TEXT NOT NULL,
+    enrichment_source_hash TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    last_attempt_at TIMESTAMPTZ,
+    enriched_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_listing_enrichment_ledger_status
+ON listing_enrichment_ledger (status, updated_at DESC);

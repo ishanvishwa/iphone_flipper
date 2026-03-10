@@ -66,6 +66,15 @@ def build_cycle_telemetry_payload(
         payload["end_to_end_alert_latency_ms_count"] = int(
             metrics.get("end_to_end_alert_latency_ms_count", 0) or 0
         )
+        payload["enrichment_enqueue_latency_ms_sum"] = int(
+            metrics.get("enrichment_enqueue_latency_ms_sum", 0) or 0
+        )
+        payload["enrichment_enqueue_latency_ms_count"] = int(
+            metrics.get("enrichment_enqueue_latency_ms_count", 0) or 0
+        )
+        payload["enrichment_enqueue_failure_count"] = int(
+            metrics.get("enrichment_enqueue_failure_count", 0) or 0
+        )
 
     if details:
         signal_action = str(details.get("signal_action") or "").strip().lower()

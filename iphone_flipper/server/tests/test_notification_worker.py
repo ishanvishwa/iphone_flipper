@@ -140,6 +140,7 @@ def _build_stream_event(
         potential_profit=potential_profit,
         title="iPhone 15 Pro",
         url="https://example.com/listing-1",
+        thumbnail_url="https://example.com/thumb.jpg",
         source="marketplace",
     )
     return "1741604400000-0", event.to_redis_fields()

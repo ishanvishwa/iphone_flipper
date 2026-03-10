@@ -101,25 +101,36 @@ def apply_server_listing_batch(
     source: str,
     min_seq_id_exclusive: int,
 ) -> SyncApplyResult:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    listing_ids = [str(item.get("id") or "").strip() for item in items if str(item.get("id") or "").strip()]
+    existing_rows: dict[str, sqlite3.Row] = {}
+    if listing_ids:
+        placeholders = ",".join(["?"] * len(listing_ids))
+        cursor.execute(
+            f"SELECT id, updated_at, description, seller_name, thumbnail_url FROM listings WHERE id IN ({placeholders})",
+            listing_ids,
+        )
+        existing_rows = {str(row["id"]): row for row in cursor.fetchall()}
+
     eligible_items: list[dict[str, Any]] = []
     for item in items:
-        seq_id = _safe_int(item.get("seq_id"), 0)
         listing_id = str(item.get("id") or "").strip()
-        if not listing_id or seq_id <= int(min_seq_id_exclusive):
+        seq_id = _safe_int(item.get("seq_id"), 0)
+        if not listing_id:
             continue
-        eligible_items.append(item)
+        if seq_id > int(min_seq_id_exclusive):
+            eligible_items.append(item)
+            continue
+        if source == "websocket" and seq_id == int(min_seq_id_exclusive):
+            existing_row = existing_rows.get(listing_id)
+            if _should_apply_same_cursor_update(existing_row, item):
+                eligible_items.append(item)
 
     if not eligible_items:
+        conn.close()
         return SyncApplyResult()
-
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    listing_ids = [str(item.get("id") or "").strip() for item in eligible_items]
-
-    existing_ids: set[str] = set()
-    placeholders = ",".join(["?"] * len(listing_ids))
-    cursor.execute(f"SELECT id FROM listings WHERE id IN ({placeholders})", listing_ids)
-    existing_ids = {str(row[0]) for row in cursor.fetchall()}
 
     inserted = 0
     updated = 0
@@ -135,6 +146,7 @@ def apply_server_listing_batch(
         url = str(item.get("url") or "")
         description = str(item.get("description") or "")
         seller_name = str(item.get("seller_name") or "")
+        thumbnail_url = str(item.get("thumbnail_url") or "")
         model = str(item.get("model") or "")
         condition = str(item.get("condition") or "")
         status = str(item.get("status") or "new")
@@ -145,25 +157,29 @@ def apply_server_listing_batch(
             """
             INSERT INTO listings (
                 id, title, price, location, url, description, seller_name, model,
-                condition, max_buy_price, potential_profit, status, created_at, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                condition, max_buy_price, potential_profit, status, thumbnail_url, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 title = excluded.title,
                 price = excluded.price,
                 location = excluded.location,
                 url = excluded.url,
-                description = excluded.description,
-                seller_name = excluded.seller_name,
+                description = COALESCE(NULLIF(excluded.description, ''), listings.description),
+                seller_name = COALESCE(NULLIF(excluded.seller_name, ''), listings.seller_name),
                 model = excluded.model,
                 condition = excluded.condition,
-                max_buy_price = excluded.max_buy_price,
-                potential_profit = excluded.potential_profit,
+                max_buy_price = COALESCE(excluded.max_buy_price, listings.max_buy_price),
+                potential_profit = COALESCE(excluded.potential_profit, listings.potential_profit),
                 status = CASE
                     WHEN listings.status = 'purchased' THEN listings.status
                     ELSE excluded.status
                 END,
-                updated_at = excluded.updated_at
+                thumbnail_url = COALESCE(NULLIF(excluded.thumbnail_url, ''), listings.thumbnail_url),
+                updated_at = CASE
+                    WHEN COALESCE(NULLIF(excluded.updated_at, ''), listings.updated_at) > COALESCE(listings.updated_at, '')
+                        THEN excluded.updated_at
+                    ELSE listings.updated_at
+                END
             """,
             (
                 listing_id,
@@ -178,12 +194,13 @@ def apply_server_listing_batch(
                 _safe_float(item.get("max_buy_price")),
                 _safe_float(item.get("potential_profit")),
                 status,
+                thumbnail_url,
                 created_at,
                 updated_at,
             ),
         )
 
-        if listing_id in existing_ids:
+        if listing_id in existing_rows:
             updated += 1
             sync_action = "updated"
         else:
@@ -490,7 +507,7 @@ class ServerSyncEngine:
         snapshot_items = [
             dict(message.get("item") or {}, seq_id=_safe_int(message.get("cursor"), 0))
             for message in messages
-            if _safe_int(message.get("cursor"), 0) > self._cursor
+            if _safe_int(message.get("cursor"), 0) >= self._cursor
         ]
         if not snapshot_items:
             return
@@ -607,3 +624,18 @@ def _safe_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _should_apply_same_cursor_update(existing_row: sqlite3.Row | None, item: dict[str, Any]) -> bool:
+    if existing_row is None:
+        return True
+    incoming_updated_at = str(item.get("updated_at") or "").strip()
+    existing_updated_at = str(existing_row["updated_at"] or "").strip()
+    if incoming_updated_at and incoming_updated_at > existing_updated_at:
+        return True
+    for field_name in ("description", "seller_name", "thumbnail_url"):
+        incoming_value = str(item.get(field_name) or "").strip()
+        existing_value = str(existing_row[field_name] or "").strip()
+        if incoming_value and not existing_value:
+            return True
+    return False

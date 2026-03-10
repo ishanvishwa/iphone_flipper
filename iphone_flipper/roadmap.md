@@ -668,20 +668,64 @@ Condition accuracy is a critical decision parameter and currently constrained by
   - [x] telemetry field coverage for Phase 4 scheduler data
 - [x] Fresh 2026-03-10 code audit found no newly undocumented code-level features/process enhancements beyond the approved Phase 4 work and the earlier audit sections
 
+### Phase 5 Completed (This Update)
+
+- [x] Added shared Phase 5 enrichment contracts in `server/services/common/enrichment_events.py`
+- [x] Added `ENABLE_BACKGROUND_ENRICHMENT` to the shared Redis-backed feature-flag registry
+- [x] Extended authoritative listing storage with:
+  - [x] nullable `thumbnail_url`
+  - [x] `enrichment_status`
+  - [x] `enrichment_source_hash`
+  - [x] `enriched_at`
+  - [x] `enrichment_last_error`
+- [x] Added durable enrichment infrastructure:
+  - [x] Redis Stream `stream:listing_enrichment`
+  - [x] capped retention via `XADD ... MAXLEN ~ 10000`
+  - [x] PostgreSQL `listing_enrichment_ledger`
+  - [x] dedicated `enrichment_worker` compose service with consumer-group bootstrap, `XREADGROUP`, and `XAUTOCLAIM`
+- [x] Slimmed the worker hot path when background enrichment is enabled:
+  - [x] decision-ready first-alert fields stay on the initial persist path
+  - [x] cold fields (`description`, `seller_name`, thumbnail backfill) are deferred behind the enrichment stream
+  - [x] enrichment enqueue is suppressed for unchanged duplicate cold snapshots using `enrichment_source_hash`
+- [x] Kept public listing contracts backward compatible:
+  - [x] `/listings` and WebSocket snapshots now add only nullable `thumbnail_url`
+  - [x] desktop sync keeps idempotent upserts and now accepts same-cursor websocket enrichment updates when `updated_at` is newer or cold fields fill in
+- [x] Preserved decision-ready notifications:
+  - [x] title
+  - [x] price
+  - [x] projected profit
+  - [x] URL
+  - [x] optional thumbnail preview link when present
+- [x] Added Phase 5 observability:
+  - [x] `listing_enrichment_enqueued`
+  - [x] `listing_enrichment_started`
+  - [x] `listing_enrichment_completed`
+  - [x] `listing_enrichment_failed`
+  - [x] cycle telemetry counters for enrichment enqueue latency/failure
+- [x] Added targeted tests for:
+  - [x] hot/cold field partitioning and enrichment event schema
+  - [x] thumbnail normalization and source-hash dedupe
+  - [x] worker enqueue gating and flags-off compatibility
+  - [x] enrichment consumer bootstrap/ack/retry/duplicate suppression
+  - [x] desktop same-cursor enrichment merge
+  - [x] API payload compatibility with nullable `thumbnail_url`
+- [x] Fresh 2026-03-10 code audit found no additional undocumented code-level features/process enhancements beyond the approved Phase 5 work and the earlier audit sections
+
 ### Planned Next Phases
 
-- [ ] Phase 5: hot-path payload slimming and background enrichment for non-critical fields
+- [x] Phase 5: hot-path payload slimming and background enrichment for non-critical fields
 - [ ] Phase 6: reliability/replay/operator controls (health endpoints, backlog visibility, replay tooling, live push rollback switches)
 
 ### Upgrade-Track Notes
 
-- Current baseline after Phase 4 rollout: Postgres remains authoritative, Redis pub/sub fanout stays active as the API trigger for normalized WebSocket fanout, Redis Streams publishing remains enabled, notification delivery remains on the dedicated notification consumer, and priority scheduling / route lanes are now enabled in production even though `worker_3` currently has no persisted DB routes after the controlled acceptance smoke cleanup.
+- Current baseline after Phase 5 rollout: Postgres remains authoritative, Redis pub/sub fanout stays active as the API trigger for normalized WebSocket fanout, Redis Streams publishing remains enabled, notification delivery remains on the dedicated notification consumer, priority scheduling / route lanes remain enabled, and cold-field enrichment now runs on a separate Redis Streams consumer so the first discovery-to-alert path no longer waits on description/seller/thumbnail backfill.
 - VPS rollout state on 2026-03-10:
   - `ENABLE_REDIS_STREAM_EVENTS=1`
   - `ENABLE_NOTIFICATION_CONSUMER=1`
   - `ENABLE_GUI_WEBSOCKET_PUSH=1`
   - `ENABLE_PRIORITY_SCHEDULER=1`
   - `ENABLE_ROUTE_LANES=1`
+  - `ENABLE_BACKGROUND_ENRICHMENT=1`
 - Rollout verification included:
   - clean startup with `ENABLE_GUI_WEBSOCKET_PUSH=0` proving the desktop remained poll-only
   - live flag enable in `flipper:flags` for `ENABLE_GUI_WEBSOCKET_PUSH=1`
@@ -721,6 +765,14 @@ Condition accuracy is a critical decision parameter and currently constrained by
       - hot route `next_run_at - last_selected_at = 149.570s`
       - sweep route `phase4_sweep2_w3 next_run_at - last_selected_at = 229.610s`
   - temporary Phase 4 routes were deleted afterward and the full worker pool was restarted; `worker_3` returned to env-backed routing and `/worker-routes?worker_name=worker_3` returned `count=0`
+- controlled Phase 5 enrichment smoke:
+  - verified clean startup with `ENABLE_BACKGROUND_ENRICHMENT=0`
+  - enabled `ENABLE_BACKGROUND_ENRICHMENT=1` in `flipper:flags`
+  - confirmed `stream:listing_enrichment` activity plus active consumer group `listing_enrichment`
+  - confirmed live `listing_enrichment_enqueued` / `listing_enrichment_completed` JSON events in worker + enrichment-worker logs
+  - verified later cold-field updates still reach API/WebSocket clients through pub/sub-triggered `listing_updated`
+  - compared worker CPU/memory and scrape-cycle duration before/after enable; worker resource usage stayed flat while enrichment work moved onto `enrichment_worker`
+  - confirmed alert payloads remained decision-ready with title, price, projected profit, URL, and optional thumbnail preview metadata
 - Acceptance criteria now expected to hold together after Phase 1 + Phase 2:
   - newly persisted listings generate exactly one stream event in the happy path
   - consumer restart does not lose unread events
@@ -733,6 +785,10 @@ Condition accuracy is a critical decision parameter and currently constrained by
   - hot routes show shorter revisit intervals than sweep routes
   - per-profile request intensity does not exceed the current baseline cadence
   - high-value route coverage time decreases measurably versus the flags-off baseline
+- Acceptance criteria now met after Phase 5:
+  - alert pipeline does not block on deep enrichment
+  - CPU and memory usage per worker decrease or remain flat
+  - notification payload remains sufficient for decision-making
 
 ---
 
@@ -781,4 +837,4 @@ Fresh audit note (2026-03-10): no additional undocumented code-level features we
 
 ## Current Focus Recommendation
 
-Active priority is **V3.0 Phase 5**. The next implementation step should be hot-path slimming/background enrichment for non-critical fields while keeping the broader **Phase 5A** server-migration direction intact. Dolphin Anty VPS installation remains operational. Remaining high-impact items after Phase 4 acceptance: hot-path slimming/background enrichment, replay/operator tooling, and `legacy_utils.py` test coverage.
+Active priority is **V3.0 Phase 6**. The next implementation step should focus on reliability/replay/operator controls on top of the separated fast alert path and background enrichment path while keeping the broader **Phase 5A** server-migration direction intact. Dolphin Anty VPS installation remains operational. Remaining high-impact items after Phase 5 acceptance: replay/operator tooling, backlog/health visibility, and deeper `legacy_utils.py` coverage.

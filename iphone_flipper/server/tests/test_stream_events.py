@@ -30,6 +30,7 @@ class ListingStreamEventTests(unittest.TestCase):
             potential_profit=220.0,
             title="iPhone 15 Pro 256GB",
             url="https://example.com/listing-1",
+            thumbnail_url="https://example.com/thumb-1.jpg",
             source="marketplace",
         )
 
@@ -42,6 +43,7 @@ class ListingStreamEventTests(unittest.TestCase):
         self.assertEqual(decoded.query_total, 10)
         self.assertEqual(decoded.price, 799.0)
         self.assertEqual(decoded.potential_profit, 220.0)
+        self.assertEqual(decoded.thumbnail_url, "https://example.com/thumb-1.jpg")
 
     def test_build_listing_stream_event_uses_metadata_fields(self) -> None:
         listing = {
@@ -50,6 +52,7 @@ class ListingStreamEventTests(unittest.TestCase):
             "price": 650,
             "potential_profit": 90,
             "url": "https://example.com/listing-2",
+            "thumbnail_url": "https://example.com/thumb-2.jpg",
         }
         metadata = {
             "route_name": "profile_1",
@@ -72,6 +75,7 @@ class ListingStreamEventTests(unittest.TestCase):
         self.assertEqual(event.route_name, "profile_1")
         self.assertEqual(event.query_shard_key, "QUERY_SHARD:def")
         self.assertEqual(event.source, "marketplace")
+        self.assertEqual(event.thumbnail_url, "https://example.com/thumb-2.jpg")
 
 
 class ListingStreamStateTests(unittest.TestCase):

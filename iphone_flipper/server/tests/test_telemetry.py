@@ -33,6 +33,9 @@ class TelemetryPayloadTests(unittest.TestCase):
                 "notification_delivery_latency_ms_count": 1,
                 "end_to_end_alert_latency_ms_sum": 120,
                 "end_to_end_alert_latency_ms_count": 1,
+                "enrichment_enqueue_latency_ms_sum": 14,
+                "enrichment_enqueue_latency_ms_count": 1,
+                "enrichment_enqueue_failure_count": 0,
             },
             outcome=CycleOutcome.OK,
             retry_count=1,
@@ -103,6 +106,9 @@ class TelemetryPayloadTests(unittest.TestCase):
         self.assertEqual(payload["notification_delivery_latency_ms_sum"], 11)
         self.assertEqual(payload["notification_delivery_latency_ms_count"], 1)
         self.assertEqual(payload["end_to_end_alert_latency_ms_count"], 1)
+        self.assertEqual(payload["enrichment_enqueue_latency_ms_sum"], 14)
+        self.assertEqual(payload["enrichment_enqueue_latency_ms_count"], 1)
+        self.assertEqual(payload["enrichment_enqueue_failure_count"], 0)
         self.assertEqual(payload["signal_action"], "throttle")
         self.assertEqual(payload["query_shard_key"], "iphone_15")
         self.assertEqual(payload["query_lock_key"], "query-lock:abc")

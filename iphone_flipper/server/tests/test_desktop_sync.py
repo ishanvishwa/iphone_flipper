@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import threading
 import unittest
 from pathlib import Path
@@ -155,7 +156,7 @@ class DesktopSyncEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.upsert_calls[0]["source"], "poll_sync")
         self.assertEqual(self.upsert_calls[0]["seq_ids"], [11, 12])
         self.assertEqual(self.upsert_calls[1]["source"], "websocket")
-        self.assertEqual(self.upsert_calls[1]["seq_ids"], [13])
+        self.assertEqual(self.upsert_calls[1]["seq_ids"], [12, 13])
         self.assertEqual(self.persisted_cursors, [12, 13])
         self.assertEqual(self.events[-1]["since_id"], 13)
 
@@ -279,3 +280,100 @@ class DesktopSyncHelpersTests(unittest.TestCase):
         self.assertEqual(tree.selected, ("row-9",))
         self.assertEqual(tree.focused, "row-9")
         self.assertEqual(tree.seen, "row-9")
+
+    def test_apply_server_listing_batch_accepts_same_cursor_enrichment_update(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "listings.db"
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                CREATE TABLE listings (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    price REAL,
+                    location TEXT,
+                    url TEXT,
+                    description TEXT,
+                    seller_name TEXT,
+                    model TEXT,
+                    condition TEXT,
+                    max_buy_price REAL,
+                    potential_profit REAL,
+                    status TEXT,
+                    thumbnail_url TEXT,
+                    created_at TEXT,
+                    updated_at TEXT
+                )
+                """
+            )
+            cursor.execute(
+                """
+                INSERT INTO listings (
+                    id, title, price, location, url, description, seller_name, model,
+                    condition, max_buy_price, potential_profit, status, thumbnail_url,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "listing-1",
+                    "iPhone 15 Pro",
+                    900.0,
+                    "Perth",
+                    "https://example.com/1",
+                    "",
+                    "",
+                    "iPhone 15 Pro",
+                    "used",
+                    800.0,
+                    100.0,
+                    "new",
+                    "",
+                    "2026-03-10T10:00:00",
+                    "2026-03-10T10:00:00",
+                ),
+            )
+            conn.commit()
+            conn.close()
+
+            result = desktop_sync.apply_server_listing_batch(
+                db_path,
+                [
+                    {
+                        "seq_id": 25,
+                        "id": "listing-1",
+                        "title": "iPhone 15 Pro",
+                        "price": 900.0,
+                        "location": "Perth",
+                        "url": "https://example.com/1",
+                        "description": "Battery 89%",
+                        "seller_name": "Seller A",
+                        "thumbnail_url": "https://example.com/thumb.jpg",
+                        "model": "iPhone 15 Pro",
+                        "condition": "used",
+                        "max_buy_price": 800.0,
+                        "potential_profit": 100.0,
+                        "status": "new",
+                        "created_at": "2026-03-10T10:00:00",
+                        "updated_at": "2026-03-10T10:05:00",
+                    }
+                ],
+                source="websocket",
+                min_seq_id_exclusive=25,
+            )
+
+            self.assertEqual(result.inserted, 0)
+            self.assertEqual(result.updated, 1)
+            self.assertEqual(result.max_seq_id, 25)
+
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT description, seller_name, thumbnail_url, updated_at FROM listings WHERE id = ?",
+                ("listing-1",),
+            ).fetchone()
+            conn.close()
+            self.assertEqual(row["description"], "Battery 89%")
+            self.assertEqual(row["seller_name"], "Seller A")
+            self.assertEqual(row["thumbnail_url"], "https://example.com/thumb.jpg")
+            self.assertEqual(row["updated_at"], "2026-03-10T10:05:00")

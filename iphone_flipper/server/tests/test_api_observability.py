@@ -57,6 +57,7 @@ class ApiObservabilityTests(unittest.IsolatedAsyncioTestCase):
             "url": "https://example.com/listing-1",
             "description": "",
             "seller_name": "",
+            "thumbnail_url": "https://example.com/thumb-1.jpg",
             "model": "iPhone 15",
             "condition": "used",
             "max_buy_price": 950,
@@ -101,6 +102,7 @@ class ApiObservabilityTests(unittest.IsolatedAsyncioTestCase):
             "url": "https://example.com/listing-2",
             "description": "",
             "seller_name": "",
+            "thumbnail_url": "https://example.com/thumb-2.jpg",
             "model": "iPhone 15 Pro",
             "condition": "used",
             "max_buy_price": 1260,
@@ -143,6 +145,7 @@ class ApiObservabilityTests(unittest.IsolatedAsyncioTestCase):
                 "url": "https://example.com/listing-2",
                 "description": "",
                 "seller_name": "",
+                "thumbnail_url": "https://example.com/thumb-2.jpg",
                 "model": "iPhone 15 Pro",
                 "condition": "used",
                 "max_buy_price": Decimal("1260.00"),
@@ -157,6 +160,7 @@ class ApiObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item["price"], 1200.5)
         self.assertEqual(item["max_buy_price"], 1260.0)
         self.assertEqual(item["potential_profit"], 140.25)
+        self.assertEqual(item["thumbnail_url"], "https://example.com/thumb-2.jpg")
         json.dumps(item)
 
     async def test_broadcast_skips_when_listing_row_is_missing(self) -> None:
