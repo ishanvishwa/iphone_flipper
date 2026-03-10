@@ -200,6 +200,19 @@ class NotificationSendPacerTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(sleep_mock.await_args.args[0], 0.8, places=3)
 
 
+class NotificationFormattingTests(unittest.TestCase):
+    def test_build_telegram_card_remains_text_only_without_thumbnail(self) -> None:
+        _, fields = _build_stream_event()
+        event = ListingStreamEvent.from_redis_fields(fields)
+
+        message = notification_worker._build_telegram_card(event)
+
+        self.assertIn("Potential Profit", message)
+        self.assertIn("Link:", message)
+        self.assertNotIn("thumb.jpg", message)
+        self.assertNotIn("Thumbnail", message)
+
+
 class NotificationConsumerTests(unittest.IsolatedAsyncioTestCase):
     async def test_ensure_consumer_group_ignores_busygroup(self) -> None:
         redis_client = _FakeRedis()

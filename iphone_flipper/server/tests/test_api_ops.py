@@ -46,6 +46,99 @@ class _FakeConn:
         return None
 
 
+class _RouteOpsConn:
+    def transaction(self) -> _FakeTransaction:
+        return _FakeTransaction()
+
+    async def fetch(self, query: str, *args):
+        normalized = " ".join(str(query).split())
+        if "FROM central_routes" in normalized:
+            return [
+                {
+                    "route_name": "route-hot",
+                    "legacy_worker_name": "worker_3",
+                    "legacy_route_name": "env_default",
+                    "is_enabled": True,
+                    "proxy_server": "",
+                    "proxy_username": None,
+                    "proxy_password": None,
+                    "proxy_mode": "fixed",
+                    "proxy_pool": None,
+                    "preferred_proxy_key": None,
+                    "preferred_proxy_updated_at": None,
+                    "priority": 10,
+                    "status": "ENABLED",
+                    "status_reason": None,
+                    "status_since": None,
+                    "next_run_at": None,
+                    "route_interval_seconds": 150,
+                    "avg_result_count": 3.0,
+                    "profitable_hit_rate": 0.4,
+                    "recent_duplicate_ratio": 0.1,
+                    "avg_page_load_ms": None,
+                    "successful_cycles": 5,
+                    "last_selected_at": None,
+                    "last_success_at": None,
+                    "consecutive_failures": 0,
+                    "cooldown_until": None,
+                    "lane_override": None,
+                    "computed_lane": "hot",
+                    "effective_lane": "hot",
+                    "priority_score": 6.2,
+                    "priority_score_updated_at": None,
+                    "last_error": None,
+                    "created_at": None,
+                    "updated_at": None,
+                }
+            ]
+        if "FROM route_queries" in normalized:
+            return [
+                {
+                    "route_name": "route-hot",
+                    "query_text": "iPhone 15 Pro",
+                    "query_order": 0,
+                    "is_enabled": True,
+                    "last_selected_at": None,
+                    "last_success_at": None,
+                    "avg_result_count": 4.0,
+                    "profitable_hit_rate": 0.5,
+                    "recent_duplicate_ratio": 0.0,
+                    "selection_count": 2,
+                    "last_error": None,
+                    "created_at": None,
+                    "updated_at": None,
+                }
+            ]
+        if "FROM execution_profiles" in normalized:
+            return [
+                {
+                    "user_data_dir": "/app/runtime/browser_profile_3",
+                    "worker_name": "worker_3",
+                    "is_enabled": True,
+                    "status": "READY",
+                    "status_reason": None,
+                    "status_since": None,
+                    "cooldown_until": None,
+                    "manual_login_required": False,
+                    "manual_login_reason": None,
+                    "manual_login_required_at": None,
+                    "quarantined_at": None,
+                    "quarantine_reason": None,
+                    "quarantine_evidence": None,
+                    "last_selected_at": None,
+                    "last_success_at": None,
+                    "consecutive_failures": 0,
+                    "last_error": None,
+                    "created_at": None,
+                    "updated_at": None,
+                }
+            ]
+        return []
+
+    async def fetchrow(self, query: str, *args):
+        return None
+
+
 class _FakePool:
     def __init__(self, conn: _FakeConn) -> None:
         self._conn = conn
@@ -197,6 +290,126 @@ class ApiOpsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["notification_consumer"]["drain_enabled"])
         self.assertEqual(payload["dead_letter_queue_size"], 2)
         self.assertEqual(payload["worker_event_publish_health"][0]["last_event_publish_status"], "ok")
+
+    async def test_get_worker_health_includes_effective_route_snapshot_fields(self) -> None:
+        api_main.app.state.db_pool = _FakePool(
+            _FakeConn(
+                rows=[
+                    {
+                        "worker_name": "worker_3",
+                        "route_name": "env_default",
+                        "status": "ok",
+                        "listings_saved": 0,
+                        "query_count": 1,
+                        "last_run_started_at": "2026-03-10T00:00:00+00:00",
+                        "last_run_finished_at": "2026-03-10T00:00:05+00:00",
+                        "route_source": "env",
+                        "route_user_data_dir": "/app/runtime/browser_profile_3",
+                        "route_search_queries": "iPhone",
+                        "route_proxy_mode": "fixed",
+                        "route_proxy_server": "",
+                        "route_proxy_username": "",
+                        "route_proxy_password": "",
+                        "route_proxy_pool": "",
+                        "last_error": None,
+                        "updated_at": "2026-03-10T00:00:05+00:00",
+                        "listings_scraped_last_minute": 12,
+                        "route_cooldown_until": None,
+                        "cooldown_remaining_seconds": 0,
+                        "leased_proxy_server": None,
+                        "leased_proxy_route": None,
+                        "leased_proxy_until": None,
+                        "lease_remaining_seconds": 0,
+                    }
+                ]
+            )
+        )
+
+        with patch.object(api_main, "API_TOKEN", "test-token"):
+            payload = await api_main.get_worker_health(x_api_token="test-token")
+
+        item = payload["items"][0]
+        self.assertEqual(item["route_source"], "env")
+        self.assertEqual(item["route_user_data_dir"], "/app/runtime/browser_profile_3")
+        self.assertEqual(item["route_search_queries"], "iPhone")
+        self.assertEqual(item["route_proxy_mode"], "fixed")
+
+    async def test_get_central_routes_returns_queries_and_search_csv(self) -> None:
+        api_main.app.state.db_pool = _FakePool(_RouteOpsConn())
+
+        with patch.object(api_main, "API_TOKEN", "test-token"):
+            payload = await api_main.get_central_routes(route_name=None, x_api_token="test-token")
+
+        self.assertEqual(payload["count"], 1)
+        item = payload["items"][0]
+        self.assertEqual(item["route_name"], "route-hot")
+        self.assertEqual(item["legacy_worker_name"], "worker_3")
+        self.assertEqual(item["queries"][0]["query_text"], "iPhone 15 Pro")
+        self.assertEqual(item["search_queries"], "iPhone 15 Pro")
+
+    async def test_get_execution_profiles_returns_profile_health_rows(self) -> None:
+        api_main.app.state.db_pool = _FakePool(_RouteOpsConn())
+
+        with patch.object(api_main, "API_TOKEN", "test-token"):
+            payload = await api_main.get_execution_profiles(worker_name=None, x_api_token="test-token")
+
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["items"][0]["worker_name"], "worker_3")
+        self.assertEqual(payload["items"][0]["user_data_dir"], "/app/runtime/browser_profile_3")
+
+    async def test_bootstrap_worker_routes_from_health_creates_missing_live_routes(self) -> None:
+        class _BootstrapConn:
+            def __init__(self) -> None:
+                self.insert_calls: list[tuple] = []
+
+            async def fetch(self, query: str, *_args):
+                if "FROM worker_heartbeats" in query:
+                    return [
+                        {
+                            "worker_name": "worker_3",
+                            "route_name": "env_default",
+                            "route_source": "env",
+                            "route_user_data_dir": "/app/runtime/browser_profile_3",
+                            "route_search_queries": "iPhone",
+                            "route_proxy_mode": "fixed",
+                            "route_proxy_server": None,
+                            "route_proxy_username": None,
+                            "route_proxy_password": None,
+                            "route_proxy_pool": None,
+                        }
+                    ]
+                return []
+
+            async def fetchval(self, query: str, worker_name: str):
+                if "FROM worker_routes" in query and worker_name == "worker_3":
+                    return None
+                return None
+
+            async def fetchrow(self, query: str, *args):
+                if "COALESCE(BTRIM(user_data_dir), '')" in query:
+                    return None
+                if "INSERT INTO worker_routes" in query:
+                    self.insert_calls.append(args)
+                    return {
+                        "worker_name": args[0],
+                        "route_name": args[1],
+                        "user_data_dir": args[7],
+                        "search_queries": args[8],
+                    }
+                return None
+
+        conn = _BootstrapConn()
+        api_main.app.state.db_pool = _FakePool(conn)
+
+        with patch.object(api_main, "API_TOKEN", "test-token"):
+            payload = await api_main.bootstrap_worker_routes_from_health(x_api_token="test-token")
+
+        self.assertEqual(payload["created_count"], 1)
+        self.assertEqual(payload["created"][0]["worker_name"], "worker_3")
+        self.assertEqual(payload["created"][0]["route_name"], "env_default")
+        self.assertEqual(conn.insert_calls[0][2], "")
+        self.assertEqual(conn.insert_calls[0][7], "/app/runtime/browser_profile_3")
+        self.assertEqual(conn.insert_calls[0][8], "iPhone")
 
     async def test_replay_notification_dead_letters_resets_failed_terminal_and_republishes(self) -> None:
         api_main.app.state.redis = _FakeRedis()

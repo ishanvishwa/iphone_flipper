@@ -177,6 +177,113 @@ BEFORE UPDATE ON worker_routes
 FOR EACH ROW
 EXECUTE FUNCTION set_updated_at_timestamp();
 
+CREATE TABLE IF NOT EXISTS central_routes (
+    route_name TEXT PRIMARY KEY,
+    legacy_worker_name TEXT,
+    legacy_route_name TEXT,
+    is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    proxy_server TEXT NOT NULL DEFAULT '',
+    proxy_username TEXT,
+    proxy_password TEXT,
+    proxy_mode TEXT NOT NULL DEFAULT 'fixed',
+    proxy_pool TEXT,
+    preferred_proxy_key TEXT,
+    preferred_proxy_updated_at TIMESTAMPTZ,
+    priority INTEGER NOT NULL DEFAULT 100,
+    status TEXT NOT NULL DEFAULT 'ENABLED',
+    status_reason TEXT,
+    status_since TIMESTAMPTZ,
+    next_run_at TIMESTAMPTZ,
+    route_interval_seconds INTEGER,
+    avg_result_count DOUBLE PRECISION,
+    profitable_hit_rate DOUBLE PRECISION,
+    recent_duplicate_ratio DOUBLE PRECISION,
+    avg_page_load_ms DOUBLE PRECISION,
+    successful_cycles INTEGER NOT NULL DEFAULT 0,
+    last_selected_at TIMESTAMPTZ,
+    last_success_at TIMESTAMPTZ,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    cooldown_until TIMESTAMPTZ,
+    lane_override TEXT,
+    computed_lane TEXT NOT NULL DEFAULT 'warm',
+    effective_lane TEXT NOT NULL DEFAULT 'warm',
+    priority_score DOUBLE PRECISION,
+    priority_score_updated_at TIMESTAMPTZ,
+    last_error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (legacy_worker_name, legacy_route_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_central_routes_schedule
+ON central_routes (is_enabled, status, cooldown_until, next_run_at, priority, route_name);
+CREATE INDEX IF NOT EXISTS idx_central_routes_status
+ON central_routes (is_enabled, status, effective_lane, priority_score DESC);
+
+DROP TRIGGER IF EXISTS trg_set_updated_at_central_routes ON central_routes;
+CREATE TRIGGER trg_set_updated_at_central_routes
+BEFORE UPDATE ON central_routes
+FOR EACH ROW
+EXECUTE FUNCTION set_updated_at_timestamp();
+
+CREATE TABLE IF NOT EXISTS route_queries (
+    id BIGSERIAL PRIMARY KEY,
+    route_name TEXT NOT NULL REFERENCES central_routes(route_name) ON DELETE CASCADE,
+    query_text TEXT NOT NULL,
+    query_order INTEGER NOT NULL DEFAULT 0,
+    is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    last_selected_at TIMESTAMPTZ,
+    last_success_at TIMESTAMPTZ,
+    avg_result_count DOUBLE PRECISION,
+    profitable_hit_rate DOUBLE PRECISION,
+    recent_duplicate_ratio DOUBLE PRECISION,
+    selection_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (route_name, query_text)
+);
+
+CREATE INDEX IF NOT EXISTS idx_route_queries_route_enabled
+ON route_queries (route_name, is_enabled, query_order);
+
+DROP TRIGGER IF EXISTS trg_set_updated_at_route_queries ON route_queries;
+CREATE TRIGGER trg_set_updated_at_route_queries
+BEFORE UPDATE ON route_queries
+FOR EACH ROW
+EXECUTE FUNCTION set_updated_at_timestamp();
+
+CREATE TABLE IF NOT EXISTS execution_profiles (
+    user_data_dir TEXT PRIMARY KEY,
+    worker_name TEXT NOT NULL,
+    is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    status TEXT NOT NULL DEFAULT 'READY',
+    status_reason TEXT,
+    status_since TIMESTAMPTZ,
+    cooldown_until TIMESTAMPTZ,
+    manual_login_required BOOLEAN NOT NULL DEFAULT FALSE,
+    manual_login_reason TEXT,
+    manual_login_required_at TIMESTAMPTZ,
+    quarantined_at TIMESTAMPTZ,
+    quarantine_reason TEXT,
+    quarantine_evidence JSONB,
+    last_selected_at TIMESTAMPTZ,
+    last_success_at TIMESTAMPTZ,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_execution_profiles_worker
+ON execution_profiles (worker_name, is_enabled, status, cooldown_until, last_selected_at);
+
+DROP TRIGGER IF EXISTS trg_set_updated_at_execution_profiles ON execution_profiles;
+CREATE TRIGGER trg_set_updated_at_execution_profiles
+BEFORE UPDATE ON execution_profiles
+FOR EACH ROW
+EXECUTE FUNCTION set_updated_at_timestamp();
+
 CREATE TABLE IF NOT EXISTS worker_heartbeats (
     worker_name TEXT PRIMARY KEY,
     route_name TEXT,
@@ -189,6 +296,14 @@ CREATE TABLE IF NOT EXISTS worker_heartbeats (
     last_event_publish_status TEXT,
     last_event_publish_error TEXT,
     last_stream_event_id TEXT,
+    route_source TEXT,
+    route_user_data_dir TEXT,
+    route_search_queries TEXT,
+    route_proxy_mode TEXT,
+    route_proxy_server TEXT,
+    route_proxy_username TEXT,
+    route_proxy_password TEXT,
+    route_proxy_pool TEXT,
     last_error TEXT,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -197,6 +312,14 @@ ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS last_event_publish_at TIM
 ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS last_event_publish_status TEXT;
 ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS last_event_publish_error TEXT;
 ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS last_stream_event_id TEXT;
+ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS route_source TEXT;
+ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS route_user_data_dir TEXT;
+ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS route_search_queries TEXT;
+ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS route_proxy_mode TEXT;
+ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS route_proxy_server TEXT;
+ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS route_proxy_username TEXT;
+ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS route_proxy_password TEXT;
+ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS route_proxy_pool TEXT;
 
 CREATE TABLE IF NOT EXISTS worker_scrape_events (
     id BIGSERIAL PRIMARY KEY,

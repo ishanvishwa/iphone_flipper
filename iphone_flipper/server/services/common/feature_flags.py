@@ -13,6 +13,7 @@ DEFAULT_FEATURE_FLAGS: dict[str, bool] = {
     "ENABLE_PRIORITY_SCHEDULER": False,
     "ENABLE_ROUTE_LANES": False,
     "ENABLE_BACKGROUND_ENRICHMENT": False,
+    "ENABLE_CENTRAL_ROUTE_DISPATCH": False,
 }
 
 _TRUE_VALUES = {"1", "true", "yes", "on", "enabled"}

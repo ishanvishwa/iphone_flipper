@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from server.services.worker.scheduler import (
     annotate_routes_with_priority,
     lane_interval_multiplier,
+    rank_route_query_records,
     rank_route_queries,
     select_next_route,
 )
@@ -112,6 +113,72 @@ class PrioritySchedulerTests(unittest.TestCase):
         )
 
         self.assertEqual(route["computed_lane"], "hot")
+
+    def test_prefer_non_hot_can_force_exploration_dispatch(self) -> None:
+        now = datetime(2026, 3, 10, 2, 0, tzinfo=timezone.utc)
+        routes = [
+            {
+                "route_name": "route_hot",
+                "priority": 5,
+                "next_run_at": now - timedelta(seconds=5),
+                "route_interval_seconds": 30,
+                "avg_result_count": 12.0,
+                "profitable_hit_rate": 0.5,
+                "recent_duplicate_ratio": 0.05,
+                "status": "ENABLED",
+                "consecutive_failures": 0,
+                "lane_override": "hot",
+            },
+            {
+                "route_name": "route_warm",
+                "priority": 50,
+                "next_run_at": now - timedelta(seconds=30),
+                "route_interval_seconds": 30,
+                "avg_result_count": 2.0,
+                "profitable_hit_rate": 0.05,
+                "recent_duplicate_ratio": 0.0,
+                "status": "ENABLED",
+                "consecutive_failures": 0,
+                "lane_override": "warm",
+            },
+        ]
+
+        annotate_routes_with_priority(routes, now=now, fallback_interval_seconds=30.0)
+        selected = select_next_route(
+            routes,
+            now=now,
+            use_priority_scheduler=True,
+            prefer_non_hot=True,
+        )
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["route_name"], "route_warm")
+
+    def test_rank_route_query_records_uses_query_metrics(self) -> None:
+        route = {"effective_lane": "warm"}
+        ranked = rank_route_query_records(
+            route,
+            [
+                {
+                    "query_text": "iPhone",
+                    "is_enabled": True,
+                    "avg_result_count": 1.0,
+                    "profitable_hit_rate": 0.0,
+                    "recent_duplicate_ratio": 0.8,
+                    "selection_count": 10,
+                },
+                {
+                    "query_text": "iPhone 15 Pro",
+                    "is_enabled": True,
+                    "avg_result_count": 4.0,
+                    "profitable_hit_rate": 0.4,
+                    "recent_duplicate_ratio": 0.0,
+                    "selection_count": 2,
+                },
+            ],
+        )
+
+        self.assertEqual(ranked[0]["query_text"], "iPhone 15 Pro")
 
 
 if __name__ == "__main__":

@@ -221,6 +221,7 @@ def select_next_route(
     *,
     use_priority_scheduler: bool = False,
     runtime_config: dict[str, Any] | None = None,
+    prefer_non_hot: bool = False,
 ) -> dict[str, Any] | None:
     if not routes:
         return None
@@ -249,6 +250,10 @@ def select_next_route(
         )
     if not due_routes:
         return None
+    if prefer_non_hot:
+        non_hot_due_routes = [item for item in due_routes if item[0] > _LANE_RANK["hot"]]
+        if non_hot_due_routes:
+            due_routes = non_hot_due_routes
     due_routes.sort(key=lambda item: (item[0], item[1], item[2], item[3], item[4]))
     return due_routes[0][5]
 
@@ -277,6 +282,48 @@ def rank_route_queries(route: dict[str, Any], queries: list[str]) -> list[str]:
     return [item[2] for item in ranked]
 
 
+def rank_route_query_records(route: dict[str, Any], query_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized_lane = normalize_route_lane(route.get("effective_lane"), allow_none=False)
+    ranked: list[tuple[float, int, str, dict[str, Any]]] = []
+    seen: set[str] = set()
+
+    for index, row in enumerate(query_rows):
+        if not bool(row.get("is_enabled", True)):
+            continue
+        query = str(row.get("query_text") or "").strip()
+        if not query:
+            continue
+        query_identity = query.lower()
+        if query_identity in seen:
+            continue
+        seen.add(query_identity)
+
+        category = _query_category(query)
+        category_score = _query_category_score(normalized_lane, category)
+        specificity_bonus = min(1.0, len(query.split()) * 0.15)
+        avg_result_count = max(0.0, _safe_float(row.get("avg_result_count")))
+        profitable_hit_rate = _clamp(_safe_float(row.get("profitable_hit_rate")), 0.0, 1.0)
+        duplicate_ratio = _clamp(_safe_float(row.get("recent_duplicate_ratio")), 0.0, 1.0)
+        selection_count = max(0.0, _safe_float(row.get("selection_count")))
+
+        yield_boost = min(1.5, avg_result_count / 8.0)
+        profit_boost = profitable_hit_rate * 1.75
+        freshness_boost = min(0.45, 1.0 / max(1.0, selection_count))
+        duplicate_penalty = duplicate_ratio * (1.0 if category == "broad" else 0.4)
+
+        ranked.append(
+            (
+                category_score + specificity_bonus + yield_boost + profit_boost + freshness_boost - duplicate_penalty,
+                index,
+                query,
+                row,
+            )
+        )
+
+    ranked.sort(key=lambda item: (-item[0], item[1], item[2]))
+    return [item[3] for item in ranked]
+
+
 async def schedule_route_next_run_at(
     pool: asyncpg.Pool,
     route: dict[str, Any],
@@ -285,7 +332,8 @@ async def schedule_route_next_run_at(
     jitter_pct: float,
     rng: Any = random,
 ) -> datetime | None:
-    if route.get("source") != "db":
+    route_source = str(route.get("source") or "").strip().lower()
+    if route_source not in {"db", "central"}:
         return None
 
     next_run_at = compute_next_run_at(
@@ -296,16 +344,28 @@ async def schedule_route_next_run_at(
     )
 
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            UPDATE worker_routes
-            SET next_run_at = $3
-            WHERE worker_name = $1 AND route_name = $2
-            RETURNING next_run_at
-            """,
-            route.get("worker_name"),
-            route.get("route_name"),
-            next_run_at,
-        )
+        if route_source == "central":
+            row = await conn.fetchrow(
+                """
+                UPDATE central_routes
+                SET next_run_at = $2
+                WHERE route_name = $1
+                RETURNING next_run_at
+                """,
+                route.get("route_name"),
+                next_run_at,
+            )
+        else:
+            row = await conn.fetchrow(
+                """
+                UPDATE worker_routes
+                SET next_run_at = $3
+                WHERE worker_name = $1 AND route_name = $2
+                RETURNING next_run_at
+                """,
+                route.get("worker_name"),
+                route.get("route_name"),
+                next_run_at,
+            )
 
     return row["next_run_at"] if row else None

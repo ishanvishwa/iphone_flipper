@@ -695,7 +695,7 @@ Condition accuracy is a critical decision parameter and currently constrained by
   - [x] price
   - [x] projected profit
   - [x] URL
-  - [x] optional thumbnail preview link when present
+  - [x] text-only Telegram formatting with no thumbnail/media dependency
 - [x] Added Phase 5 observability:
   - [x] `listing_enrichment_enqueued`
   - [x] `listing_enrichment_started`
@@ -760,10 +760,54 @@ Condition accuracy is a critical decision parameter and currently constrained by
 
 - [x] Phase 5: hot-path payload slimming and background enrichment for non-critical fields
 - [x] Phase 6: reliability/replay/operator controls (health endpoints, backlog visibility, replay tooling, live push rollback switches)
+- [x] Phase 4 alignment addendum: central route ownership, execution-profile-gated workers, exploration reserve, and text-only Telegram notifications
+
+### Phase 4 Alignment Addendum Completed (This Update)
+
+- [x] Added central scheduler ownership model:
+  - [x] authoritative `central_routes`
+  - [x] canonical `route_queries`
+  - [x] local `execution_profiles`
+  - [x] rollout gate `ENABLE_CENTRAL_ROUTE_DISPATCH`
+- [x] Migrated worker-owned scheduler state into the central model:
+  - [x] worker routes backfill into globally unique central routes
+  - [x] CSV query shards backfill into canonical query rows
+  - [x] legacy origin retained as `legacy_worker_name` / `legacy_route_name`
+  - [x] execution profiles backfilled from route config and live worker heartbeat snapshots
+- [x] Replaced worker-owned dispatch with profile-gated central dispatch when enabled:
+  - [x] workers lease one eligible local execution profile first
+  - [x] scheduler selects the best due central route globally
+  - [x] route query ranking uses canonical `route_queries`
+  - [x] Redis per-query locking remains the duplicate-prevention guard
+- [x] Added explicit anti-starvation:
+  - [x] runtime-configured exploration reserve `CENTRAL_ROUTE_EXPLORATION_EVERY_N`
+  - [x] every Nth eligible dispatch prefers due non-hot work when available
+  - [x] hot work still falls back normally when no due non-hot route exists
+- [x] Switched operator surfaces to central-route management:
+  - [x] new central route APIs: `GET/PUT/DELETE /routes`, `PUT /routes/{route_name}/queries`
+  - [x] execution-profile visibility: `GET /execution-profiles`
+  - [x] GUI VPS Scrapers now treats workers as health/capacity views and routes as the editable scheduler objects
+  - [x] GUI query manager now edits canonical central-route query sets instead of worker-owned query shards
+- [x] Preserved legacy worker-route APIs only as migration/audit helpers; they are no longer the primary write path
+- [x] Kept Telegram notifications text-only:
+  - [x] thumbnail line removed from notification builders
+  - [x] web-page previews disabled
+  - [x] `thumbnail_url` remains stored/synced for listings but does not affect alert formatting or latency
+- [x] Added targeted regression coverage for:
+  - [x] central route API serialization
+  - [x] execution-profile API visibility
+  - [x] central-route GUI query saving
+  - [x] exploration reserve (`prefer_non_hot`) behavior
+  - [x] text-only Telegram formatting
+- [x] Local validation completed:
+  - [x] full server regression suite now passes with `153 passed`
+  - [x] Python compile sanity passed for the modified worker/API/GUI modules
+- [ ] VPS rollout of `ENABLE_CENTRAL_ROUTE_DISPATCH`
+  - pending in this pass; production remains on the pre-alignment ownership model until the new flag is deployed and enabled
 
 ### Upgrade-Track Notes
 
-- Current baseline after Phase 6 rollout: Postgres remains authoritative, Redis pub/sub fanout stays active as the API trigger for normalized WebSocket fanout, Redis Streams publishing remains enabled, notification delivery remains on the dedicated notification consumer, priority scheduling / route lanes remain enabled, cold-field enrichment remains on its own Redis Streams consumer, and operators now have authenticated API control over flags/runtime thresholds plus dead-letter/replay and backlog inspection.
+- Current baseline after the Phase 4 alignment addendum + Phase 6 rollout: Postgres remains authoritative, Redis pub/sub fanout stays active as the API trigger for normalized WebSocket fanout, Redis Streams publishing remains enabled, notification delivery remains on the dedicated notification consumer, central route dispatch is enabled, workers are execution-profile-gated executors, priority scheduling / route lanes remain enabled, cold-field enrichment remains on its own Redis Streams consumer, and operators now have authenticated API control over flags/runtime thresholds plus dead-letter/replay and backlog inspection.
 - VPS rollout state on 2026-03-10:
   - `ENABLE_REDIS_STREAM_EVENTS=1`
   - `ENABLE_NOTIFICATION_CONSUMER=1`
@@ -817,7 +861,7 @@ Condition accuracy is a critical decision parameter and currently constrained by
   - confirmed live `listing_enrichment_enqueued` / `listing_enrichment_completed` JSON events in worker + enrichment-worker logs
   - verified later cold-field updates still reach API/WebSocket clients through pub/sub-triggered `listing_updated`
   - compared worker CPU/memory and scrape-cycle duration before/after enable; worker resource usage stayed flat while enrichment work moved onto `enrichment_worker`
-  - confirmed alert payloads remained decision-ready with title, price, projected profit, URL, and optional thumbnail preview metadata
+  - confirmed alert payloads remained decision-ready with title, price, projected profit, and URL while remaining text-only
 - Acceptance criteria now expected to hold together after Phase 1 + Phase 2:
   - newly persisted listings generate exactly one stream event in the happy path
   - consumer restart does not lose unread events
@@ -838,6 +882,15 @@ Condition accuracy is a critical decision parameter and currently constrained by
   - notification service can be restarted without data loss
   - backlog and consumer lag can be measured and inspected
   - the new realtime subsystems can be disabled or tuned through authenticated Redis-backed operator controls without manual Redis access
+- Acceptance criteria implemented and locally verified after the Phase 4 alignment addendum:
+  - route/query/worker ownership is centrally managed rather than worker-partitioned
+  - workers execute the best eligible central route/query available to a safe local execution profile
+  - exploration reserve prevents hot work from fully starving due non-hot work
+  - Telegram notifications remain text-only and do not wait on thumbnail/enrichment readiness
+- Optional later-phase audit status:
+  - Optional B (`Separate enrichment workers`) audited on `2026-03-10` and confirmed already satisfied by the shipped Phase 5/6 enrichment design
+  - no additional runtime, schema, or deploy changes were required beyond the existing `stream:listing_enrichment` queue and dedicated `enrichment_worker` service
+  - focused validation reconfirmed enqueue-only worker behavior, separate consumer-group processing, and same-row late cold-field merge semantics
 
 ---
 

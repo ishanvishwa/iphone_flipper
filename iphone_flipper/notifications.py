@@ -142,7 +142,6 @@ def build_telegram_listing_card(listing: dict) -> str:
     profit = _fmt_money(listing.get("potential_profit"))
     description = escape(_short_text(str(listing.get("description") or "")))
     url = str(listing.get("url") or "").strip()
-    thumbnail_url = str(listing.get("thumbnail_url") or "").strip()
 
     lines = [
         "📱 <b>New Listing</b>",
@@ -153,9 +152,6 @@ def build_telegram_listing_card(listing: dict) -> str:
         f"Potential Profit: {profit}",
         f"Description: {description}",
     ]
-    if thumbnail_url:
-        safe_thumbnail = escape(thumbnail_url, quote=True)
-        lines.append(f"Thumbnail: <a href=\"{safe_thumbnail}\">Preview</a>")
     if url:
         safe_url = escape(url, quote=True)
         lines.append(f"Link: <a href=\"{safe_url}\">Open Listing</a>")
@@ -168,7 +164,7 @@ def notify_telegram_listing_card(listing: dict) -> bool:
     return send_telegram(
         message,
         parse_mode="HTML",
-        disable_web_page_preview=False,
+        disable_web_page_preview=True,
     )
 
 

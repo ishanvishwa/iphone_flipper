@@ -102,6 +102,7 @@ from server.services.worker.scheduler import (  # noqa: E402
     annotate_routes_with_priority as annotate_routes_with_priority_from_module,
     lane_interval_multiplier as lane_interval_multiplier_from_module,
     normalize_route_lane as normalize_route_lane_from_module,
+    rank_route_query_records as rank_route_query_records_from_module,
     rank_route_queries as rank_route_queries_from_module,
     route_interval_seconds as route_interval_seconds_from_module,
     schedule_route_next_run_at as schedule_route_next_run_at_from_module,
@@ -369,6 +370,7 @@ _MANUAL_LOGIN_ALERT_LAST_SENT_AT: dict[str, datetime] = {}
 _ROUTE_CONSECUTIVE_BAD_CYCLES: dict[str, int] = {}
 _ROUTE_SESSION_QUERY_COUNTS: dict[str, int] = {}
 _SINGLE_ROUTE_ENFORCEMENT_ACTIVE = False
+_CENTRAL_ROUTE_DISPATCH_COUNT = 0
 
 # Dolphin Profile failures tracking is now backed by `proxy_stats` in PostgreSQL
 DOLPHIN_PROFILE_BLACKLIST_AFTER = 2   # blacklist after N consecutive failures
@@ -1274,6 +1276,584 @@ async def _load_worker_routes(pool: asyncpg.Pool) -> list[dict[str, Any]]:
     return routes
 
 
+def _normalize_execution_profile_status(raw: str | None) -> str:
+    value = str(raw or "").strip().upper()
+    allowed = {"READY", "DEGRADED", "THROTTLED", "COOLDOWN", "NEEDS_LOGIN", "DISABLED"}
+    if value in allowed:
+        return value
+    return "READY"
+
+
+async def _load_central_routes(pool: asyncpg.Pool) -> list[dict[str, Any]]:
+    query = """
+        SELECT
+            r.route_name,
+            r.legacy_worker_name,
+            r.legacy_route_name,
+            r.is_enabled,
+            r.proxy_server,
+            r.proxy_username,
+            r.proxy_password,
+            r.proxy_mode,
+            r.proxy_pool,
+            r.preferred_proxy_key,
+            r.preferred_proxy_updated_at,
+            r.priority,
+            r.status,
+            r.status_reason,
+            r.status_since,
+            r.next_run_at,
+            r.route_interval_seconds,
+            r.avg_result_count,
+            r.profitable_hit_rate,
+            r.recent_duplicate_ratio,
+            r.avg_page_load_ms,
+            r.successful_cycles,
+            r.last_selected_at,
+            r.last_success_at,
+            r.consecutive_failures,
+            r.cooldown_until,
+            r.lane_override,
+            r.computed_lane,
+            r.effective_lane,
+            r.priority_score,
+            r.priority_score_updated_at,
+            r.last_error,
+            q.query_text,
+            q.query_order,
+            q.is_enabled AS query_enabled,
+            q.last_selected_at AS query_last_selected_at,
+            q.last_success_at AS query_last_success_at,
+            q.avg_result_count AS query_avg_result_count,
+            q.profitable_hit_rate AS query_profitable_hit_rate,
+            q.recent_duplicate_ratio AS query_recent_duplicate_ratio,
+            q.selection_count AS query_selection_count,
+            q.last_error AS query_last_error
+        FROM central_routes r
+        LEFT JOIN route_queries q
+               ON q.route_name = r.route_name
+        WHERE r.is_enabled = TRUE
+          AND COALESCE(r.status, 'ENABLED') IN ('ENABLED', 'DEGRADED', 'THROTTLED')
+          AND (r.cooldown_until IS NULL OR r.cooldown_until <= NOW())
+        ORDER BY r.priority ASC, r.route_name ASC, q.query_order ASC, q.query_text ASC
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(query)
+
+    routes_by_name: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        route_name = str(row["route_name"] or "").strip()
+        if not route_name:
+            continue
+        route = routes_by_name.get(route_name)
+        if route is None:
+            route = {
+                "worker_name": None,
+                "route_name": route_name,
+                "legacy_worker_name": str(row["legacy_worker_name"] or "").strip() or None,
+                "legacy_route_name": str(row["legacy_route_name"] or "").strip() or None,
+                "is_enabled": bool(row["is_enabled"]),
+                "proxy_server": str(row["proxy_server"] or "").strip(),
+                "proxy_username": str(row["proxy_username"] or "").strip() or None,
+                "proxy_password": str(row["proxy_password"] or "").strip() or None,
+                "proxy_mode": _normalize_proxy_mode(str(row["proxy_mode"] or "fixed")),
+                "proxy_pool": str(row["proxy_pool"] or "").strip() or None,
+                "preferred_proxy_key": str(row["preferred_proxy_key"] or "").strip() or None,
+                "preferred_proxy_updated_at": row["preferred_proxy_updated_at"],
+                "search_queries": None,
+                "priority": int(row["priority"] or 100),
+                "status": _normalize_route_status(str(row["status"] or RouteStatus.ENABLED.value)),
+                "status_reason": str(row["status_reason"] or "").strip() or None,
+                "status_since": row["status_since"],
+                "next_run_at": row["next_run_at"],
+                "route_interval_seconds": int(row["route_interval_seconds"] or 0) or None,
+                "avg_result_count": float(row["avg_result_count"]) if row["avg_result_count"] is not None else None,
+                "profitable_hit_rate": float(row["profitable_hit_rate"]) if row["profitable_hit_rate"] is not None else 0.0,
+                "recent_duplicate_ratio": float(row["recent_duplicate_ratio"]) if row["recent_duplicate_ratio"] is not None else 0.0,
+                "avg_page_load_ms": float(row["avg_page_load_ms"]) if row["avg_page_load_ms"] is not None else None,
+                "successful_cycles": int(row["successful_cycles"] or 0),
+                "consecutive_failures": int(row["consecutive_failures"] or 0),
+                "cooldown_until": row["cooldown_until"],
+                "lane_override": _normalize_route_lane(row["lane_override"]),
+                "computed_lane": _normalize_route_lane(row["computed_lane"], allow_none=False),
+                "effective_lane": _normalize_route_lane(row["effective_lane"], allow_none=False),
+                "priority_score": float(row["priority_score"]) if row["priority_score"] is not None else None,
+                "priority_score_updated_at": row["priority_score_updated_at"],
+                "last_selected_at": row["last_selected_at"],
+                "last_success_at": row["last_success_at"],
+                "last_error": str(row["last_error"] or "").strip() or None,
+                "query_rows": [],
+                "source": "central",
+            }
+            routes_by_name[route_name] = route
+        query_text = str(row["query_text"] or "").strip()
+        if query_text:
+            route["query_rows"].append(
+                {
+                    "route_name": route_name,
+                    "query_text": query_text,
+                    "query_order": int(row["query_order"] or 0),
+                    "is_enabled": bool(row["query_enabled"]),
+                    "last_selected_at": row["query_last_selected_at"],
+                    "last_success_at": row["query_last_success_at"],
+                    "avg_result_count": float(row["query_avg_result_count"]) if row["query_avg_result_count"] is not None else None,
+                    "profitable_hit_rate": float(row["query_profitable_hit_rate"]) if row["query_profitable_hit_rate"] is not None else 0.0,
+                    "recent_duplicate_ratio": float(row["query_recent_duplicate_ratio"]) if row["query_recent_duplicate_ratio"] is not None else 0.0,
+                    "selection_count": int(row["query_selection_count"] or 0),
+                    "last_error": str(row["query_last_error"] or "").strip() or None,
+                }
+            )
+
+    routes = list(routes_by_name.values())
+    for route in routes:
+        enabled_queries = [
+            str(item.get("query_text") or "").strip()
+            for item in route.get("query_rows") or []
+            if bool(item.get("is_enabled", True)) and str(item.get("query_text") or "").strip()
+        ]
+        route["search_queries"] = ", ".join(enabled_queries) if enabled_queries else "BUCKETS"
+    return routes
+
+
+async def _has_configured_central_routes(pool: asyncpg.Pool) -> bool:
+    async with pool.acquire() as conn:
+        row = await conn.fetchval(
+            """
+            SELECT 1
+            FROM central_routes
+            WHERE is_enabled = TRUE
+            LIMIT 1
+            """
+        )
+    return bool(row)
+
+
+async def _count_enabled_central_routes(pool: asyncpg.Pool) -> int:
+    async with pool.acquire() as conn:
+        count = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM central_routes
+            WHERE is_enabled = TRUE
+              AND COALESCE(status, 'ENABLED') <> 'DISABLED'
+            """
+        )
+    return int(count or 0)
+
+
+async def _release_expired_central_route_cooldowns(pool: asyncpg.Pool) -> int:
+    async with pool.acquire() as conn:
+        status = await conn.execute(
+            """
+            UPDATE central_routes
+            SET
+                cooldown_until = NULL,
+                status = $1,
+                status_reason = NULL,
+                status_since = NOW()
+            WHERE is_enabled = TRUE
+              AND status = $2
+              AND cooldown_until IS NOT NULL
+              AND cooldown_until <= NOW()
+            """,
+            RouteStatus.ENABLED.value,
+            RouteStatus.COOLDOWN.value,
+        )
+    try:
+        return int(str(status or "").split()[-1])
+    except (TypeError, ValueError, IndexError):
+        return 0
+
+
+async def _load_execution_profiles(pool: asyncpg.Pool) -> list[dict[str, Any]]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                user_data_dir,
+                worker_name,
+                is_enabled,
+                status,
+                status_reason,
+                status_since,
+                cooldown_until,
+                manual_login_required,
+                manual_login_reason,
+                manual_login_required_at,
+                quarantined_at,
+                quarantine_reason,
+                quarantine_evidence,
+                last_selected_at,
+                last_success_at,
+                consecutive_failures,
+                last_error
+            FROM execution_profiles
+            WHERE worker_name = $1
+              AND is_enabled = TRUE
+              AND COALESCE(status, 'READY') IN ('READY', 'DEGRADED', 'THROTTLED')
+              AND COALESCE(manual_login_required, FALSE) = FALSE
+              AND (cooldown_until IS NULL OR cooldown_until <= NOW())
+            ORDER BY last_selected_at ASC NULLS FIRST, user_data_dir ASC
+            """,
+            WORKER_NAME,
+        )
+    return [
+        {
+            "user_data_dir": str(row["user_data_dir"] or "").strip(),
+            "worker_name": str(row["worker_name"] or "").strip(),
+            "is_enabled": bool(row["is_enabled"]),
+            "status": _normalize_execution_profile_status(str(row["status"] or "READY")),
+            "status_reason": str(row["status_reason"] or "").strip() or None,
+            "status_since": row["status_since"],
+            "cooldown_until": row["cooldown_until"],
+            "manual_login_required": bool(row["manual_login_required"]),
+            "manual_login_reason": str(row["manual_login_reason"] or "").strip() or None,
+            "manual_login_required_at": row["manual_login_required_at"],
+            "quarantined_at": row["quarantined_at"],
+            "quarantine_reason": str(row["quarantine_reason"] or "").strip() or None,
+            "quarantine_evidence": row["quarantine_evidence"],
+            "last_selected_at": row["last_selected_at"],
+            "last_success_at": row["last_success_at"],
+            "consecutive_failures": int(row["consecutive_failures"] or 0),
+            "last_error": str(row["last_error"] or "").strip() or None,
+        }
+        for row in rows
+        if str(row["user_data_dir"] or "").strip()
+    ]
+
+
+async def _has_execution_profiles(pool: asyncpg.Pool) -> bool:
+    async with pool.acquire() as conn:
+        row = await conn.fetchval(
+            """
+            SELECT 1
+            FROM execution_profiles
+            WHERE worker_name = $1
+              AND is_enabled = TRUE
+            LIMIT 1
+            """,
+            WORKER_NAME,
+        )
+    return bool(row)
+
+
+async def _count_manual_login_required_execution_profiles(pool: asyncpg.Pool) -> int:
+    async with pool.acquire() as conn:
+        count = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM execution_profiles
+            WHERE worker_name = $1
+              AND is_enabled = TRUE
+              AND COALESCE(manual_login_required, FALSE) = TRUE
+            """,
+            WORKER_NAME,
+        )
+    return int(count or 0)
+
+
+async def _seconds_until_next_execution_profile_cooldown_release(pool: asyncpg.Pool) -> float | None:
+    async with pool.acquire() as conn:
+        seconds = await conn.fetchval(
+            """
+            SELECT EXTRACT(EPOCH FROM (MIN(cooldown_until) - NOW()))
+            FROM execution_profiles
+            WHERE worker_name = $1
+              AND is_enabled = TRUE
+              AND cooldown_until > NOW()
+            """,
+            WORKER_NAME,
+        )
+    if seconds is None:
+        return None
+    try:
+        return max(0.0, float(seconds))
+    except (TypeError, ValueError):
+        return None
+
+
+async def _release_expired_execution_profile_cooldowns(pool: asyncpg.Pool) -> int:
+    async with pool.acquire() as conn:
+        status = await conn.execute(
+            """
+            UPDATE execution_profiles
+            SET
+                cooldown_until = NULL,
+                status = 'READY',
+                status_reason = NULL,
+                status_since = NOW()
+            WHERE worker_name = $1
+              AND is_enabled = TRUE
+              AND status = 'COOLDOWN'
+              AND COALESCE(manual_login_required, FALSE) = FALSE
+              AND cooldown_until IS NOT NULL
+              AND cooldown_until <= NOW()
+            """,
+            WORKER_NAME,
+        )
+    try:
+        return int(str(status or "").split()[-1])
+    except (TypeError, ValueError, IndexError):
+        return 0
+
+
+def _select_execution_profile(profiles: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not profiles:
+        return None
+    return min(
+        profiles,
+        key=lambda item: (
+            item.get("last_selected_at") is not None,
+            item.get("last_selected_at") or datetime.min.replace(tzinfo=timezone.utc),
+            str(item.get("user_data_dir") or ""),
+        ),
+    )
+
+
+async def _mark_execution_profile_selected(pool: asyncpg.Pool, profile: dict[str, Any]) -> None:
+    user_data_dir = str(profile.get("user_data_dir") or "").strip()
+    if not user_data_dir:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE execution_profiles
+            SET last_selected_at = NOW()
+            WHERE user_data_dir = $1
+            """,
+            user_data_dir,
+        )
+    profile["last_selected_at"] = datetime.now(timezone.utc)
+
+
+async def _record_execution_profile_outcome(
+    pool: asyncpg.Pool,
+    profile: dict[str, Any],
+    *,
+    success: bool,
+    error: str = "",
+    count_failure: bool = True,
+) -> int:
+    user_data_dir = str(profile.get("user_data_dir") or "").strip()
+    if not user_data_dir:
+        return 0
+    async with pool.acquire() as conn:
+        if success:
+            row = await conn.fetchrow(
+                """
+                UPDATE execution_profiles
+                SET
+                    status = 'READY',
+                    status_reason = NULL,
+                    status_since = NOW(),
+                    last_success_at = NOW(),
+                    last_error = NULL,
+                    consecutive_failures = 0
+                WHERE user_data_dir = $1
+                RETURNING consecutive_failures, last_success_at
+                """,
+                user_data_dir,
+            )
+            profile["status"] = "READY"
+            profile["status_reason"] = None
+            profile["last_error"] = None
+            profile["consecutive_failures"] = 0
+            if row:
+                profile["last_success_at"] = row["last_success_at"]
+            return 0
+
+        error_text = error[:2000] if error else "unknown error"
+        if count_failure:
+            row = await conn.fetchrow(
+                """
+                UPDATE execution_profiles
+                SET
+                    last_error = $2,
+                    consecutive_failures = GREATEST(0, COALESCE(consecutive_failures, 0)) + 1
+                WHERE user_data_dir = $1
+                RETURNING consecutive_failures
+                """,
+                user_data_dir,
+                error_text,
+            )
+            count = int(row["consecutive_failures"] or 0) if row else 0
+            profile["last_error"] = error_text
+            profile["consecutive_failures"] = count
+            return count
+
+        await conn.execute(
+            """
+            UPDATE execution_profiles
+            SET
+                last_error = $2
+            WHERE user_data_dir = $1
+            """,
+            user_data_dir,
+            error_text,
+        )
+    profile["last_error"] = error_text
+    return int(profile.get("consecutive_failures") or 0)
+
+
+async def _put_execution_profile_on_cooldown(
+    pool: asyncpg.Pool,
+    profile: dict[str, Any],
+    *,
+    reason: str,
+    cooldown_seconds: int,
+) -> datetime | None:
+    user_data_dir = str(profile.get("user_data_dir") or "").strip()
+    if not user_data_dir:
+        return None
+    safe_seconds = max(60, int(cooldown_seconds))
+    reason_text = (reason or "").strip()[:2000] or "profile put on cooldown"
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE execution_profiles
+            SET
+                cooldown_until = NOW() + ($2::INT * INTERVAL '1 second'),
+                status = 'COOLDOWN',
+                status_reason = $3,
+                status_since = NOW(),
+                last_error = $3,
+                consecutive_failures = 0
+            WHERE user_data_dir = $1
+            RETURNING cooldown_until
+            """,
+            user_data_dir,
+            safe_seconds,
+            reason_text,
+        )
+    if row:
+        profile["status"] = "COOLDOWN"
+        profile["status_reason"] = reason_text
+        profile["consecutive_failures"] = 0
+        profile["cooldown_until"] = row["cooldown_until"]
+        return row["cooldown_until"]
+    return None
+
+
+async def _mark_execution_profile_manual_login_required(
+    pool: asyncpg.Pool,
+    profile: dict[str, Any],
+    *,
+    reason: str,
+    evidence: dict[str, Any] | None = None,
+) -> datetime | None:
+    user_data_dir = str(profile.get("user_data_dir") or "").strip()
+    if not user_data_dir:
+        return None
+    reason_text = (reason or "").strip()[:2000] or "Manual login required."
+    evidence_payload: str | None = None
+    if evidence:
+        try:
+            evidence_payload = json.dumps(evidence, default=str)
+        except Exception:
+            evidence_payload = None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE execution_profiles
+            SET
+                status = 'NEEDS_LOGIN',
+                status_reason = $2,
+                status_since = NOW(),
+                manual_login_required = TRUE,
+                manual_login_reason = $2,
+                manual_login_required_at = NOW(),
+                quarantined_at = NOW(),
+                quarantine_reason = $2,
+                quarantine_evidence = COALESCE($3::JSONB, quarantine_evidence),
+                cooldown_until = NULL,
+                consecutive_failures = 0,
+                last_error = $2
+            WHERE user_data_dir = $1
+            RETURNING manual_login_required_at
+            """,
+            user_data_dir,
+            reason_text,
+            evidence_payload,
+        )
+    if row:
+        profile["status"] = "NEEDS_LOGIN"
+        profile["status_reason"] = reason_text
+        profile["manual_login_required"] = True
+        profile["manual_login_reason"] = reason_text
+        profile["last_error"] = reason_text
+        profile["consecutive_failures"] = 0
+        return row["manual_login_required_at"]
+    return None
+
+
+async def _record_selected_query_outcome(
+    pool: asyncpg.Pool,
+    route: dict[str, Any],
+    *,
+    selected_query: str | None,
+    success: bool,
+    metrics: dict[str, int],
+    error: str = "",
+) -> None:
+    if str(route.get("source") or "").strip().lower() != "central":
+        return
+    route_name = str(route.get("route_name") or "").strip()
+    query_text = str(selected_query or "").strip()
+    if not route_name:
+        return
+    target_query = query_text or "BUCKETS"
+    listings_saved = max(0, int(metrics.get("listings_saved", 0) or 0))
+    profitable_count = max(0, int(metrics.get("profitable_listing_count", 0) or 0))
+    duplicate_count = max(0, int(metrics.get("duplicate_listing_count", 0) or 0))
+    profitable_ratio = min(1.0, profitable_count / float(listings_saved)) if listings_saved > 0 else 0.0
+    duplicate_ratio = min(1.0, duplicate_count / float(listings_saved)) if listings_saved > 0 else 0.0
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE route_queries
+            SET
+                last_selected_at = NOW(),
+                last_success_at = CASE WHEN $3::BOOLEAN THEN NOW() ELSE last_success_at END,
+                avg_result_count = CASE
+                    WHEN avg_result_count IS NULL THEN $4::DOUBLE PRECISION
+                    ELSE ($7::DOUBLE PRECISION * $4::DOUBLE PRECISION)
+                       + ((1 - $7::DOUBLE PRECISION) * avg_result_count)
+                END,
+                profitable_hit_rate = CASE
+                    WHEN profitable_hit_rate IS NULL THEN $5::DOUBLE PRECISION
+                    ELSE ($7::DOUBLE PRECISION * $5::DOUBLE PRECISION)
+                       + ((1 - $7::DOUBLE PRECISION) * profitable_hit_rate)
+                END,
+                recent_duplicate_ratio = CASE
+                    WHEN recent_duplicate_ratio IS NULL THEN $6::DOUBLE PRECISION
+                    ELSE ($7::DOUBLE PRECISION * $6::DOUBLE PRECISION)
+                       + ((1 - $7::DOUBLE PRECISION) * recent_duplicate_ratio)
+                END,
+                selection_count = GREATEST(0, COALESCE(selection_count, 0)) + 1,
+                last_error = CASE WHEN $3::BOOLEAN THEN NULL ELSE $8 END
+            WHERE route_name = $1
+              AND query_text = $2
+            """,
+            route_name,
+            target_query,
+            bool(success),
+            float(metrics.get("listings_scraped", 0) or 0),
+            float(profitable_ratio),
+            float(duplicate_ratio),
+            float(SIGNAL_ROLLING_ALPHA),
+            (error or "").strip()[:2000] or None,
+        )
+    if str(result or "").endswith("0") and target_query != "BUCKETS":
+        await _record_selected_query_outcome(
+            pool,
+            {**route, "route_name": route_name},
+            selected_query="BUCKETS",
+            success=success,
+            metrics=metrics,
+            error=error,
+        )
+
+
 async def _has_configured_worker_routes(pool: asyncpg.Pool) -> bool:
     async with pool.acquire() as conn:
         row = await conn.fetchval(
@@ -1372,12 +1952,14 @@ def _select_next_route(
     *,
     use_priority_scheduler: bool = False,
     runtime_config: dict[str, Any] | None = None,
+    prefer_non_hot: bool = False,
 ) -> dict[str, Any] | None:
     return select_next_route_from_module(
         routes=routes,
         now=now,
         use_priority_scheduler=use_priority_scheduler,
         runtime_config=runtime_config,
+        prefer_non_hot=prefer_non_hot,
     )
 
 
@@ -1396,14 +1978,22 @@ def _annotate_routes_with_priority(
     )
 
 
+def _central_route_exploration_every_n(runtime_config: dict[str, Any] | None) -> int:
+    raw_value = None if runtime_config is None else runtime_config.get("CENTRAL_ROUTE_EXPLORATION_EVERY_N")
+    try:
+        value = int(float(raw_value))
+    except (TypeError, ValueError):
+        value = 5
+    return max(0, value)
+
+
 async def _persist_route_priority_state(pool: asyncpg.Pool, routes: list[dict[str, Any]]) -> None:
-    updates: list[tuple[str, str, str | None, str, str, float | None]] = []
+    worker_updates: list[tuple[str, str, str | None, str, str, float | None]] = []
+    central_updates: list[tuple[str, str | None, str, str, float | None]] = []
     for route in routes:
-        if route.get("source") != "db":
-            continue
         route_name = str(route.get("route_name") or "").strip()
-        worker_name = str(route.get("worker_name") or "").strip()
-        if not worker_name or not route_name:
+        route_source = str(route.get("source") or "").strip().lower()
+        if not route_name or route_source not in {"db", "central"}:
             continue
         stored_override = _normalize_route_lane(route.get("lane_override"))
         stored_computed = _normalize_route_lane(route.get("computed_lane"), allow_none=False)
@@ -1414,7 +2004,21 @@ async def _persist_route_priority_state(pool: asyncpg.Pool, routes: list[dict[st
                 stored_score = round(float(stored_score), 4)
             except (TypeError, ValueError):
                 stored_score = None
-        updates.append(
+        if route_source == "central":
+            central_updates.append(
+                (
+                    route_name,
+                    stored_override,
+                    stored_computed,
+                    stored_effective,
+                    stored_score,
+                )
+            )
+            continue
+        worker_name = str(route.get("worker_name") or "").strip()
+        if not worker_name:
+            continue
+        worker_updates.append(
             (
                 worker_name,
                 route_name,
@@ -1424,37 +2028,63 @@ async def _persist_route_priority_state(pool: asyncpg.Pool, routes: list[dict[st
                 stored_score,
             )
         )
-    if not updates:
+    if not worker_updates and not central_updates:
         return
     async with pool.acquire() as conn:
-        await conn.executemany(
-            """
-            UPDATE worker_routes
-            SET
-                lane_override = $3,
-                computed_lane = $4,
-                effective_lane = $5,
-                priority_score = $6,
-                priority_score_updated_at = NOW()
-            WHERE worker_name = $1 AND route_name = $2
-            """,
-            updates,
-        )
+        if worker_updates:
+            await conn.executemany(
+                """
+                UPDATE worker_routes
+                SET
+                    lane_override = $3,
+                    computed_lane = $4,
+                    effective_lane = $5,
+                    priority_score = $6,
+                    priority_score_updated_at = NOW()
+                WHERE worker_name = $1 AND route_name = $2
+                """,
+                worker_updates,
+            )
+        if central_updates:
+            await conn.executemany(
+                """
+                UPDATE central_routes
+                SET
+                    lane_override = $2,
+                    computed_lane = $3,
+                    effective_lane = $4,
+                    priority_score = $5,
+                    priority_score_updated_at = NOW()
+                WHERE route_name = $1
+                """,
+                central_updates,
+            )
 
 
 async def _mark_route_selected(pool: asyncpg.Pool, route: dict[str, Any]) -> None:
-    if route.get("source") != "db":
+    route_source = str(route.get("source") or "").strip().lower()
+    if route_source not in {"db", "central"}:
         return
     async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE worker_routes
-            SET last_selected_at = NOW()
-            WHERE worker_name = $1 AND route_name = $2
-            """,
-            route.get("worker_name"),
-            route.get("route_name"),
-        )
+        if route_source == "central":
+            await conn.execute(
+                """
+                UPDATE central_routes
+                SET last_selected_at = NOW()
+                WHERE route_name = $1
+                """,
+                route.get("route_name"),
+            )
+        else:
+            await conn.execute(
+                """
+                UPDATE worker_routes
+                SET last_selected_at = NOW()
+                WHERE worker_name = $1 AND route_name = $2
+                """,
+                route.get("worker_name"),
+                route.get("route_name"),
+            )
     route["last_selected_at"] = datetime.now(timezone.utc)
 
 
@@ -1569,25 +2199,42 @@ async def _persist_route_preferred_proxy_key(
     route: dict[str, Any],
     proxy_key: str | None,
 ) -> None:
-    if route.get("source") != "db":
+    route_source = str(route.get("source") or "").strip().lower()
+    if route_source not in {"db", "central"}:
         return
     key = str(proxy_key or "").strip() or None
     async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE worker_routes
-            SET
-                preferred_proxy_key = $3,
-                preferred_proxy_updated_at = CASE
-                    WHEN $3::TEXT IS NULL THEN NULL
-                    ELSE NOW()
-                END
-            WHERE worker_name = $1 AND route_name = $2
-            """,
-            route.get("worker_name"),
-            route.get("route_name"),
-            key,
-        )
+        if route_source == "central":
+            await conn.execute(
+                """
+                UPDATE central_routes
+                SET
+                    preferred_proxy_key = $2,
+                    preferred_proxy_updated_at = CASE
+                        WHEN $2::TEXT IS NULL THEN NULL
+                        ELSE NOW()
+                    END
+                WHERE route_name = $1
+                """,
+                route.get("route_name"),
+                key,
+            )
+        else:
+            await conn.execute(
+                """
+                UPDATE worker_routes
+                SET
+                    preferred_proxy_key = $3,
+                    preferred_proxy_updated_at = CASE
+                        WHEN $3::TEXT IS NULL THEN NULL
+                        ELSE NOW()
+                    END
+                WHERE worker_name = $1 AND route_name = $2
+                """,
+                route.get("worker_name"),
+                route.get("route_name"),
+                key,
+            )
     route["preferred_proxy_key"] = key
     route["preferred_proxy_updated_at"] = datetime.now(timezone.utc) if key else None
 
@@ -1783,6 +2430,24 @@ async def _release_profile_lock(pool: asyncpg.Pool, route: dict[str, Any], profi
 
 
 def _priority_query_candidates(route: dict[str, Any]) -> list[str]:
+    query_rows = route.get("query_rows")
+    if isinstance(query_rows, list) and query_rows:
+        normalized_rows = rank_route_query_records_from_module(route=route, query_rows=query_rows)
+        enabled_queries = [
+            str(item.get("query_text") or "").strip()
+            for item in normalized_rows
+            if str(item.get("query_text") or "").strip()
+        ]
+        if enabled_queries:
+            if len(enabled_queries) == 1 and enabled_queries[0].upper() == "BUCKETS":
+                bucket_queries = [
+                    *BUCKET_BROAD,
+                    *BUCKET_EXACT,
+                    *BUCKET_FLIPPER,
+                    *BUCKET_MISSPELLING,
+                ]
+                return rank_route_queries_from_module(route=route, queries=bucket_queries)
+            return enabled_queries
     raw_queries = _split_query_csv(route.get("search_queries"))
     if not raw_queries or (len(raw_queries) == 1 and raw_queries[0].upper() == "BUCKETS"):
         bucket_queries = [
@@ -2011,31 +2676,53 @@ async def _set_route_status(
     status: str,
     reason: str | None = None,
 ) -> None:
-    if route.get("source") != "db":
+    route_source = str(route.get("source") or "").strip().lower()
+    if route_source not in {"db", "central"}:
         return
     normalized_status = _normalize_route_status(status)
     reason_text = (reason or "").strip()[:2000] or None
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            UPDATE worker_routes
-            SET
-                status = $3,
-                status_reason = $4,
-                status_since = CASE
-                    WHEN worker_routes.status IS DISTINCT FROM $3
-                      OR worker_routes.status_reason IS DISTINCT FROM $4
-                    THEN NOW()
-                    ELSE worker_routes.status_since
-                END
-            WHERE worker_name = $1 AND route_name = $2
-            RETURNING status, status_reason, status_since
-            """,
-            route.get("worker_name"),
-            route.get("route_name"),
-            normalized_status,
-            reason_text,
-        )
+        if route_source == "central":
+            row = await conn.fetchrow(
+                """
+                UPDATE central_routes
+                SET
+                    status = $2,
+                    status_reason = $3,
+                    status_since = CASE
+                        WHEN central_routes.status IS DISTINCT FROM $2
+                          OR central_routes.status_reason IS DISTINCT FROM $3
+                        THEN NOW()
+                        ELSE central_routes.status_since
+                    END
+                WHERE route_name = $1
+                RETURNING status, status_reason, status_since
+                """,
+                route.get("route_name"),
+                normalized_status,
+                reason_text,
+            )
+        else:
+            row = await conn.fetchrow(
+                """
+                UPDATE worker_routes
+                SET
+                    status = $3,
+                    status_reason = $4,
+                    status_since = CASE
+                        WHEN worker_routes.status IS DISTINCT FROM $3
+                          OR worker_routes.status_reason IS DISTINCT FROM $4
+                        THEN NOW()
+                        ELSE worker_routes.status_since
+                    END
+                WHERE worker_name = $1 AND route_name = $2
+                RETURNING status, status_reason, status_since
+                """,
+                route.get("worker_name"),
+                route.get("route_name"),
+                normalized_status,
+                reason_text,
+            )
     if row:
         route["status"] = _normalize_route_status(str(row["status"] or normalized_status))
         route["status_reason"] = str(row["status_reason"] or "").strip() or None
@@ -2052,35 +2739,61 @@ async def _record_route_signal_baseline(
     result_count: int,
     page_load_ms: int,
 ) -> None:
-    if route.get("source") != "db":
+    route_source = str(route.get("source") or "").strip().lower()
+    if route_source not in {"db", "central"}:
         return
     result_value = max(0, int(result_count or 0))
     load_value = max(0, int(page_load_ms or 0))
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            UPDATE worker_routes
-            SET
-                avg_result_count = CASE
-                    WHEN avg_result_count IS NULL THEN $3::DOUBLE PRECISION
-                    ELSE ($5::DOUBLE PRECISION * $3::DOUBLE PRECISION)
-                       + ((1 - $5::DOUBLE PRECISION) * avg_result_count)
-                END,
-                avg_page_load_ms = CASE
-                    WHEN avg_page_load_ms IS NULL THEN $4::DOUBLE PRECISION
-                    ELSE ($5::DOUBLE PRECISION * $4::DOUBLE PRECISION)
-                       + ((1 - $5::DOUBLE PRECISION) * avg_page_load_ms)
-                END,
-                successful_cycles = GREATEST(0, COALESCE(successful_cycles, 0)) + 1
-            WHERE worker_name = $1 AND route_name = $2
-            RETURNING avg_result_count, avg_page_load_ms, successful_cycles
-            """,
-            route.get("worker_name"),
-            route.get("route_name"),
-            float(result_value),
-            float(load_value),
-            float(SIGNAL_ROLLING_ALPHA),
-        )
+        if route_source == "central":
+            row = await conn.fetchrow(
+                """
+                UPDATE central_routes
+                SET
+                    avg_result_count = CASE
+                        WHEN avg_result_count IS NULL THEN $2::DOUBLE PRECISION
+                        ELSE ($4::DOUBLE PRECISION * $2::DOUBLE PRECISION)
+                           + ((1 - $4::DOUBLE PRECISION) * avg_result_count)
+                    END,
+                    avg_page_load_ms = CASE
+                        WHEN avg_page_load_ms IS NULL THEN $3::DOUBLE PRECISION
+                        ELSE ($4::DOUBLE PRECISION * $3::DOUBLE PRECISION)
+                           + ((1 - $4::DOUBLE PRECISION) * avg_page_load_ms)
+                    END,
+                    successful_cycles = GREATEST(0, COALESCE(successful_cycles, 0)) + 1
+                WHERE route_name = $1
+                RETURNING avg_result_count, avg_page_load_ms, successful_cycles
+                """,
+                route.get("route_name"),
+                float(result_value),
+                float(load_value),
+                float(SIGNAL_ROLLING_ALPHA),
+            )
+        else:
+            row = await conn.fetchrow(
+                """
+                UPDATE worker_routes
+                SET
+                    avg_result_count = CASE
+                        WHEN avg_result_count IS NULL THEN $3::DOUBLE PRECISION
+                        ELSE ($5::DOUBLE PRECISION * $3::DOUBLE PRECISION)
+                           + ((1 - $5::DOUBLE PRECISION) * avg_result_count)
+                    END,
+                    avg_page_load_ms = CASE
+                        WHEN avg_page_load_ms IS NULL THEN $4::DOUBLE PRECISION
+                        ELSE ($5::DOUBLE PRECISION * $4::DOUBLE PRECISION)
+                           + ((1 - $5::DOUBLE PRECISION) * avg_page_load_ms)
+                    END,
+                    successful_cycles = GREATEST(0, COALESCE(successful_cycles, 0)) + 1
+                WHERE worker_name = $1 AND route_name = $2
+                RETURNING avg_result_count, avg_page_load_ms, successful_cycles
+                """,
+                route.get("worker_name"),
+                route.get("route_name"),
+                float(result_value),
+                float(load_value),
+                float(SIGNAL_ROLLING_ALPHA),
+            )
     if row:
         route["avg_result_count"] = float(row["avg_result_count"]) if row["avg_result_count"] is not None else None
         route["avg_page_load_ms"] = float(row["avg_page_load_ms"]) if row["avg_page_load_ms"] is not None else None
@@ -2092,7 +2805,8 @@ async def _record_route_priority_metrics(
     route: dict[str, Any],
     metrics: dict[str, int],
 ) -> None:
-    if route.get("source") != "db":
+    route_source = str(route.get("source") or "").strip().lower()
+    if route_source not in {"db", "central"}:
         return
     listings_saved = max(0, int(metrics.get("listings_saved", 0) or 0))
     profitable_count = max(0, int(metrics.get("profitable_listing_count", 0) or 0))
@@ -2104,29 +2818,53 @@ async def _record_route_priority_metrics(
         profitable_ratio = min(1.0, profitable_count / float(listings_saved))
         duplicate_ratio = min(1.0, duplicate_count / float(listings_saved))
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            UPDATE worker_routes
-            SET
-                profitable_hit_rate = CASE
-                    WHEN profitable_hit_rate IS NULL THEN $3::DOUBLE PRECISION
-                    ELSE ($5::DOUBLE PRECISION * $3::DOUBLE PRECISION)
-                       + ((1 - $5::DOUBLE PRECISION) * profitable_hit_rate)
-                END,
-                recent_duplicate_ratio = CASE
-                    WHEN recent_duplicate_ratio IS NULL THEN $4::DOUBLE PRECISION
-                    ELSE ($5::DOUBLE PRECISION * $4::DOUBLE PRECISION)
-                       + ((1 - $5::DOUBLE PRECISION) * recent_duplicate_ratio)
-                END
-            WHERE worker_name = $1 AND route_name = $2
-            RETURNING profitable_hit_rate, recent_duplicate_ratio
-            """,
-            route.get("worker_name"),
-            route.get("route_name"),
-            float(profitable_ratio),
-            float(duplicate_ratio),
-            float(SIGNAL_ROLLING_ALPHA),
-        )
+        if route_source == "central":
+            row = await conn.fetchrow(
+                """
+                UPDATE central_routes
+                SET
+                    profitable_hit_rate = CASE
+                        WHEN profitable_hit_rate IS NULL THEN $2::DOUBLE PRECISION
+                        ELSE ($4::DOUBLE PRECISION * $2::DOUBLE PRECISION)
+                           + ((1 - $4::DOUBLE PRECISION) * profitable_hit_rate)
+                    END,
+                    recent_duplicate_ratio = CASE
+                        WHEN recent_duplicate_ratio IS NULL THEN $3::DOUBLE PRECISION
+                        ELSE ($4::DOUBLE PRECISION * $3::DOUBLE PRECISION)
+                           + ((1 - $4::DOUBLE PRECISION) * recent_duplicate_ratio)
+                    END
+                WHERE route_name = $1
+                RETURNING profitable_hit_rate, recent_duplicate_ratio
+                """,
+                route.get("route_name"),
+                float(profitable_ratio),
+                float(duplicate_ratio),
+                float(SIGNAL_ROLLING_ALPHA),
+            )
+        else:
+            row = await conn.fetchrow(
+                """
+                UPDATE worker_routes
+                SET
+                    profitable_hit_rate = CASE
+                        WHEN profitable_hit_rate IS NULL THEN $3::DOUBLE PRECISION
+                        ELSE ($5::DOUBLE PRECISION * $3::DOUBLE PRECISION)
+                           + ((1 - $5::DOUBLE PRECISION) * profitable_hit_rate)
+                    END,
+                    recent_duplicate_ratio = CASE
+                        WHEN recent_duplicate_ratio IS NULL THEN $4::DOUBLE PRECISION
+                        ELSE ($5::DOUBLE PRECISION * $4::DOUBLE PRECISION)
+                           + ((1 - $5::DOUBLE PRECISION) * recent_duplicate_ratio)
+                    END
+                WHERE worker_name = $1 AND route_name = $2
+                RETURNING profitable_hit_rate, recent_duplicate_ratio
+                """,
+                route.get("worker_name"),
+                route.get("route_name"),
+                float(profitable_ratio),
+                float(duplicate_ratio),
+                float(SIGNAL_ROLLING_ALPHA),
+            )
     if row:
         route["profitable_hit_rate"] = (
             float(row["profitable_hit_rate"]) if row["profitable_hit_rate"] is not None else profitable_ratio
@@ -2145,7 +2883,16 @@ async def _upsert_worker_heartbeat(
     last_error: str | None = None,
     started_at: datetime | None = None,
     finished_at: datetime | None = None,
+    route: dict[str, Any] | None = None,
     ) -> None:
+    route_source = str((route or {}).get("source") or "").strip() or None
+    route_user_data_dir = str((route or {}).get("user_data_dir") or "").strip() or None
+    route_search_queries = str((route or {}).get("search_queries") or "").strip() or None
+    route_proxy_mode = str((route or {}).get("proxy_mode") or "").strip() or None
+    route_proxy_server = str((route or {}).get("proxy_server") or "").strip() or None
+    route_proxy_username = str((route or {}).get("proxy_username") or "").strip() or None
+    route_proxy_password = str((route or {}).get("proxy_password") or "").strip() or None
+    route_proxy_pool = str((route or {}).get("proxy_pool") or "").strip() or None
     query = """
         INSERT INTO worker_heartbeats (
             worker_name,
@@ -2155,10 +2902,18 @@ async def _upsert_worker_heartbeat(
             query_count,
             last_run_started_at,
             last_run_finished_at,
+            route_source,
+            route_user_data_dir,
+            route_search_queries,
+            route_proxy_mode,
+            route_proxy_server,
+            route_proxy_username,
+            route_proxy_password,
+            route_proxy_pool,
             last_error,
             updated_at
         ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, NOW()
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NOW()
         )
         ON CONFLICT (worker_name) DO UPDATE SET
             route_name = EXCLUDED.route_name,
@@ -2167,6 +2922,14 @@ async def _upsert_worker_heartbeat(
             query_count = EXCLUDED.query_count,
             last_run_started_at = COALESCE(EXCLUDED.last_run_started_at, worker_heartbeats.last_run_started_at),
             last_run_finished_at = COALESCE(EXCLUDED.last_run_finished_at, worker_heartbeats.last_run_finished_at),
+            route_source = COALESCE(EXCLUDED.route_source, worker_heartbeats.route_source),
+            route_user_data_dir = COALESCE(EXCLUDED.route_user_data_dir, worker_heartbeats.route_user_data_dir),
+            route_search_queries = COALESCE(EXCLUDED.route_search_queries, worker_heartbeats.route_search_queries),
+            route_proxy_mode = COALESCE(EXCLUDED.route_proxy_mode, worker_heartbeats.route_proxy_mode),
+            route_proxy_server = COALESCE(EXCLUDED.route_proxy_server, worker_heartbeats.route_proxy_server),
+            route_proxy_username = COALESCE(EXCLUDED.route_proxy_username, worker_heartbeats.route_proxy_username),
+            route_proxy_password = COALESCE(EXCLUDED.route_proxy_password, worker_heartbeats.route_proxy_password),
+            route_proxy_pool = COALESCE(EXCLUDED.route_proxy_pool, worker_heartbeats.route_proxy_pool),
             last_error = EXCLUDED.last_error,
             updated_at = NOW()
     """
@@ -2180,6 +2943,14 @@ async def _upsert_worker_heartbeat(
             int(max(0, query_count)),
             started_at,
             finished_at,
+            route_source,
+            route_user_data_dir,
+            route_search_queries,
+            route_proxy_mode,
+            route_proxy_server,
+            route_proxy_username,
+            route_proxy_password,
+            route_proxy_pool,
             (last_error or "").strip()[:2000] or None,
         )
 
@@ -2820,7 +3591,7 @@ async def _run_scrape_cycle(
     if feature_flags is not None:
         route_lanes_enabled = await feature_flags.is_enabled("ENABLE_ROUTE_LANES")
         priority_scheduler_enabled = (
-            route.get("source") == "db"
+            str(route.get("source") or "").strip().lower() in {"db", "central"}
             and route_lanes_enabled
             and await feature_flags.is_enabled(
             "ENABLE_PRIORITY_SCHEDULER"
@@ -3584,22 +4355,38 @@ async def _run_worker_loop(
     runtime_config: RedisRuntimeConfig | None,
 ) -> None:
     logging.info("[%s] worker loop online", WORKER_NAME)
-    global _SINGLE_ROUTE_ENFORCEMENT_ACTIVE
+    global _SINGLE_ROUTE_ENFORCEMENT_ACTIVE, _CENTRAL_ROUTE_DISPATCH_COUNT
     try:
         while True:
             cycle_started_monotonic = time.monotonic()
             route = None
+            selected_profile: dict[str, Any] | None = None
             started_at = datetime.now(timezone.utc)
             try:
-                released_cooldowns = await _release_expired_route_cooldowns(pool)
+                central_route_dispatch_enabled = False
+                if feature_flags is not None:
+                    central_route_dispatch_enabled = await feature_flags.is_enabled("ENABLE_CENTRAL_ROUTE_DISPATCH")
+
+                released_cooldowns = 0
+                if central_route_dispatch_enabled:
+                    released_cooldowns += await _release_expired_central_route_cooldowns(pool)
+                    released_cooldowns += await _release_expired_execution_profile_cooldowns(pool)
+                else:
+                    released_cooldowns = await _release_expired_route_cooldowns(pool)
                 if released_cooldowns > 0:
                     logging.info(
-                        "[%s] released %s route(s) from expired cooldown.",
+                        "[%s] released %s scheduler item(s) from expired cooldown.",
                         WORKER_NAME,
                         released_cooldowns,
                     )
-                routes = await _load_worker_routes(pool)
-                enabled_route_count = await _count_enabled_worker_routes(pool)
+                if central_route_dispatch_enabled:
+                    routes = await _load_central_routes(pool)
+                    enabled_route_count = await _count_enabled_central_routes(pool)
+                    execution_profiles = await _load_execution_profiles(pool)
+                else:
+                    routes = await _load_worker_routes(pool)
+                    enabled_route_count = await _count_enabled_worker_routes(pool)
+                    execution_profiles = []
                 eligible_route_count = len(routes)
                 effective_interval_seconds = compute_worker_effective_interval(
                     base_interval=SCRAPE_INTERVAL_SECONDS,
@@ -3615,7 +4402,9 @@ async def _run_worker_loop(
                         "ENABLE_PRIORITY_SCHEDULER"
                     )
                 single_route_enforcement = (
-                    enabled_route_count > 0 and enabled_route_count < WORKER_MIN_ENABLED_ROUTES_WARN
+                    not central_route_dispatch_enabled
+                    and enabled_route_count > 0
+                    and enabled_route_count < WORKER_MIN_ENABLED_ROUTES_WARN
                 )
                 if single_route_enforcement:
                     effective_interval_seconds *= WORKER_SINGLE_ROUTE_REST_MULTIPLIER
@@ -3658,42 +4447,116 @@ async def _run_worker_loop(
                         runtime_config=runtime_snapshot,
                     )
                     await _persist_route_priority_state(pool=pool, routes=routes)
+
+                prefer_non_hot = False
+                if central_route_dispatch_enabled and execution_profiles:
+                    selected_profile = _select_execution_profile(execution_profiles)
+                    exploration_every_n = _central_route_exploration_every_n(runtime_snapshot)
+                    if priority_scheduler_enabled and exploration_every_n > 0:
+                        prefer_non_hot = ((_CENTRAL_ROUTE_DISPATCH_COUNT + 1) % exploration_every_n) == 0
                 route = _select_next_route(
                     routes,
                     now=now_dt,
                     use_priority_scheduler=priority_scheduler_enabled,
                     runtime_config=runtime_snapshot,
+                    prefer_non_hot=prefer_non_hot,
                 )
-                
-                if route is None:
-                    has_db_routes = await _has_configured_worker_routes(pool)
-                    if has_db_routes:
-                        manual_required_count = await _count_manual_login_required_routes(pool)
-                        due_in_seconds = seconds_until_next_route(routes=routes, now=now_dt) if routes else None
-                        cooldown_in_seconds = await _seconds_until_next_cooldown_release(pool)
+                if route is not None and central_route_dispatch_enabled:
+                    if selected_profile is None:
+                        route = None
+                    else:
+                        _CENTRAL_ROUTE_DISPATCH_COUNT += 1
+                        route = dict(route)
+                        route["worker_name"] = WORKER_NAME
+                        route["execution_profile"] = selected_profile
+                        route["user_data_dir"] = (
+                            str((selected_profile or {}).get("user_data_dir") or "").strip() or None
+                        )
+                        route["exploration_dispatch"] = bool(
+                            prefer_non_hot and str(route.get("effective_lane") or "").strip().lower() != "hot"
+                        )
 
+                if route is None:
+                    if central_route_dispatch_enabled:
+                        has_configured_routes = await _has_configured_central_routes(pool)
+                        has_execution_profiles = await _has_execution_profiles(pool)
+                        due_in_seconds = seconds_until_next_route(routes=routes, now=now_dt) if routes else None
+                        cooldown_in_seconds = await _seconds_until_next_execution_profile_cooldown_release(pool)
+                        manual_required_count = await _count_manual_login_required_execution_profiles(pool)
                         heartbeat_status = "scheduled_wait"
-                        if routes and due_in_seconds is not None:
+                        if not has_configured_routes:
+                            waiting_reason = "No central routes are configured yet."
+                            sleep_target_seconds = max(1.0, effective_interval_seconds)
+                        elif not has_execution_profiles:
+                            heartbeat_status = "wait_profile_lock"
                             waiting_reason = (
-                                f"No route is due yet. Next route becomes eligible in {int(max(0, due_in_seconds))}s."
+                                f"No eligible execution profiles are configured for {WORKER_NAME}. "
+                                "Add or migrate profiles before enabling central dispatch."
+                            )
+                            sleep_target_seconds = max(1.0, effective_interval_seconds)
+                        elif selected_profile is None:
+                            if manual_required_count > 0:
+                                heartbeat_status = "manual_login_required"
+                                waiting_reason = (
+                                    f"{manual_required_count} execution profile(s) require manual login. "
+                                    "Clear profile quarantine before central dispatch can resume."
+                                )
+                            elif cooldown_in_seconds is not None:
+                                heartbeat_status = "cooldown"
+                                waiting_reason = (
+                                    f"All execution profiles are cooling down. "
+                                    f"Next profile becomes eligible in {int(max(0, cooldown_in_seconds))}s."
+                                )
+                            else:
+                                heartbeat_status = "wait_profile_lock"
+                                waiting_reason = "No eligible execution profile is currently available."
+                            sleep_target_seconds = max(0.1, cooldown_in_seconds or effective_interval_seconds)
+                        elif routes and due_in_seconds is not None:
+                            waiting_reason = (
+                                f"No central route is due yet. Next route becomes eligible in {int(max(0, due_in_seconds))}s."
                             )
                             sleep_target_seconds = max(0.1, due_in_seconds)
                         else:
                             heartbeat_status = "cooldown"
-                            if manual_required_count > 0:
+                            waiting_reason = "No eligible central routes are currently available."
+                            sleep_target_seconds = max(1.0, effective_interval_seconds)
+                    else:
+                        has_configured_routes = await _has_configured_worker_routes(pool)
+                        if has_configured_routes:
+                            manual_required_count = await _count_manual_login_required_routes(pool)
+                            due_in_seconds = seconds_until_next_route(routes=routes, now=now_dt) if routes else None
+                            cooldown_in_seconds = await _seconds_until_next_cooldown_release(pool)
+
+                            heartbeat_status = "scheduled_wait"
+                            if routes and due_in_seconds is not None:
                                 waiting_reason = (
-                                    f"{manual_required_count} route(s) are quarantined for manual login. "
-                                    "Run VPS Manual Login, then clear Manual Login Required on the route."
+                                    f"No route is due yet. Next route becomes eligible in {int(max(0, due_in_seconds))}s."
                                 )
+                                sleep_target_seconds = max(0.1, due_in_seconds)
                             else:
-                                waiting_reason = (
-                                    "No eligible DB routes currently available (routes may be in cooldown or waiting for proxy reuse)."
-                                )
-                            if cooldown_in_seconds is not None:
-                                sleep_target_seconds = max(0.1, cooldown_in_seconds)
-                            else:
-                                sleep_target_seconds = max(1.0, effective_interval_seconds)
-                        
+                                heartbeat_status = "cooldown"
+                                if manual_required_count > 0:
+                                    waiting_reason = (
+                                        f"{manual_required_count} route(s) are quarantined for manual login. "
+                                        "Run VPS Manual Login, then clear Manual Login Required on the route."
+                                    )
+                                else:
+                                    waiting_reason = (
+                                        "No eligible DB routes currently available (routes may be in cooldown or waiting for proxy reuse)."
+                                    )
+                                if cooldown_in_seconds is not None:
+                                    sleep_target_seconds = max(0.1, cooldown_in_seconds)
+                                else:
+                                    sleep_target_seconds = max(1.0, effective_interval_seconds)
+                        else:
+                            has_configured_routes = False
+                            route = _build_env_route()
+                            effective_interval_seconds = float(SCRAPE_INTERVAL_SECONDS)
+                            # V2.2: Dolphin Anty profiles have bound proxies configured
+                            # natively.  A standalone SCRAPER_PROXY_SERVER is no longer
+                            # required for workers to operate.
+
+                    if has_configured_routes and route is None:
                         await _upsert_worker_heartbeat(
                             pool=pool,
                             route_name="",
@@ -3703,25 +4566,37 @@ async def _run_worker_loop(
                             last_error=waiting_reason,
                             started_at=started_at,
                             finished_at=datetime.now(timezone.utc),
+                            route=None,
                         )
                         logging.info("[%s] %s", WORKER_NAME, waiting_reason)
-                        
-                    else:
-                        route = _build_env_route()
-                        effective_interval_seconds = float(SCRAPE_INTERVAL_SECONDS)
-                        # V2.2: Dolphin Anty profiles have bound proxies configured
-                        # natively.  A standalone SCRAPER_PROXY_SERVER is no longer
-                        # required for workers to operate.
+                    elif route is None and central_route_dispatch_enabled:
+                        await _upsert_worker_heartbeat(
+                            pool=pool,
+                            route_name="",
+                            status="scheduled_wait",
+                            listings_saved=0,
+                            query_count=0,
+                            last_error="Central dispatch is enabled but no executable route/profile pair is available.",
+                            started_at=started_at,
+                            finished_at=datetime.now(timezone.utc),
+                            route=None,
+                        )
+                        logging.info(
+                            "[%s] central dispatch is enabled but no executable route/profile pair is available.",
+                            WORKER_NAME,
+                        )
                 
                 if route is not None:
                     route_started_at = datetime.now(timezone.utc)
                     route_started_monotonic = time.monotonic()
-                    if route.get("source") == "db":
+                    if str(route.get("source") or "").strip().lower() in {"db", "central"}:
                         await _mark_route_selected(pool, route)
+                    if selected_profile is not None and central_route_dispatch_enabled:
+                        await _mark_execution_profile_selected(pool, selected_profile)
                             
                 if route is None:
                     # No route found, wait and try again
-                    sleep_target_seconds = sleep_target_seconds if has_db_routes else effective_interval_seconds
+                    sleep_target_seconds = sleep_target_seconds if has_configured_routes else effective_interval_seconds
                     await asyncio.sleep(
                         compute_sleep_seconds(
                             base_interval=sleep_target_seconds,
@@ -3742,6 +4617,7 @@ async def _run_worker_loop(
                     query_count=0,
                     last_error=None,
                     started_at=started_at,
+                    route=route,
                 )
 
                 logging.info(
@@ -3779,8 +4655,9 @@ async def _run_worker_loop(
                         query_count=0,
                         last_error=f"Proxy provider saturated (pacing={proxy_health.pacing_multiplier:.1f}x)",
                         finished_at=datetime.now(timezone.utc),
+                        route=route,
                     )
-                    if route.get("source") == "db":
+                    if str(route.get("source") or "").strip().lower() in {"db", "central"}:
                         await _schedule_route_next_run_at(
                             pool=pool,
                             route=route,
@@ -3806,16 +4683,18 @@ async def _run_worker_loop(
                 outcome = cycle_result.outcome
                 error_category = cycle_result.error_category
                 reason = (cycle_result.reason or "").strip()
+                execution_profile = route.get("execution_profile") if isinstance(route, dict) else None
+                selected_query_text = str(((cycle_result.details or {}).get("selected_query")) or "").strip() or None
                 _cycle_dolphin_id = (cycle_result.details or {}).get("dolphin_profile_id") if cycle_result.details else None
                 route_interval_seconds = _route_interval_seconds(route, fallback_seconds=effective_interval_seconds)
                 lane_multiplier = (
                     lane_interval_multiplier_from_module(route.get("effective_lane"))
-                    if priority_scheduler_enabled and route.get("source") == "db"
+                    if priority_scheduler_enabled and str(route.get("source") or "").strip().lower() in {"db", "central"}
                     else 1.0
                 )
                 if (
                     single_route_enforcement
-                    and route.get("source") == "db"
+                    and str(route.get("source") or "").strip().lower() == "db"
                     and route.get("route_interval_seconds")
                 ):
                     route_interval_seconds *= WORKER_SINGLE_ROUTE_REST_MULTIPLIER
@@ -3845,17 +4724,45 @@ async def _run_worker_loop(
                         error=quarantine_reason,
                         count_failure=False,
                     )
-                    quarantined_at = await _mark_route_manual_login_required(
+                    if str(route.get("source") or "").strip().lower() == "central" and execution_profile:
+                        await _record_execution_profile_outcome(
+                            pool=pool,
+                            profile=execution_profile,
+                            success=False,
+                            error=quarantine_reason,
+                            count_failure=False,
+                        )
+                        quarantined_at = await _mark_execution_profile_manual_login_required(
+                            pool=pool,
+                            profile=execution_profile,
+                            reason=quarantine_reason,
+                            evidence=_build_quarantine_evidence(cycle_id=cycle_id, cycle_result=cycle_result),
+                        )
+                    else:
+                        quarantined_at = await _mark_route_manual_login_required(
+                            pool=pool,
+                            route=route,
+                            reason=quarantine_reason,
+                            evidence=_build_quarantine_evidence(cycle_id=cycle_id, cycle_result=cycle_result),
+                        )
+                    await _record_selected_query_outcome(
                         pool=pool,
                         route=route,
-                        reason=quarantine_reason,
-                        evidence=_build_quarantine_evidence(cycle_id=cycle_id, cycle_result=cycle_result),
+                        selected_query=selected_query_text,
+                        success=False,
+                        metrics=metrics,
+                        error=quarantine_reason,
                     )
                     heartbeat_error = quarantine_reason
                     if quarantined_at:
-                        heartbeat_error = (
-                            f"{quarantine_reason} Route disabled for rotation at {quarantined_at.isoformat()}."
-                        )
+                        if str(route.get("source") or "").strip().lower() == "central":
+                            heartbeat_error = (
+                                f"{quarantine_reason} Profile removed from rotation at {quarantined_at.isoformat()}."
+                            )
+                        else:
+                            heartbeat_error = (
+                                f"{quarantine_reason} Route disabled for rotation at {quarantined_at.isoformat()}."
+                            )
                     await _upsert_worker_heartbeat(
                         pool=pool,
                         route_name=route_name,
@@ -3864,6 +4771,7 @@ async def _run_worker_loop(
                         query_count=metrics.get("query_count", 0),
                         last_error=heartbeat_error,
                         finished_at=finished_at,
+                        route=route,
                     )
                     if _should_send_manual_login_alert(route=route, reason=quarantine_reason):
                         await asyncio.to_thread(
@@ -3936,6 +4844,22 @@ async def _run_worker_loop(
                         error=wait_reason,
                         count_failure=False,
                     )
+                    if execution_profile:
+                        await _record_execution_profile_outcome(
+                            pool=pool,
+                            profile=execution_profile,
+                            success=False,
+                            error=wait_reason,
+                            count_failure=False,
+                        )
+                    await _record_selected_query_outcome(
+                        pool=pool,
+                        route=route,
+                        selected_query=selected_query_text,
+                        success=False,
+                        metrics=metrics,
+                        error=wait_reason,
+                    )
                     await _upsert_worker_heartbeat(
                         pool=pool,
                         route_name=route_name,
@@ -3944,6 +4868,7 @@ async def _run_worker_loop(
                         query_count=metrics.get("query_count", 0),
                         last_error=wait_reason,
                         finished_at=finished_at,
+                        route=route,
                     )
                 elif outcome == CycleOutcome.FAIL:
                     previous_bad_cycles = _current_bad_cycle_count(route_runtime_key, route)
@@ -4009,6 +4934,22 @@ async def _run_worker_loop(
                         error=heartbeat_error,
                         count_failure=failure_counts,
                     )
+                    profile_cooldown_until: datetime | None = None
+                    if execution_profile:
+                        profile_bad_cycles = await _record_execution_profile_outcome(
+                            pool=pool,
+                            profile=execution_profile,
+                            success=False,
+                            error=heartbeat_error,
+                            count_failure=failure_counts,
+                        )
+                        if failure_counts and profile_bad_cycles >= WORKER_ROUTE_COOLDOWN_BAD_CYCLES:
+                            profile_cooldown_until = await _put_execution_profile_on_cooldown(
+                                pool=pool,
+                                profile=execution_profile,
+                                reason=base_reason,
+                                cooldown_seconds=WORKER_ROUTE_COOLDOWN_SECONDS,
+                            )
 
                     cooldown_for_alert: int | None = None
                     if cooldown_applied:
@@ -4033,6 +4974,20 @@ async def _run_worker_loop(
                                 WORKER_ROUTE_COOLDOWN_SECONDS,
                                 bad_cycles,
                             )
+                    if profile_cooldown_until and str(route.get("source") or "").strip().lower() == "central":
+                        heartbeat_status = "cooldown"
+                        heartbeat_error = (
+                            f"{base_reason} Execution profile moved to cooldown until {profile_cooldown_until.isoformat()}."
+                        )
+
+                    await _record_selected_query_outcome(
+                        pool=pool,
+                        route=route,
+                        selected_query=selected_query_text,
+                        success=False,
+                        metrics=metrics,
+                        error=heartbeat_error,
+                    )
 
 
                     await _upsert_worker_heartbeat(
@@ -4043,6 +4998,7 @@ async def _run_worker_loop(
                         query_count=metrics.get("query_count", 0),
                         last_error=heartbeat_error,
                         finished_at=finished_at,
+                        route=route,
                     )
                 else:
                     _ROUTE_CONSECUTIVE_BAD_CYCLES[route_runtime_key] = 0
@@ -4091,6 +5047,19 @@ async def _run_worker_loop(
                     await _record_route_priority_metrics(
                         pool=pool,
                         route=route,
+                        metrics=metrics,
+                    )
+                    if execution_profile:
+                        await _record_execution_profile_outcome(
+                            pool=pool,
+                            profile=execution_profile,
+                            success=True,
+                        )
+                    await _record_selected_query_outcome(
+                        pool=pool,
+                        route=route,
+                        selected_query=selected_query_text,
+                        success=True,
                         metrics=metrics,
                     )
                     heartbeat_status = "ok"
@@ -4142,6 +5111,7 @@ async def _run_worker_loop(
                         query_count=metrics.get("query_count", 0),
                         last_error=heartbeat_error,
                         finished_at=finished_at,
+                        route=route,
                     )
 
                 _emit_cycle_telemetry(
@@ -4152,7 +5122,7 @@ async def _run_worker_loop(
                     result=cycle_result,
                 )
 
-                if route.get("source") == "db":
+                if str(route.get("source") or "").strip().lower() in {"db", "central"}:
                     await _schedule_route_next_run_at(
                         pool=pool,
                         route=route,
@@ -4184,6 +5154,7 @@ async def _run_worker_loop(
                     last_error=error_reason,
                     started_at=started_at,
                     finished_at=datetime.now(timezone.utc),
+                    route=route if isinstance(route, dict) else None,
                 )
                 _emit_cycle_telemetry(
                     cycle_id=str(uuid.uuid4()),

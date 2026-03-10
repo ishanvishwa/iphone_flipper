@@ -2273,7 +2273,7 @@ This keeps `dev-log.md` actionable for both engineering and operations.
     - successful enrichment updates listing rows, marks status/ledger state, and republishes lightweight pub/sub `listing_updated` triggers so API/WebSocket clients can merge later cold-field updates
   - preserved public interfaces and alert sufficiency:
     - `/listings` and WebSocket snapshots now add only nullable `thumbnail_url`
-    - Telegram listing cards remain text-first and now include optional thumbnail preview metadata when present
+    - Telegram listing cards remain text-first; thumbnails stay in listing storage/sync only and are not included in notification formatting
     - desktop sync still uses idempotent upserts and now accepts same-cursor websocket updates when `updated_at` is newer or cold fields were previously blank
   - infra/deploy wiring:
     - added `enrichment_worker` to `server/infra/docker-compose.yml`
@@ -2334,7 +2334,7 @@ This keeps `dev-log.md` actionable for both engineering and operations.
   - `CPU and memory usage per worker decrease or remain flat.`  
     Met. Worker resource usage and scrape-cycle duration remained flat in the enable window while enrichment work shifted onto the separate enrichment service.
   - `Notification payload remains sufficient for decision-making.`  
-    Met. Alerts still include title, price, projected profit, and URL, with optional thumbnail preview metadata when available.
+    Met. Alerts still include title, price, projected profit, and URL without depending on thumbnail/media formatting.
 - Unresolved follow-ups:
   - Phase 6 still owns operator replay/backlog controls and explicit rollback tooling for live scheduler + enrichment behavior
   - production still has no persisted `worker_routes` after the Phase 4 acceptance cleanup, so Phase 4 remains enabled but inert until operators create DB-backed routes again through the API/GUI
@@ -2440,5 +2440,129 @@ This keeps `dev-log.md` actionable for both engineering and operations.
     - implemented through `stream:notification_dead_letter` plus bounded `POST /ops/replay/notifications`
 - Remaining rollout task:
   - deploy the Phase 6 branch to `ubuntu@15.235.185.32`, verify the new ops endpoints and dead-letter/replay flow against the live stack, then leave production in the normal drained=`false` state with the existing Phase 0-5 flags preserved
+
+---
+
+### §44 – Optional B Audit: Separate Enrichment Workers (2026-03-10)
+
+- Summary: Audited the upgrade-plan Optional B item (`Separate enrichment workers`) against the shipped Phase 5/6 codebase and confirmed it is already implemented. No runtime, schema, or deploy changes were required for this pass.
+- Audit result:
+  - discovery workers remain enqueue-only for cold enrichment when `ENABLE_BACKGROUND_ENRICHMENT=1`
+  - deferred enrichment runs on the dedicated Redis Stream `stream:listing_enrichment`
+  - the separate `enrichment_worker` service is already compose-wired and included in the default VPS deploy service set
+  - consumer-group processing already includes `XGROUP CREATE ... MKSTREAM`, `XREADGROUP`, `XAUTOCLAIM`, retry/backoff, and ledger-backed dedupe through `listing_enrichment_ledger`
+  - successful enrichment republishes a lightweight pub/sub `listing_updated` trigger so API/WebSocket/desktop consumers merge late cold-field updates onto the same listing row instead of creating a second listing flow
+- Evidence inspected:
+  - `server/services/worker/worker.py`
+  - `server/services/common/enrichment_events.py`
+  - `server/services/worker/enrichment_worker.py`
+  - `server/infra/docker-compose.yml`
+  - `server/scripts/deploy_vps.sh`
+- Validation performed:
+  - focused enrichment regression:
+    - `PYTHONPATH=iphone_flipper ./iphone_flipper/.venv/bin/python -m pytest iphone_flipper/server/tests/test_enrichment_events.py iphone_flipper/server/tests/test_enrichment_worker.py iphone_flipper/server/tests/test_worker_observability.py -q`
+    - result: `25 passed`
+  - live deploy/runtime check:
+    - confirmed `enrichment_worker` is up in the VPS compose stack
+    - confirmed `GET /ops/runtime-config` reports `ENABLE_BACKGROUND_ENRICHMENT=true`
+- Acceptance status:
+  - `discovery workers enqueue enrichment and continue without waiting for completion`  
+    Met. The worker persists the hot row, publishes the normal event fanout, and only then enqueues the cold enrichment job behind the feature flag.
+  - `enrichment is consumed by a separate background worker service`  
+    Met. `enrichment_worker.py` is already a dedicated compose/deploy service over `stream:listing_enrichment`.
+  - `enrichment updates arrive later on the same listing row without duplicating the listing`  
+    Met. Enrichment completion republishes `listing_updated`, and downstream consumers merge the late cold-field update onto the existing row.
+
+---
+
+### §45 – Phase 4 Alignment Addendum: Central Route Ownership + Text-Only Notifications (2026-03-10)
+
+- Summary: Implemented the Phase 4 scheduler-alignment addendum in code. Scheduler ownership is now centralized behind `ENABLE_CENTRAL_ROUTE_DISPATCH`: routes live in `central_routes`, canonical query sets live in `route_queries`, workers act as generic executors, and execution safety is enforced through worker-local `execution_profiles`. Telegram notifications were also tightened back to the old text-only style so thumbnails do not affect alert latency or formatting. This pass was validated locally; production rollout of the new central-dispatch flag is still pending.
+- Motivation:
+  - remove hard worker ownership of routes/queries while keeping the scheduler route-centric
+  - let workers pull the best eligible central route/query available to a safe local profile instead of waiting on worker-partitioned route sets
+  - add an explicit exploration reserve so hot work cannot fully starve due non-hot work
+  - keep notification delivery fast and predictable by removing thumbnail/media formatting from Telegram
+- Changes:
+  - added central scheduler persistence in `server/services/common/schema_ensure.py` + `server/services/api/sql/001_init.sql`:
+    - `central_routes`
+    - `route_queries`
+    - `execution_profiles`
+    - runtime backfill from legacy `worker_routes` and `worker_heartbeats`, including deterministic route-name conflict handling (`{worker_name}__{route_name}` when needed)
+  - added rollout/config controls:
+    - feature flag `ENABLE_CENTRAL_ROUTE_DISPATCH`
+    - runtime-config knob `CENTRAL_ROUTE_EXPLORATION_EVERY_N`
+  - refactored worker dispatch in `server/services/worker/worker.py`:
+    - central route loading now comes from `central_routes` + `route_queries`
+    - workers lease one eligible local execution profile before dispatch
+    - route selection no longer filters by `worker_name` when central dispatch is enabled
+    - selected query outcomes now feed canonical `route_queries` metrics
+    - execution-profile success/failure/cooldown/manual-login state is tracked separately from route state
+  - extended scheduler behavior in `server/services/worker/scheduler.py`:
+    - central routes still use route-level lanes/scores
+    - canonical query-row ranking is now first-class through `rank_route_query_records()`
+    - explicit anti-starvation path via `prefer_non_hot=True` on every Nth eligible central dispatch
+    - central routes now persist their next due time through `schedule_route_next_run_at()`
+  - extended API control plane in `server/services/api/app/main.py`:
+    - added central route endpoints:
+      - `GET /routes`
+      - `GET /routes/{route_name}/queries`
+      - `PUT /routes/{route_name}`
+      - `PUT /routes/{route_name}/queries`
+      - `DELETE /routes/{route_name}`
+    - added execution-profile visibility:
+      - `GET /execution-profiles`
+    - kept legacy `worker-routes` endpoints available only for migration/audit helpers
+  - updated GUI in `gui.py`:
+    - VPS Scrapers now treats routes as central scheduler objects and workers as health/capacity views
+    - route table keys now use central route identity (`route::{route_name}`)
+    - worker summary groups central routes by `legacy_worker_name`
+    - query manager now edits canonical central-route query sets instead of worker-owned query shards
+    - legacy route-retest/manual-login bulk clear actions are blocked for central routes and redirected conceptually to execution-profile management
+  - reverted Telegram formatting to text-only:
+    - removed thumbnail lines from `iphone_flipper/notifications.py`
+    - removed thumbnail lines from `server/services/worker/notification_worker.py`
+    - disabled Telegram web-page previews so stored thumbnails never influence notification latency
+  - fresh audit result:
+    - no additional undocumented features/process enhancements were found beyond the approved alignment work; the main discrepancy was the previously documented worker-owned route model, now superseded by the central scheduler path behind the new flag
+- Files touched:
+  - `server/services/common/feature_flags.py`
+  - `server/services/common/runtime_config.py`
+  - `server/services/common/schema_ensure.py`
+  - `server/services/api/sql/001_init.sql`
+  - `server/services/api/app/main.py`
+  - `server/services/worker/scheduler.py`
+  - `server/services/worker/route_transitions.py`
+  - `server/services/worker/worker.py`
+  - `gui.py`
+  - `notifications.py`
+  - `server/services/worker/notification_worker.py`
+  - `server/tests/test_api_ops.py`
+  - `server/tests/test_gui_vps_scrapers.py`
+  - `server/tests/test_notification_worker.py`
+  - `server/tests/test_priority_scheduler.py`
+  - `architecture.md`
+  - `roadmap.md`
+  - `dev-log.md`
+- Decision/rationale:
+  - the implementation stays route-centric, matching the addendum’s acceptable interpretation, but removes worker ownership from scheduler state
+  - profiles remain worker-local because they carry login/session/proxy safety, but they are now execution gates rather than route owners
+  - exploration reserve is deliberately simple and measurable; it can be tuned through runtime config without a second scheduler architecture
+  - thumbnails remain in listing/enrichment/storage paths for GUI use, but notification delivery intentionally ignores them to avoid extra formatting or media-send latency
+- Validation performed:
+  - local compile sanity:
+    - `python3 -m py_compile iphone_flipper/gui.py iphone_flipper/notifications.py iphone_flipper/server/services/api/app/main.py iphone_flipper/server/services/common/feature_flags.py iphone_flipper/server/services/common/runtime_config.py iphone_flipper/server/services/common/schema_ensure.py iphone_flipper/server/services/worker/notification_worker.py iphone_flipper/server/services/worker/route_transitions.py iphone_flipper/server/services/worker/scheduler.py iphone_flipper/server/services/worker/worker.py iphone_flipper/server/tests/test_api_ops.py iphone_flipper/server/tests/test_gui_vps_scrapers.py iphone_flipper/server/tests/test_notification_worker.py iphone_flipper/server/tests/test_priority_scheduler.py iphone_flipper/server/tests/test_worker_publish_health.py`
+  - full server regression:
+    - `PYTHONPATH=iphone_flipper iphone_flipper/.venv/bin/python -m pytest iphone_flipper/server/tests -q`
+    - result: `153 passed`
+- Acceptance criteria status:
+  - `route/query/worker ownership model matches the addendum`  
+    Met in code. Central routes and canonical route queries are scheduler-owned, workers are executors, and execution safety is handled through local execution profiles.
+  - `non-hot work cannot be completely starved by hot work`  
+    Met in code. The scheduler now supports a runtime-configured exploration reserve through `CENTRAL_ROUTE_EXPLORATION_EVERY_N`.
+  - `Telegram notifications remain fast and text-only`  
+    Met. Notification builders omit thumbnail text and disable preview rendering.
+- Remaining rollout task:
+  - deploy the new code and enable `ENABLE_CENTRAL_ROUTE_DISPATCH` in production, then run a live acceptance pass to confirm central dispatch behavior and profile-gated execution on the VPS fleet
 
 ---

@@ -163,9 +163,6 @@ def _build_telegram_card(event: ListingStreamEvent) -> str:
     source = str(event.source or "").strip()
     if source:
         lines.append(f"Source: {escape(source)}")
-    thumbnail_url = str(event.thumbnail_url or "").strip()
-    if thumbnail_url:
-        lines.append(f"Thumbnail: <a href=\"{escape(thumbnail_url, quote=True)}\">Preview</a>")
     url = str(event.url or "").strip()
     if url:
         lines.append(f"Link: <a href=\"{escape(url, quote=True)}\">Open Listing</a>")
@@ -185,7 +182,7 @@ async def _send_telegram(message: str) -> bool:
             "chat_id": TELEGRAM_CHAT_ID,
             "text": message,
             "parse_mode": "HTML",
-            "disable_web_page_preview": False,
+            "disable_web_page_preview": True,
         }
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=10)

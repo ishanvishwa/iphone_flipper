@@ -5,7 +5,7 @@ import time
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
@@ -121,7 +121,7 @@ class WebSocketConnectionManager:
 
 class WorkerRouteUpsert(BaseModel):
     is_enabled: bool = True
-    proxy_server: str = Field(min_length=1, max_length=512)
+    proxy_server: str | None = Field(default=None, max_length=512)
     proxy_username: str | None = None
     proxy_password: str | None = None
     proxy_mode: str = Field(default="fixed", max_length=32)
@@ -135,6 +135,25 @@ class WorkerRouteUpsert(BaseModel):
     status_reason: str | None = None
     manual_login_required: bool | None = None
     manual_login_reason: str | None = None
+
+
+class CentralRouteUpsert(BaseModel):
+    is_enabled: bool = True
+    proxy_server: str | None = Field(default=None, max_length=512)
+    proxy_username: str | None = None
+    proxy_password: str | None = None
+    proxy_mode: str = Field(default="fixed", max_length=32)
+    proxy_pool: str | None = None
+    search_queries: str | None = None
+    priority: int = Field(default=100, ge=0, le=100000)
+    lane_override: str | None = Field(default=None, max_length=16)
+    route_interval_seconds: int | None = Field(default=None, ge=1, le=86400)
+    route_status: str | None = Field(default=None, max_length=32)
+    status_reason: str | None = None
+
+
+class RouteQuerySetUpdateRequest(BaseModel):
+    queries: list[str] = Field(default_factory=list)
 
 
 class WorkerRouteRetestRequest(BaseModel):
@@ -551,6 +570,133 @@ async def _build_route_config_warnings(conn: asyncpg.Connection, worker_name: st
             f"{WORKER_MIN_ENABLED_ROUTES_WARN} routes are enabled."
         )
     return warnings
+
+
+def _normalize_query_items(queries: list[str] | None = None, query_csv: str | None = None) -> list[str]:
+    raw_items: list[str] = []
+    if queries is not None:
+        raw_items.extend(str(item or "") for item in queries)
+    if query_csv is not None:
+        raw_items.extend(str(query_csv or "").split(","))
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_item in raw_items:
+        query = str(raw_item or "").strip()
+        if not query:
+            continue
+        identity = query.lower()
+        if identity in seen:
+            continue
+        seen.add(identity)
+        normalized.append(query)
+    return normalized or ["BUCKETS"]
+
+
+async def _replace_route_queries(
+    conn: asyncpg.Connection,
+    *,
+    route_name: str,
+    query_items: list[str],
+) -> None:
+    normalized_queries = _normalize_query_items(queries=query_items)
+    await conn.execute(
+        """
+        DELETE FROM route_queries
+        WHERE route_name = $1
+          AND NOT (query_text = ANY($2::TEXT[]))
+        """,
+        route_name,
+        normalized_queries,
+    )
+    for index, query in enumerate(normalized_queries):
+        await conn.execute(
+            """
+            INSERT INTO route_queries (
+                route_name,
+                query_text,
+                query_order,
+                is_enabled
+            ) VALUES ($1, $2, $3, TRUE)
+            ON CONFLICT (route_name, query_text) DO UPDATE SET
+                query_order = EXCLUDED.query_order,
+                is_enabled = EXCLUDED.is_enabled
+            """,
+            route_name,
+            query,
+            index,
+        )
+
+
+async def _load_route_queries_by_route_name(
+    conn: asyncpg.Connection,
+    route_names: list[str],
+) -> dict[str, list[dict[str, Any]]]:
+    cleaned_route_names = [str(item).strip() for item in route_names if str(item).strip()]
+    if not cleaned_route_names:
+        return {}
+    rows = await conn.fetch(
+        """
+        SELECT
+            route_name,
+            query_text,
+            query_order,
+            is_enabled,
+            last_selected_at,
+            last_success_at,
+            avg_result_count,
+            profitable_hit_rate,
+            recent_duplicate_ratio,
+            selection_count,
+            last_error,
+            created_at,
+            updated_at
+        FROM route_queries
+        WHERE route_name = ANY($1::TEXT[])
+        ORDER BY route_name ASC, query_order ASC, query_text ASC
+        """,
+        cleaned_route_names,
+    )
+    query_map: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        route_name = str(row["route_name"] or "").strip()
+        if not route_name:
+            continue
+        item = _serialize_datetimes(
+            dict(row),
+            ("last_selected_at", "last_success_at", "created_at", "updated_at"),
+        )
+        query_map.setdefault(route_name, []).append(item)
+    return query_map
+
+
+def _serialize_central_route_row(
+    row: Mapping[str, Any],
+    query_items: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    item = _serialize_datetimes(
+        dict(row),
+        (
+            "last_selected_at",
+            "last_success_at",
+            "status_since",
+            "next_run_at",
+            "cooldown_until",
+            "priority_score_updated_at",
+            "preferred_proxy_updated_at",
+            "created_at",
+            "updated_at",
+        ),
+    )
+    queries = list(query_items or [])
+    enabled_query_texts = [
+        str(query.get("query_text") or "").strip()
+        for query in queries
+        if bool(query.get("is_enabled", True)) and str(query.get("query_text") or "").strip()
+    ]
+    item["queries"] = queries
+    item["search_queries"] = ", ".join(enabled_query_texts) if enabled_query_texts else "BUCKETS"
+    item["query_count"] = len(queries)
+    return item
 
 
 async def _ensure_worker_tables(pool: asyncpg.Pool) -> None:
@@ -1038,6 +1184,425 @@ async def get_listings(
     }
 
 
+@app.get("/routes")
+async def get_central_routes(
+    route_name: str | None = Query(default=None),
+    x_api_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    await _auth_rest(x_api_token)
+    route_name_filter = (route_name or "").strip()
+    async with app.state.db_pool.acquire() as conn:
+        if route_name_filter:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    route_name,
+                    legacy_worker_name,
+                    legacy_route_name,
+                    is_enabled,
+                    proxy_server,
+                    proxy_username,
+                    CASE WHEN proxy_password IS NOT NULL AND proxy_password <> '' THEN '****' ELSE NULL END AS proxy_password,
+                    proxy_mode,
+                    proxy_pool,
+                    preferred_proxy_key,
+                    preferred_proxy_updated_at,
+                    priority,
+                    status,
+                    status_reason,
+                    status_since,
+                    next_run_at,
+                    route_interval_seconds,
+                    avg_result_count,
+                    profitable_hit_rate,
+                    recent_duplicate_ratio,
+                    avg_page_load_ms,
+                    successful_cycles,
+                    last_selected_at,
+                    last_success_at,
+                    consecutive_failures,
+                    cooldown_until,
+                    lane_override,
+                    computed_lane,
+                    effective_lane,
+                    priority_score,
+                    priority_score_updated_at,
+                    last_error,
+                    created_at,
+                    updated_at
+                FROM central_routes
+                WHERE route_name = $1
+                ORDER BY priority ASC, route_name ASC
+                """,
+                route_name_filter,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    route_name,
+                    legacy_worker_name,
+                    legacy_route_name,
+                    is_enabled,
+                    proxy_server,
+                    proxy_username,
+                    CASE WHEN proxy_password IS NOT NULL AND proxy_password <> '' THEN '****' ELSE NULL END AS proxy_password,
+                    proxy_mode,
+                    proxy_pool,
+                    preferred_proxy_key,
+                    preferred_proxy_updated_at,
+                    priority,
+                    status,
+                    status_reason,
+                    status_since,
+                    next_run_at,
+                    route_interval_seconds,
+                    avg_result_count,
+                    profitable_hit_rate,
+                    recent_duplicate_ratio,
+                    avg_page_load_ms,
+                    successful_cycles,
+                    last_selected_at,
+                    last_success_at,
+                    consecutive_failures,
+                    cooldown_until,
+                    lane_override,
+                    computed_lane,
+                    effective_lane,
+                    priority_score,
+                    priority_score_updated_at,
+                    last_error,
+                    created_at,
+                    updated_at
+                FROM central_routes
+                ORDER BY priority ASC, route_name ASC
+                """
+            )
+        route_names = [str(row["route_name"] or "").strip() for row in rows if str(row["route_name"] or "").strip()]
+        queries_by_route = await _load_route_queries_by_route_name(conn, route_names)
+
+    items = [
+        _serialize_central_route_row(dict(row), queries_by_route.get(str(row["route_name"] or "").strip(), []))
+        for row in rows
+    ]
+    return {"count": len(items), "items": items}
+
+
+@app.get("/routes/{route_name}/queries")
+async def get_route_queries(
+    route_name: str,
+    x_api_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    await _auth_rest(x_api_token)
+    route_name_clean = route_name.strip()
+    if not route_name_clean:
+        raise HTTPException(status_code=400, detail="route_name is required.")
+    async with app.state.db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT route_name FROM central_routes WHERE route_name = $1",
+            route_name_clean,
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail="Route not found.")
+        queries_by_route = await _load_route_queries_by_route_name(conn, [route_name_clean])
+    items = queries_by_route.get(route_name_clean, [])
+    return {"count": len(items), "items": items}
+
+
+@app.put("/routes/{route_name}")
+async def upsert_central_route(
+    route_name: str,
+    payload: CentralRouteUpsert,
+    x_api_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    await _auth_rest(x_api_token)
+    route_name_clean = route_name.strip()
+    if not route_name_clean:
+        raise HTTPException(status_code=400, detail="route_name is required.")
+
+    lane_override_provided = _payload_field_is_set(payload, "lane_override")
+    lane_override = normalize_route_lane(payload.lane_override) if lane_override_provided else None
+    raw_lane_override = (payload.lane_override or "").strip()
+    if (
+        lane_override_provided
+        and raw_lane_override
+        and raw_lane_override.lower() not in {"auto", "default", "computed"}
+        and lane_override is None
+    ):
+        raise HTTPException(status_code=400, detail="lane_override must be one of hot, warm, sweep, or null.")
+
+    proxy_mode = _normalize_proxy_mode(payload.proxy_mode)
+    route_status = _normalize_route_status(payload.route_status)
+    status_reason = (payload.status_reason or "").strip() or None
+    query_items = _normalize_query_items(query_csv=payload.search_queries)
+
+    async with app.state.db_pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                INSERT INTO central_routes (
+                    route_name,
+                    is_enabled,
+                    proxy_server,
+                    proxy_username,
+                    proxy_password,
+                    proxy_mode,
+                    proxy_pool,
+                    priority,
+                    route_interval_seconds,
+                    lane_override,
+                    computed_lane,
+                    effective_lane,
+                    status,
+                    status_reason,
+                    status_since
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9,
+                    $10, 'warm', COALESCE($10, 'warm'),
+                    CASE
+                        WHEN $2::BOOLEAN = FALSE THEN 'DISABLED'
+                        ELSE COALESCE(NULLIF(BTRIM($11), ''), 'ENABLED')
+                    END,
+                    CASE
+                        WHEN $2::BOOLEAN = FALSE THEN COALESCE(NULLIF($12, ''), 'disabled by operator')
+                        ELSE NULLIF($12, '')
+                    END,
+                    NOW()
+                )
+                ON CONFLICT (route_name) DO UPDATE SET
+                    is_enabled = EXCLUDED.is_enabled,
+                    proxy_server = EXCLUDED.proxy_server,
+                    proxy_username = EXCLUDED.proxy_username,
+                    proxy_password = EXCLUDED.proxy_password,
+                    proxy_mode = EXCLUDED.proxy_mode,
+                    proxy_pool = EXCLUDED.proxy_pool,
+                    priority = EXCLUDED.priority,
+                    route_interval_seconds = EXCLUDED.route_interval_seconds,
+                    lane_override = CASE
+                        WHEN $13::BOOLEAN THEN $10
+                        ELSE central_routes.lane_override
+                    END,
+                    effective_lane = CASE
+                        WHEN $13::BOOLEAN THEN COALESCE($10, central_routes.computed_lane, 'warm')
+                        ELSE central_routes.effective_lane
+                    END,
+                    status = CASE
+                        WHEN EXCLUDED.is_enabled = FALSE THEN 'DISABLED'
+                        WHEN COALESCE(NULLIF(BTRIM($11), ''), '') <> '' THEN COALESCE(NULLIF(BTRIM($11), ''), 'ENABLED')
+                        WHEN central_routes.status IN ('DEGRADED', 'THROTTLED', 'COOLDOWN') THEN central_routes.status
+                        ELSE 'ENABLED'
+                    END,
+                    status_reason = CASE
+                        WHEN EXCLUDED.is_enabled = FALSE THEN COALESCE(NULLIF($12, ''), 'disabled by operator')
+                        WHEN COALESCE(NULLIF(BTRIM($12), ''), '') <> '' THEN NULLIF($12, '')
+                        ELSE central_routes.status_reason
+                    END,
+                    status_since = CASE
+                        WHEN central_routes.status IS DISTINCT FROM CASE
+                            WHEN EXCLUDED.is_enabled = FALSE THEN 'DISABLED'
+                            WHEN COALESCE(NULLIF(BTRIM($11), ''), '') <> '' THEN COALESCE(NULLIF(BTRIM($11), ''), 'ENABLED')
+                            WHEN central_routes.status IN ('DEGRADED', 'THROTTLED', 'COOLDOWN') THEN central_routes.status
+                            ELSE 'ENABLED'
+                        END THEN NOW()
+                        ELSE central_routes.status_since
+                    END
+                RETURNING
+                    route_name,
+                    legacy_worker_name,
+                    legacy_route_name,
+                    is_enabled,
+                    proxy_server,
+                    proxy_username,
+                    CASE WHEN proxy_password IS NOT NULL AND proxy_password <> '' THEN '****' ELSE NULL END AS proxy_password,
+                    proxy_mode,
+                    proxy_pool,
+                    preferred_proxy_key,
+                    preferred_proxy_updated_at,
+                    priority,
+                    status,
+                    status_reason,
+                    status_since,
+                    next_run_at,
+                    route_interval_seconds,
+                    avg_result_count,
+                    profitable_hit_rate,
+                    recent_duplicate_ratio,
+                    avg_page_load_ms,
+                    successful_cycles,
+                    last_selected_at,
+                    last_success_at,
+                    consecutive_failures,
+                    cooldown_until,
+                    lane_override,
+                    computed_lane,
+                    effective_lane,
+                    priority_score,
+                    priority_score_updated_at,
+                    last_error,
+                    created_at,
+                    updated_at
+                """,
+                route_name_clean,
+                bool(payload.is_enabled),
+                (payload.proxy_server or "").strip(),
+                (payload.proxy_username or "").strip() or None,
+                (payload.proxy_password or "").strip() or None,
+                proxy_mode,
+                (payload.proxy_pool or "").strip() or None,
+                int(payload.priority),
+                payload.route_interval_seconds,
+                lane_override,
+                route_status,
+                status_reason,
+                lane_override_provided,
+            )
+            await _replace_route_queries(conn, route_name=route_name_clean, query_items=query_items)
+            queries_by_route = await _load_route_queries_by_route_name(conn, [route_name_clean])
+
+    if row is None:
+        raise HTTPException(status_code=500, detail="Failed to save central route.")
+    return {
+        "ok": True,
+        "item": _serialize_central_route_row(dict(row), queries_by_route.get(route_name_clean, [])),
+        "warnings": [],
+    }
+
+
+@app.put("/routes/{route_name}/queries")
+async def replace_route_queries(
+    route_name: str,
+    payload: RouteQuerySetUpdateRequest,
+    x_api_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    await _auth_rest(x_api_token)
+    route_name_clean = route_name.strip()
+    if not route_name_clean:
+        raise HTTPException(status_code=400, detail="route_name is required.")
+    query_items = _normalize_query_items(queries=payload.queries)
+    async with app.state.db_pool.acquire() as conn:
+        async with conn.transaction():
+            exists = await conn.fetchval(
+                "SELECT 1 FROM central_routes WHERE route_name = $1",
+                route_name_clean,
+            )
+            if not exists:
+                raise HTTPException(status_code=404, detail="Route not found.")
+            await _replace_route_queries(conn, route_name=route_name_clean, query_items=query_items)
+            queries_by_route = await _load_route_queries_by_route_name(conn, [route_name_clean])
+    items = queries_by_route.get(route_name_clean, [])
+    return {
+        "ok": True,
+        "count": len(items),
+        "search_queries": ", ".join(
+            str(item.get("query_text") or "").strip()
+            for item in items
+            if bool(item.get("is_enabled", True)) and str(item.get("query_text") or "").strip()
+        ) or "BUCKETS",
+        "items": items,
+    }
+
+
+@app.delete("/routes/{route_name}")
+async def delete_central_route(
+    route_name: str,
+    x_api_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    await _auth_rest(x_api_token)
+    route_name_clean = route_name.strip()
+    if not route_name_clean:
+        raise HTTPException(status_code=400, detail="route_name is required.")
+    async with app.state.db_pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM central_routes WHERE route_name = $1",
+            route_name_clean,
+        )
+    deleted = result.split()[-1] != "0"
+    return {"ok": True, "deleted": deleted}
+
+
+@app.get("/execution-profiles")
+async def get_execution_profiles(
+    worker_name: str | None = Query(default=None),
+    x_api_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    await _auth_rest(x_api_token)
+    worker_name_filter = (worker_name or "").strip()
+    async with app.state.db_pool.acquire() as conn:
+        if worker_name_filter:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    user_data_dir,
+                    worker_name,
+                    is_enabled,
+                    status,
+                    status_reason,
+                    status_since,
+                    cooldown_until,
+                    manual_login_required,
+                    manual_login_reason,
+                    manual_login_required_at,
+                    quarantined_at,
+                    quarantine_reason,
+                    quarantine_evidence,
+                    last_selected_at,
+                    last_success_at,
+                    consecutive_failures,
+                    last_error,
+                    created_at,
+                    updated_at
+                FROM execution_profiles
+                WHERE worker_name = $1
+                ORDER BY worker_name ASC, user_data_dir ASC
+                """,
+                worker_name_filter,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    user_data_dir,
+                    worker_name,
+                    is_enabled,
+                    status,
+                    status_reason,
+                    status_since,
+                    cooldown_until,
+                    manual_login_required,
+                    manual_login_reason,
+                    manual_login_required_at,
+                    quarantined_at,
+                    quarantine_reason,
+                    quarantine_evidence,
+                    last_selected_at,
+                    last_success_at,
+                    consecutive_failures,
+                    last_error,
+                    created_at,
+                    updated_at
+                FROM execution_profiles
+                ORDER BY worker_name ASC, user_data_dir ASC
+                """
+            )
+    items = [
+        _serialize_datetimes(
+            dict(row),
+            (
+                "status_since",
+                "cooldown_until",
+                "manual_login_required_at",
+                "quarantined_at",
+                "last_selected_at",
+                "last_success_at",
+                "created_at",
+                "updated_at",
+            ),
+        )
+        for row in rows
+    ]
+    return {"count": len(items), "items": items}
+
+
 @app.get("/worker-routes")
 async def get_worker_routes(
     worker_name: str | None = Query(default=None),
@@ -1390,7 +1955,7 @@ async def upsert_worker_route(
             worker_name_clean,
             route_name_clean,
             bool(payload.is_enabled),
-            payload.proxy_server.strip(),
+            (payload.proxy_server or "").strip(),
             (payload.proxy_username or "").strip() or None,
             (payload.proxy_password or "").strip() or None,
             proxy_mode,
@@ -1429,6 +1994,152 @@ async def upsert_worker_route(
             ),
         ),
         "warnings": warnings,
+    }
+
+
+@app.post("/worker-routes/bootstrap-from-health")
+async def bootstrap_worker_routes_from_health(
+    x_api_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    await _auth_rest(x_api_token)
+
+    heartbeat_query = """
+        SELECT
+            worker_name,
+            COALESCE(NULLIF(BTRIM(route_name), ''), 'env_default') AS route_name,
+            NULLIF(BTRIM(route_source), '') AS route_source,
+            NULLIF(BTRIM(route_user_data_dir), '') AS route_user_data_dir,
+            NULLIF(BTRIM(route_search_queries), '') AS route_search_queries,
+            NULLIF(BTRIM(route_proxy_mode), '') AS route_proxy_mode,
+            NULLIF(BTRIM(route_proxy_server), '') AS route_proxy_server,
+            NULLIF(BTRIM(route_proxy_username), '') AS route_proxy_username,
+            NULLIF(BTRIM(route_proxy_password), '') AS route_proxy_password,
+            NULLIF(BTRIM(route_proxy_pool), '') AS route_proxy_pool
+        FROM worker_heartbeats
+        ORDER BY worker_name ASC
+    """
+    insert_query = """
+        INSERT INTO worker_routes (
+            worker_name,
+            route_name,
+            is_enabled,
+            proxy_server,
+            proxy_username,
+            proxy_password,
+            proxy_mode,
+            proxy_pool,
+            preferred_proxy_key,
+            preferred_proxy_updated_at,
+            user_data_dir,
+            search_queries,
+            priority,
+            route_interval_seconds,
+            lane_override,
+            computed_lane,
+            effective_lane,
+            status,
+            status_reason,
+            status_since,
+            manual_login_required,
+            manual_login_reason,
+            manual_login_required_at,
+            quarantined_at,
+            quarantine_reason
+        ) VALUES (
+            $1, $2, TRUE, $3, $4, $5, $6, $7,
+            NULL, NULL,
+            $8, $9, 100, NULL,
+            NULL, 'warm', 'warm',
+            'ENABLED', NULL, NOW(),
+            FALSE, NULL, NULL, NULL, NULL
+        )
+        ON CONFLICT (worker_name, route_name) DO NOTHING
+        RETURNING worker_name, route_name, user_data_dir, search_queries
+    """
+
+    created: list[dict[str, Any]] = []
+    skipped: list[dict[str, str]] = []
+    warnings_by_worker: dict[str, list[str]] = {}
+
+    async with app.state.db_pool.acquire() as conn:
+        rows = await conn.fetch(heartbeat_query)
+        for row in rows:
+            worker_name = str(row["worker_name"] or "").strip()
+            route_name = str(row["route_name"] or "").strip() or "env_default"
+            route_source = str(row["route_source"] or "").strip().lower() or "unknown"
+            user_data_dir = str(row["route_user_data_dir"] or "").strip() or None
+            search_queries = str(row["route_search_queries"] or "").strip() or None
+            proxy_mode = _normalize_proxy_mode(row["route_proxy_mode"])
+            proxy_server = str(row["route_proxy_server"] or "").strip()
+            proxy_username = str(row["route_proxy_username"] or "").strip() or None
+            proxy_password = str(row["route_proxy_password"] or "").strip() or None
+            proxy_pool = str(row["route_proxy_pool"] or "").strip() or None
+
+            if not worker_name:
+                continue
+            if route_source not in {"env", "db"}:
+                skipped.append({"worker_name": worker_name, "route_name": route_name, "reason": "unsupported_route_source"})
+                continue
+            if not user_data_dir and not search_queries:
+                skipped.append({"worker_name": worker_name, "route_name": route_name, "reason": "no_route_snapshot"})
+                continue
+
+            existing_route = await conn.fetchval(
+                """
+                SELECT 1
+                FROM worker_routes
+                WHERE worker_name = $1
+                LIMIT 1
+                """,
+                worker_name,
+            )
+            if existing_route:
+                skipped.append({"worker_name": worker_name, "route_name": route_name, "reason": "routes_already_exist"})
+                continue
+
+            try:
+                await _assert_unique_profile_dir(
+                    conn=conn,
+                    worker_name=worker_name,
+                    route_name=route_name,
+                    profile_dir=user_data_dir,
+                    is_enabled=True,
+                )
+            except HTTPException as exc:
+                skipped.append(
+                    {
+                        "worker_name": worker_name,
+                        "route_name": route_name,
+                        "reason": str(exc.detail or "profile_dir_conflict"),
+                    }
+                )
+                continue
+
+            inserted = await conn.fetchrow(
+                insert_query,
+                worker_name,
+                route_name,
+                proxy_server,
+                proxy_username,
+                proxy_password,
+                proxy_mode,
+                proxy_pool,
+                user_data_dir,
+                search_queries,
+            )
+            if inserted:
+                warnings_by_worker[worker_name] = await _build_route_config_warnings(conn=conn, worker_name=worker_name)
+                created.append(dict(inserted))
+            else:
+                skipped.append({"worker_name": worker_name, "route_name": route_name, "reason": "not_inserted"})
+
+    return {
+        "ok": True,
+        "created_count": len(created),
+        "skipped_count": len(skipped),
+        "created": created,
+        "skipped": skipped,
+        "warnings_by_worker": warnings_by_worker,
     }
 
 
@@ -1624,11 +2335,22 @@ async def get_worker_health(
             hb.query_count,
             hb.last_run_started_at,
             hb.last_run_finished_at,
+            hb.route_source,
+            hb.route_user_data_dir,
+            hb.route_search_queries,
+            hb.route_proxy_mode,
+            hb.route_proxy_server,
+            hb.route_proxy_username,
+            hb.route_proxy_password,
+            hb.route_proxy_pool,
             hb.last_error,
             hb.updated_at,
             COALESCE(s.listings_scraped_last_minute, 0)::INT AS listings_scraped_last_minute,
-            r.cooldown_until AS route_cooldown_until,
-            GREATEST(0, COALESCE(EXTRACT(EPOCH FROM (r.cooldown_until - NOW())), 0))::INT AS cooldown_remaining_seconds,
+            COALESCE(cr.cooldown_until, r.cooldown_until) AS route_cooldown_until,
+            GREATEST(
+                0,
+                COALESCE(EXTRACT(EPOCH FROM (COALESCE(cr.cooldown_until, r.cooldown_until) - NOW())), 0)
+            )::INT AS cooldown_remaining_seconds,
             l.proxy_server AS leased_proxy_server,
             l.leased_by_route AS leased_proxy_route,
             l.lease_until AS leased_proxy_until,
@@ -1644,6 +2366,8 @@ async def get_worker_health(
         LEFT JOIN worker_routes r
                ON r.worker_name = hb.worker_name
               AND r.route_name = hb.route_name
+        LEFT JOIN central_routes cr
+               ON cr.route_name = hb.route_name
         LEFT JOIN LATERAL (
             SELECT
                 proxy_server,

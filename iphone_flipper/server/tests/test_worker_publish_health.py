@@ -56,6 +56,33 @@ class WorkerPublishHealthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(args[4], "ok")
         self.assertEqual(args[6], "1741604400000-0")
 
+    async def test_upsert_worker_heartbeat_persists_route_snapshot_fields(self) -> None:
+        pool = _FakePool()
+
+        await worker._upsert_worker_heartbeat(
+            pool=pool,
+            route_name="env_default",
+            status="running",
+            route={
+                "source": "env",
+                "user_data_dir": "/app/runtime/browser_profile_3",
+                "search_queries": "iPhone",
+                "proxy_mode": "fixed",
+                "proxy_server": "",
+                "proxy_username": "",
+                "proxy_password": "",
+                "proxy_pool": "",
+            },
+        )
+
+        args = pool.conn.execute.await_args.args
+        self.assertEqual(args[1], worker.WORKER_NAME)
+        self.assertEqual(args[2], "env_default")
+        self.assertEqual(args[8], "env")
+        self.assertEqual(args[9], "/app/runtime/browser_profile_3")
+        self.assertEqual(args[10], "iPhone")
+        self.assertEqual(args[11], "fixed")
+
     async def test_process_listing_event_records_failed_publish_health(self) -> None:
         feature_flags = MagicMock()
         feature_flags.is_enabled = AsyncMock(return_value=False)

@@ -49,6 +49,8 @@ from notifications import notify_new_listings
 from server.services.common.observability import emit_json_log, utc_now_iso
 
 DB_PATH = Path(__file__).parent / "listings.db"
+VPS_PROXY_PROFILE_DIRECT = "Use Dolphin/Profile Proxy"
+VPS_PROXY_PROFILE_CUSTOM = "Custom (manual proxy)"
 
 
 class iPhoneFlipperGUI:
@@ -1488,82 +1490,61 @@ PY"""
         if error:
             self.status_bar.config(text=error)
             if self.query_manager_window and self.query_manager_window.winfo_exists():
-                messagebox.showwarning("Worker Queries", error)
+                messagebox.showwarning("Route Queries", error)
             return
 
-        grouped_routes: dict[str, list[dict]] = {}
-        for route in routes:
-            worker_name = str(route.get("worker_name") or "").strip()
+        health_by_route_name: dict[str, dict] = {}
+        for worker_name, health in (health_by_worker or {}).items():
+            route_name = str((health or {}).get("route_name") or "").strip()
+            if route_name and route_name not in health_by_route_name:
+                health_by_route_name[route_name] = dict(health)
+                health_by_route_name[route_name]["_active_worker_name"] = worker_name
+
+        matched_selected = None
+        for route in sorted(
+            routes,
+            key=lambda item: (
+                str(item.get("legacy_worker_name") or item.get("worker_name") or "").strip(),
+                self._safe_int(item.get("priority"), 100),
+                str(item.get("route_name") or "").strip(),
+            ),
+        ):
             route_name = str(route.get("route_name") or "").strip()
-            if not worker_name or not route_name:
+            if not route_name:
                 continue
-            grouped_routes.setdefault(worker_name, []).append(route)
-
-        tracked_workers = ("worker", "worker_2", "worker_3")
-        worker_names = [worker for worker in tracked_workers if worker in grouped_routes]
-        for worker_name in worker_names:
-            worker_routes = grouped_routes.get(worker_name, [])
-            if not worker_routes:
-                continue
-
-            health = health_by_worker.get(worker_name, {})
-            status = str(health.get("status") or "unknown").strip() or "unknown"
-            listings_scraped_last_minute = self._safe_int(
-                health.get("listings_scraped_last_minute"),
-                0,
-            )
-            active_route_name = str(health.get("route_name") or "").strip()
-
-            selected_route = None
-            if active_route_name:
-                for route in worker_routes:
-                    if str(route.get("route_name") or "").strip() == active_route_name:
-                        selected_route = route
-                        break
-            if selected_route is None:
-                selected_route = sorted(
-                    worker_routes,
-                    key=lambda route: (
-                        0 if bool(route.get("is_enabled", True)) else 1,
-                        self._safe_int(route.get("priority"), 100),
-                        str(route.get("route_name") or ""),
-                    ),
-                )[0]
-
-            query_csv = str(selected_route.get("search_queries") or "").strip()
-            if not query_csv:
-                for route in worker_routes:
-                    candidate = str(route.get("search_queries") or "").strip()
-                    if candidate:
-                        query_csv = candidate
-                        break
-
-            enabled_count = sum(1 for route in worker_routes if bool(route.get("is_enabled", True)))
-            route_count_display = f"{enabled_count}/{len(worker_routes)}"
-            key = worker_name
+            legacy_worker_name = str(route.get("legacy_worker_name") or route.get("worker_name") or "").strip() or "central"
+            health = health_by_route_name.get(route_name, {})
+            status = str(health.get("status") or route.get("status") or "unknown").strip() or "unknown"
+            lane = str(route.get("effective_lane") or route.get("computed_lane") or "warm").strip() or "warm"
+            key = f"route::{route_name}"
+            query_csv = str(route.get("search_queries") or "BUCKETS").strip() or "BUCKETS"
 
             self.query_manager_tree.insert(
                 "",
                 tk.END,
                 iid=key,
                 values=(
-                    worker_name,
-                    route_count_display,
+                    legacy_worker_name,
+                    route_name,
                     status,
-                    str(max(0, listings_scraped_last_minute)),
+                    lane,
                     query_csv,
                 ),
             )
             self.query_manager_routes_by_key[key] = {
-                "worker_name": worker_name,
-                "routes": worker_routes,
+                "route_name": route_name,
+                "legacy_worker_name": legacy_worker_name,
+                "active_worker_name": str(health.get("_active_worker_name") or "").strip() or None,
+                "route": route,
                 "search_queries": query_csv,
             }
+            if selected_key == key:
+                matched_selected = key
 
-        if selected_key and selected_key in self.query_manager_routes_by_key:
-            self.query_manager_tree.selection_set(selected_key)
-            self.query_manager_tree.focus(selected_key)
-            self.query_manager_tree.see(selected_key)
+        if matched_selected and matched_selected in self.query_manager_routes_by_key:
+            self.query_manager_tree.selection_set(matched_selected)
+            self.query_manager_tree.focus(matched_selected)
+            self.query_manager_tree.see(matched_selected)
             self._on_query_manager_route_selected()
         elif self.query_manager_tree.get_children():
             first = self.query_manager_tree.get_children()[0]
@@ -1587,68 +1568,42 @@ PY"""
             return
         selection = self.query_manager_tree.selection()
         if not selection:
-            messagebox.showwarning("Worker Queries", "Select a worker first.")
+            messagebox.showwarning("Route Queries", "Select a central route first.")
             return
         key = selection[0]
         data = self.query_manager_routes_by_key.get(key)
         if not data:
-            messagebox.showwarning("Worker Queries", "Selected worker is no longer available. Refresh and retry.")
+            messagebox.showwarning("Route Queries", "Selected route is no longer available. Refresh and retry.")
             return
 
-        worker_name = str(data.get("worker_name") or "").strip()
-        worker_routes = list(data.get("routes") or [])
-        if not worker_name or not worker_routes:
-            messagebox.showwarning("Worker Queries", "Invalid worker selection.")
+        route_name = str(data.get("route_name") or "").strip()
+        if not route_name:
+            messagebox.showwarning("Route Queries", "Invalid route selection.")
             return
 
         ctx, error = self._get_server_api_context()
         if error:
-            messagebox.showwarning("Worker Queries", error)
+            messagebox.showwarning("Route Queries", error)
             return
 
         query_csv = (self.query_manager_query_var.get() if self.query_manager_query_var else "").strip()
-        updated_count = 0
-        errors: list[str] = []
-        for route in worker_routes:
-            route_name = str(route.get("route_name") or "").strip()
-            if not route_name:
-                continue
-            priority = self._safe_int(route.get("priority"), 100)
-            payload = {
-                "is_enabled": bool(route.get("is_enabled", True)),
-                "proxy_server": str(route.get("proxy_server") or "").strip(),
-                "proxy_username": str(route.get("proxy_username") or "").strip() or None,
-                "proxy_password": str(route.get("proxy_password") or "").strip() or None,
-                "proxy_mode": str(route.get("proxy_mode") or "fixed").strip() or "fixed",
-                "proxy_pool": str(route.get("proxy_pool") or "").strip() or None,
-                "user_data_dir": str(route.get("user_data_dir") or "").strip() or None,
-                "search_queries": query_csv or None,
-                "priority": priority,
-            }
-            try:
-                response = requests.put(
-                    f"{ctx['base_url']}/worker-routes/{worker_name}/{route_name}",
-                    headers=ctx["headers"],
-                    json=payload,
-                    timeout=(8, 30),
-                )
-                if response.status_code == 401:
-                    raise RuntimeError("Unauthorized (check Server API Token).")
-                response.raise_for_status()
-                updated_count += 1
-            except Exception as exc:
-                errors.append(f"{route_name}: {exc}")
-
-        if errors:
-            messagebox.showerror(
-                "Save Failed",
-                "Failed to save worker queries on one or more routes:\n"
-                + "\n".join(errors[:6]),
+        query_items = [token.strip() for token in query_csv.split(",") if token.strip()]
+        try:
+            response = requests.put(
+                f"{ctx['base_url']}/routes/{route_name}/queries",
+                headers=ctx["headers"],
+                json={"queries": query_items},
+                timeout=(8, 30),
             )
-            self.status_bar.config(text=f"Worker query save failed for {worker_name}")
+            if response.status_code == 401:
+                raise RuntimeError("Unauthorized (check Server API Token).")
+            response.raise_for_status()
+        except Exception as exc:
+            messagebox.showerror("Save Failed", f"Failed to save route queries:\n{exc}")
+            self.status_bar.config(text=f"Route query save failed for {route_name}")
             return
 
-        self.status_bar.config(text=f"Saved worker queries for {worker_name} across {updated_count} route(s)")
+        self.status_bar.config(text=f"Saved canonical query set for route {route_name}")
         self._refresh_query_manager_routes()
 
     def _append_query_to_selected_route(self):
@@ -1657,7 +1612,7 @@ PY"""
 
         query = simpledialog.askstring(
             "Add Query",
-            "Query text to add for selected worker:",
+            "Query text to add for selected route:",
             parent=self.query_manager_window or self.root,
         )
         if query is None:
@@ -1731,7 +1686,7 @@ PY"""
         messagebox.showinfo("Saved", "Negative keywords saved and synced to VPS worker runtime DBs.")
 
     def show_query_keyword_manager(self):
-        """Open worker-query manager and universal negative-keyword controls."""
+        """Open central-route query manager and universal negative-keyword controls."""
         if self.query_manager_window and self.query_manager_window.winfo_exists():
             self.query_manager_window.lift()
             self.query_manager_window.focus_force()
@@ -1747,7 +1702,7 @@ PY"""
         )
 
         window = tk.Toplevel(self.root)
-        window.title("Worker Queries & Negative Keywords")
+        window.title("Central Route Queries & Negative Keywords")
         window.geometry("1240x760")
         self.query_manager_window = window
 
@@ -1768,23 +1723,23 @@ PY"""
         main.columnconfigure(1, weight=2)
         main.rowconfigure(0, weight=1)
 
-        routes_frame = ttk.LabelFrame(main, text="Worker Query Shards")
+        routes_frame = ttk.LabelFrame(main, text="Central Route Query Sets")
         routes_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
         routes_frame.columnconfigure(0, weight=1)
         routes_frame.rowconfigure(0, weight=1)
 
         self.query_manager_tree = ttk.Treeview(
             routes_frame,
-            columns=("Worker", "Enabled Routes", "Status", "Listings Scraped last minute", "Queries"),
+            columns=("Legacy Worker", "Route", "Status", "Lane", "Queries"),
             show="headings",
             selectmode="browse",
         )
         for col, width in [
-            ("Worker", 110),
-            ("Enabled Routes", 120),
+            ("Legacy Worker", 130),
+            ("Route", 190),
             ("Status", 90),
-            ("Listings Scraped last minute", 190),
-            ("Queries", 440),
+            ("Lane", 90),
+            ("Queries", 430),
         ]:
             self.query_manager_tree.heading(col, text=col)
             self.query_manager_tree.column(col, width=width, anchor=tk.W)
@@ -1797,7 +1752,7 @@ PY"""
         route_editor = ttk.Frame(routes_frame)
         route_editor.grid(row=1, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 10))
         route_editor.columnconfigure(1, weight=1)
-        ttk.Label(route_editor, text="Selected Worker Query CSV:").grid(row=0, column=0, sticky="w")
+        ttk.Label(route_editor, text="Selected Route Query CSV:").grid(row=0, column=0, sticky="w")
         ttk.Entry(route_editor, textvariable=self.query_manager_query_var).grid(
             row=0, column=1, sticky="ew", padx=(8, 0)
         )
@@ -1808,7 +1763,7 @@ PY"""
         route_actions.columnconfigure(1, weight=1)
         route_actions.columnconfigure(2, weight=1)
         route_actions.columnconfigure(3, weight=1)
-        ttk.Button(route_actions, text="Save Worker Queries", command=self._save_query_manager_route_queries).grid(
+        ttk.Button(route_actions, text="Save Route Queries", command=self._save_query_manager_route_queries).grid(
             row=0, column=0, sticky="ew", padx=4
         )
         ttk.Button(route_actions, text="Add Query", command=self._append_query_to_selected_route).grid(
@@ -1817,7 +1772,7 @@ PY"""
         ttk.Button(route_actions, text="Clear Query Set", command=lambda: self.query_manager_query_var.set("")).grid(
             row=0, column=2, sticky="ew", padx=4
         )
-        ttk.Button(route_actions, text="Refresh Workers", command=self._refresh_query_manager_routes).grid(
+        ttk.Button(route_actions, text="Refresh Routes", command=self._refresh_query_manager_routes).grid(
             row=0, column=3, sticky="ew", padx=4
         )
 
@@ -1825,7 +1780,8 @@ PY"""
             routes_frame,
             text=(
                 "Worker_3 is intended for fast-lane newest-listing sweeps (default query: iPhone). "
-                "This panel applies one query shard per worker and syncs it to all profiles/routes under that worker."
+                "This panel edits the canonical query set for each central route. "
+                "Workers remain generic executors and profiles are managed separately."
             ),
             wraplength=760,
         ).grid(row=3, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 8))
@@ -1943,40 +1899,82 @@ PY
             "Route configuration warning(s):\n" + "\n".join(f"- {item}" for item in warning_items[:6]),
         )
 
+    def _workers_missing_saved_routes(self, routes, health_by_worker):
+        workers_with_routes = {
+            str(route.get("worker_name") or "").strip()
+            for route in (routes or [])
+            if str(route.get("worker_name") or "").strip()
+        }
+        missing_workers = []
+        for worker_name, health in (health_by_worker or {}).items():
+            worker_name_clean = str(worker_name or "").strip()
+            if not worker_name_clean or worker_name_clean in workers_with_routes:
+                continue
+            route_source = str(health.get("route_source") or "env").strip().lower() or "env"
+            profile_dir = str(health.get("route_user_data_dir") or "").strip()
+            search_queries = str(health.get("route_search_queries") or "").strip()
+            if route_source not in {"env", "db"}:
+                continue
+            if not profile_dir and not search_queries:
+                continue
+            missing_workers.append(worker_name_clean)
+        return sorted(set(missing_workers))
+
+    def _bootstrap_vps_routes_from_health(self, ctx):
+        try:
+            response = requests.post(
+                f"{ctx['base_url']}/worker-routes/bootstrap-from-health",
+                headers=ctx["headers"],
+                timeout=(8, 30),
+            )
+            if response.status_code == 401:
+                return None, "Unauthorized for worker route auto-bootstrap (check Server API Token)."
+            response.raise_for_status()
+            return (response.json() if response.content else {}), None
+        except Exception as exc:
+            return None, f"Failed to auto-bootstrap worker routes: {exc}"
+
     def _fetch_vps_scraper_payloads(self):
         ctx, error = self._get_server_api_context()
         if error:
             return [], {}, error
 
-        try:
+        def _fetch_routes():
             routes_resp = requests.get(
-                f"{ctx['base_url']}/worker-routes",
+                f"{ctx['base_url']}/routes",
                 headers=ctx["headers"],
                 timeout=(8, 25),
             )
             if routes_resp.status_code == 401:
-                return [], {}, "Unauthorized for worker routes (check Server API Token)."
+                raise RuntimeError("Unauthorized for central routes (check Server API Token).")
             routes_resp.raise_for_status()
             routes_payload = routes_resp.json() if routes_resp.content else {}
-            routes = routes_payload.get("items") or []
-        except Exception as exc:
-            return [], {}, f"Failed to fetch worker routes: {exc}"
+            return routes_payload.get("items") or []
 
-        health_by_worker = {}
-        try:
+        def _fetch_health():
+            fetched_health_by_worker = {}
             health_resp = requests.get(
                 f"{ctx['base_url']}/worker-health",
                 headers=ctx["headers"],
                 timeout=(8, 25),
             )
             if health_resp.status_code == 401:
-                return routes, {}, "Unauthorized for worker health (check Server API Token)."
+                raise RuntimeError("Unauthorized for worker health (check Server API Token).")
             health_resp.raise_for_status()
             health_payload = health_resp.json() if health_resp.content else {}
             for item in (health_payload.get("items") or []):
                 worker_name = str(item.get("worker_name") or "").strip()
                 if worker_name:
-                    health_by_worker[worker_name] = item
+                    fetched_health_by_worker[worker_name] = item
+            return fetched_health_by_worker
+
+        try:
+            routes = _fetch_routes()
+        except Exception as exc:
+            return [], {}, f"Failed to fetch central routes: {exc}"
+
+        try:
+            health_by_worker = _fetch_health()
         except Exception:
             # Routes are still useful even if health endpoint is unavailable.
             health_by_worker = {}
@@ -2028,7 +2026,14 @@ PY
         return profiles
 
     def _build_vps_proxy_profile_options(self, routes):
-        options = {"Custom (manual proxy)": None}
+        options = {
+            VPS_PROXY_PROFILE_DIRECT: {
+                "proxy_server": "",
+                "proxy_username": "",
+                "proxy_password": "",
+            },
+            VPS_PROXY_PROFILE_CUSTOM: None,
+        }
         for route in routes:
             worker_name = str(route.get("worker_name") or "").strip()
             route_name = str(route.get("route_name") or "").strip()
@@ -2195,16 +2200,19 @@ PY
         return replacement, True
 
     def _on_vps_worker_name_focus_out(self, event=None):
-        worker_name = self.vps_scraper_form_vars.get("worker_name", tk.StringVar(value="")).get().strip()
+        worker_name_var = self.vps_scraper_form_vars.get("worker_name")
+        worker_name = worker_name_var.get().strip() if worker_name_var is not None else ""
         if not worker_name:
             return
-        current_profile = self.vps_scraper_form_vars.get("user_data_dir", tk.StringVar(value="")).get().strip()
+        current_profile_var = self.vps_scraper_form_vars.get("user_data_dir")
+        current_profile = current_profile_var.get().strip() if current_profile_var is not None else ""
         if current_profile:
             return
         self.vps_scraper_form_vars["user_data_dir"].set(self._suggest_profile_dir_for_worker(worker_name))
 
     def _apply_selected_proxy_profile(self):
-        selected_label = self.vps_scraper_form_vars.get("proxy_profile", tk.StringVar(value="")).get().strip()
+        selected_var = self.vps_scraper_form_vars.get("proxy_profile")
+        selected_label = selected_var.get().strip() if selected_var is not None else ""
         if not selected_label:
             return
         route = self.vps_proxy_profile_options.get(selected_label)
@@ -2228,10 +2236,13 @@ PY
 
         data = self.vps_scraper_records_by_key.get(key) or {}
         route = data.get("route") or {}
-        worker_name = str(route.get("worker_name") or "").strip()
+        worker_name = str(route.get("legacy_worker_name") or route.get("worker_name") or "").strip()
         route_name = str(route.get("route_name") or "").strip()
         if worker_name and route_name:
             return key, worker_name, route_name
+
+        if route_name:
+            return key, worker_name or None, route_name
 
         parts = str(key).split("::")
         if len(parts) >= 2:
@@ -2263,7 +2274,7 @@ PY
 
         grouped_routes: dict[str, list[dict]] = {}
         for route in routes:
-            worker_name = str(route.get("worker_name") or "").strip()
+            worker_name = str(route.get("legacy_worker_name") or route.get("worker_name") or "").strip()
             route_name = str(route.get("route_name") or "").strip()
             if not worker_name or not route_name:
                 continue
@@ -2346,7 +2357,8 @@ PY
         candidate_key = None
         for key, data in self.vps_scraper_records_by_key.items():
             route = data.get("route") or {}
-            if str(route.get("worker_name") or "").strip() != worker_name:
+            route_worker_name = str(route.get("legacy_worker_name") or route.get("worker_name") or "").strip()
+            if route_worker_name != worker_name:
                 continue
             route_name = str(route.get("route_name") or "").strip()
             if active_route_name and route_name == active_route_name:
@@ -2387,10 +2399,11 @@ PY
             or ""
         )
         last_run_display = last_run.replace("T", " ")[:19] if last_run else ""
+        route_user_data_dir = str(health.get("route_user_data_dir") or "").strip()
         values = (
             worker_name_clean,
             route_name or "env_default",
-            "env-backed",
+            self._profile_display_name(route_user_data_dir) if route_user_data_dir else "env-backed",
             "env",
             "-",
             status,
@@ -2410,7 +2423,8 @@ PY
                 "route_name": route_name,
                 "is_enabled": True,
                 "is_synthetic_health_row": True,
-                "user_data_dir": "",
+                "source": str(health.get("route_source") or "env").strip() or "env",
+                "user_data_dir": route_user_data_dir,
                 "lane_override": "",
                 "computed_lane": "",
                 "effective_lane": "",
@@ -2418,7 +2432,12 @@ PY
                 "priority_score_updated_at": "",
                 "profitable_hit_rate": "",
                 "recent_duplicate_ratio": "",
-                "search_queries": "",
+                "search_queries": str(health.get("route_search_queries") or ""),
+                "proxy_mode": str(health.get("route_proxy_mode") or "fixed").strip() or "fixed",
+                "proxy_server": str(health.get("route_proxy_server") or ""),
+                "proxy_username": str(health.get("route_proxy_username") or ""),
+                "proxy_password": str(health.get("route_proxy_password") or ""),
+                "proxy_pool": str(health.get("route_proxy_pool") or ""),
                 "priority": "",
                 "manual_login_required": False,
             },
@@ -2465,64 +2484,57 @@ PY
             proxy_widget["values"] = proxy_options
             current = self.vps_scraper_form_vars["proxy_profile"].get()
             if current not in proxy_options:
-                self.vps_scraper_form_vars["proxy_profile"].set("Custom (manual proxy)")
+                self.vps_scraper_form_vars["proxy_profile"].set(VPS_PROXY_PROFILE_DIRECT)
 
         skipped_routes = 0
         rendered_workers: set[str] = set()
+        health_by_route_name: dict[str, dict] = {}
+        for worker_name, health in (health_by_worker or {}).items():
+            route_name = str((health or {}).get("route_name") or "").strip()
+            if route_name and route_name not in health_by_route_name:
+                health_by_route_name[route_name] = dict(health)
+                health_by_route_name[route_name]["_active_worker_name"] = worker_name
         for route in routes:
             try:
-                worker_name = str(route.get("worker_name") or "").strip()
+                worker_name = str(route.get("legacy_worker_name") or route.get("worker_name") or "").strip() or "central"
                 route_name = str(route.get("route_name") or "").strip()
-                if not worker_name or not route_name:
+                if not route_name:
                     continue
-                base_key = f"{worker_name}::{route_name}"
+                base_key = f"route::{route_name}"
                 key = base_key
                 duplicate_suffix = 2
                 while key in self.vps_scraper_records_by_key:
                     key = f"{base_key}::{duplicate_suffix}"
                     duplicate_suffix += 1
-                health = health_by_worker.get(worker_name, {})
-                manual_login_required = bool(route.get("manual_login_required")) or str(route.get("status") or "").strip().upper() == "NEEDS_LOGIN"
-                active_route_name = ""
-                if manual_login_required:
+                health = health_by_route_name.get(route_name, {})
+                active_worker_name = str(health.get("_active_worker_name") or "").strip()
+                route_status = str(route.get("status") or "ENABLED").strip().upper() or "ENABLED"
+                if health:
+                    status = str(health.get("status") or route_status.lower()).strip() or route_status.lower()
+                elif route_status == "NEEDS_LOGIN":
                     status = "manual_login_required"
-                elif health:
-                    active_route_name = str(health.get("route_name") or "").strip()
-                    worker_status = str(health.get("status") or "unknown").strip()
-                    if active_route_name and active_route_name != route_name:
-                        status = "ready"
-                    else:
-                        status = worker_status or "unknown"
                 else:
-                    status = "unknown"
+                    status = route_status.lower()
 
-                is_active_route = not active_route_name or active_route_name == route_name
-                lease_text, cooldown_text, _ = self._worker_runtime_summary(health if is_active_route else {})
-                if manual_login_required:
-                    lease_display = "-"
-                elif not is_active_route:
-                    lease_display = "-"
-                else:
-                    lease_display = lease_text
-
+                lease_text, cooldown_text, _ = self._worker_runtime_summary(health if health else {})
+                lease_display = lease_text if health else "-"
                 route_cooldown_seconds = self._seconds_until_iso(route.get("cooldown_until"))
-                if manual_login_required:
+                if route_status == "NEEDS_LOGIN":
                     cooldown_display = "manual login required"
                 elif route_cooldown_seconds > 0:
                     cooldown_display = f"waiting cooldown ({self._format_elapsed(route_cooldown_seconds)})"
-                elif is_active_route:
+                elif health:
                     cooldown_display = cooldown_text
                 else:
                     cooldown_display = "-"
-
                 last_run = str(
                     health.get("last_run_finished_at")
                     or health.get("last_run_started_at")
-                    or health.get("updated_at")
+                    or route.get("last_selected_at")
+                    or route.get("updated_at")
                     or ""
                 )
                 last_run_display = last_run.replace("T", " ")[:19] if last_run else ""
-                enabled_display = "yes" if route.get("is_enabled", True) else "no"
                 lane_display = str(route.get("effective_lane") or route.get("computed_lane") or "warm").strip() or "warm"
                 if str(route.get("lane_override") or "").strip():
                     lane_display = f"{lane_display}*"
@@ -2533,15 +2545,22 @@ PY
                         score_display = f"{float(priority_score):.2f}"
                     except (TypeError, ValueError):
                         score_display = str(priority_score)
+                query_count = self._safe_int(route.get("query_count"), -1)
+                if query_count < 0:
+                    query_count = len(route.get("queries") or [])
+                if query_count <= 0:
+                    query_csv = str(route.get("search_queries") or "").strip()
+                    if query_csv and query_csv.upper() != "BUCKETS":
+                        query_count = len([token for token in query_csv.split(",") if token.strip()])
 
                 values = (
                     worker_name,
                     route_name,
-                    self._profile_display_name(str(route.get("user_data_dir") or "")),
+                    f"{max(0, query_count)} query(s)",
                     lane_display,
                     score_display,
                     status,
-                    str(max(0, self._safe_int(health.get("listings_scraped_last_minute"), 0))) if is_active_route else "-",
+                    str(max(0, self._safe_int(health.get("listings_scraped_last_minute"), 0))) if health else "-",
                     last_run_display,
                 )
                 try:
@@ -2556,7 +2575,8 @@ PY
                     "health": health,
                     "lease_display": lease_display,
                     "cooldown_display": cooldown_display,
-                    "manual_login_required": manual_login_required,
+                    "manual_login_required": route_status == "NEEDS_LOGIN",
+                    "active_worker_name": active_worker_name or None,
                 }
                 rendered_workers.add(worker_name)
                 if selected_worker_name == worker_name and selected_route_name == route_name and not matched_selected_key:
@@ -2594,29 +2614,27 @@ PY
             if not routes and health_by_worker:
                 self.status_bar.config(
                     text=(
-                        "No saved VPS routes found. Showing live worker health rows only. "
-                        "Lane/score values appear after you save a DB-backed route."
+                        "No saved central routes found. Showing live worker health rows only. "
+                        "Create a central route to enable shared scheduling."
                     )
                 )
             else:
-                self.status_bar.config(text=f"Loaded {loaded_count} VPS scraper route(s)")
+                self.status_bar.config(text=f"Loaded {loaded_count} central route(s)")
 
     def _clear_vps_scraper_form(self):
         self.selected_vps_scraper_key = None
-        suggested_worker = self._suggest_next_worker_name()
-        suggested_profile = self._suggest_profile_dir_for_worker(suggested_worker)
         defaults = {
-            "worker_name": suggested_worker,
+            "worker_name": "",
             "route_name": "",
             "is_enabled": "1",
             "priority": "100",
             "lane_override": "auto",
             "route_interval_seconds": "",
-            "user_data_dir": suggested_profile,
+            "user_data_dir": "",
             "proxy_server": "",
             "proxy_username": "",
             "proxy_password": "",
-            "proxy_profile": "Custom (manual proxy)",
+            "proxy_profile": VPS_PROXY_PROFILE_DIRECT,
             "proxy_mode": "fixed",
             "proxy_pool": "",
             "search_queries": "",
@@ -2639,7 +2657,7 @@ PY
         }
         for key, value in defaults.items():
             var = self.vps_scraper_form_vars.get(key)
-            if isinstance(var, tk.StringVar):
+            if hasattr(var, "set"):
                 var.set(value)
         if self.vps_scraper_tree:
             self.vps_scraper_tree.selection_remove(self.vps_scraper_tree.selection())
@@ -2658,10 +2676,10 @@ PY
         synthetic_health_row = bool(route.get("is_synthetic_health_row"))
 
         self.selected_vps_scraper_key = key
-        self.vps_scraper_form_vars["worker_name"].set(str(route.get("worker_name") or ""))
-        self.vps_scraper_form_vars["route_name"].set(
-            str(route.get("route_name") or "") if synthetic_health_row else str(route.get("route_name") or "")
+        self.vps_scraper_form_vars["worker_name"].set(
+            str(route.get("legacy_worker_name") or route.get("worker_name") or "")
         )
+        self.vps_scraper_form_vars["route_name"].set(str(route.get("route_name") or ""))
         self.vps_scraper_form_vars["is_enabled"].set("1" if route.get("is_enabled", True) else "0")
         self.vps_scraper_form_vars["priority"].set("" if synthetic_health_row else str(route.get("priority") or 100))
         lane_override = str(route.get("lane_override") or "").strip().lower() or "auto"
@@ -2671,16 +2689,14 @@ PY
             str(route_interval_value) if route_interval_value not in (None, "") else ""
         )
         self.vps_scraper_form_vars["user_data_dir"].set(
-            self._suggest_profile_dir_for_worker(str(route.get("worker_name") or "").strip())
-            if synthetic_health_row
-            else str(route.get("user_data_dir") or "")
+            str(route.get("user_data_dir") or "") if synthetic_health_row else ""
         )
         self.vps_scraper_form_vars["proxy_mode"].set(str(route.get("proxy_mode") or "fixed"))
         self.vps_scraper_form_vars["proxy_server"].set(str(route.get("proxy_server") or ""))
         self.vps_scraper_form_vars["proxy_username"].set(str(route.get("proxy_username") or ""))
         self.vps_scraper_form_vars["proxy_password"].set(str(route.get("proxy_password") or ""))
         self.vps_scraper_form_vars["proxy_pool"].set(str(route.get("proxy_pool") or ""))
-        profile_label = "Custom (manual proxy)"
+        profile_label = VPS_PROXY_PROFILE_DIRECT
         for label, profile_route in self.vps_proxy_profile_options.items():
             if not profile_route:
                 continue
@@ -2691,14 +2707,18 @@ PY
             ):
                 profile_label = label
                 break
+        if str(route.get("proxy_mode") or "fixed").strip().lower() == "auto_rotation":
+            profile_label = VPS_PROXY_PROFILE_CUSTOM
         self.vps_scraper_form_vars["proxy_profile"].set(profile_label)
         self.vps_scraper_form_vars["search_queries"].set(str(route.get("search_queries") or ""))
-        self.vps_scraper_form_vars["manual_login_required"].set("1" if route.get("manual_login_required") else "0")
-        self.vps_scraper_form_vars["manual_login_reason"].set(str(route.get("manual_login_reason") or ""))
-        self.vps_scraper_form_vars["quarantined_at"].set(str(route.get("quarantined_at") or ""))
-        self.vps_scraper_form_vars["quarantine_reason"].set(str(route.get("quarantine_reason") or ""))
-        self.vps_scraper_form_vars["quarantine_evidence"].set(str(route.get("quarantine_evidence") or ""))
-        self.vps_scraper_form_vars["worker_status"].set(str(health.get("status") or "unknown"))
+        self.vps_scraper_form_vars["manual_login_required"].set("0")
+        self.vps_scraper_form_vars["manual_login_reason"].set("")
+        self.vps_scraper_form_vars["quarantined_at"].set("")
+        self.vps_scraper_form_vars["quarantine_reason"].set("")
+        self.vps_scraper_form_vars["quarantine_evidence"].set("")
+        self.vps_scraper_form_vars["worker_status"].set(
+            str(health.get("status") or route.get("status") or "unknown")
+        )
         self.vps_scraper_form_vars["worker_scraped_last_minute"].set(
             str(max(0, self._safe_int(health.get("listings_scraped_last_minute"), 0)))
         )
@@ -2739,9 +2759,17 @@ PY
                     "Create or save a DB-backed route to populate lane and score fields."
                 )
             )
+        else:
+            active_worker_name = str(data.get("active_worker_name") or "").strip()
+            self.status_bar.config(
+                text=(
+                    f"Central route '{route.get('route_name')}' loaded"
+                    + (f" (legacy origin: {route.get('legacy_worker_name')})" if route.get("legacy_worker_name") else "")
+                    + (f"; active on {active_worker_name}" if active_worker_name else "")
+                )
+            )
 
     def _save_vps_scraper_route(self, allow_remap: bool = True):
-        worker_name = self.vps_scraper_form_vars["worker_name"].get().strip()
         route_name = self.vps_scraper_form_vars["route_name"].get().strip()
         proxy_mode = str(self.vps_scraper_form_vars["proxy_mode"].get() or "").strip().lower()
         if proxy_mode not in {"fixed", "auto_rotation"}:
@@ -2751,14 +2779,10 @@ PY
             self._apply_selected_proxy_profile()
         else:
             # In auto rotation mode, route pool selection controls proxy choice.
-            self.vps_scraper_form_vars["proxy_profile"].set("Custom (manual proxy)")
+            self.vps_scraper_form_vars["proxy_profile"].set(VPS_PROXY_PROFILE_CUSTOM)
         proxy_server = self.vps_scraper_form_vars["proxy_server"].get().strip()
         proxy_pool_raw = self.vps_scraper_form_vars["proxy_pool"].get().strip()
         pool_entries = []
-
-        if not worker_name:
-            worker_name = self._suggest_next_worker_name()
-            self.vps_scraper_form_vars["worker_name"].set(worker_name)
 
         if proxy_mode == "auto_rotation":
             pool_entries = self._parse_socks5_proxy_pool_entries(proxy_pool_raw)
@@ -2783,46 +2807,12 @@ PY
                 if not self.vps_scraper_form_vars["proxy_password"].get().strip():
                     self.vps_scraper_form_vars["proxy_password"].set(str(seed_entry.get("proxy_password") or ""))
 
-        if not worker_name:
-            messagebox.showwarning("Validation Error", "Worker Name could not be auto-assigned.")
-            return False
-        if not re.fullmatch(r"[a-zA-Z0-9_-]+", worker_name):
-            messagebox.showwarning("Validation Error", "Worker Name may only include letters, numbers, '_' and '-'.")
-            return False
-
-        current_key = (self.selected_vps_scraper_key or "").strip()
-        editing_same_route = current_key == f"{worker_name}::{route_name}"
-        if allow_remap and not editing_same_route:
-            normalized_worker, remapped = self._normalize_worker_name_for_rotation(worker_name)
-            if remapped and normalized_worker:
-                original_worker = worker_name
-                worker_name = normalized_worker
-                self.vps_scraper_form_vars["worker_name"].set(worker_name)
-                if not self.vps_scraper_form_vars["route_name"].get().strip():
-                    self.vps_scraper_form_vars["route_name"].set(
-                        self._suggest_route_name_for_worker(worker_name, self.vps_scraper_form_vars["user_data_dir"].get().strip())
-                    )
-                self.status_bar.config(
-                    text=f"Worker '{original_worker}' not active; reassigned route to '{worker_name}' for live rotation."
-                )
-
-        profile_dir = self.vps_scraper_form_vars["user_data_dir"].get().strip()
-        if not profile_dir:
-            profile_dir = self._suggest_profile_dir_for_worker(worker_name)
-            self.vps_scraper_form_vars["user_data_dir"].set(profile_dir)
-        if not route_name:
-            route_name = self._suggest_route_name_for_worker(worker_name, profile_dir)
-            self.vps_scraper_form_vars["route_name"].set(route_name)
         if not route_name:
             messagebox.showwarning("Validation Error", "Route Name is required.")
             return False
         if not re.fullmatch(r"[a-zA-Z0-9_-]+", route_name):
             messagebox.showwarning("Validation Error", "Route Name may only include letters, numbers, '_' and '-'.")
             return False
-        if not proxy_server:
-            messagebox.showwarning("Validation Error", "Proxy Server is required (example: socks5://host:port).")
-            return False
-
         priority_raw = self.vps_scraper_form_vars["priority"].get().strip() or "100"
         try:
             priority = int(priority_raw)
@@ -2845,9 +2835,6 @@ PY
                 messagebox.showwarning("Validation Error", "Route Interval must be >= 1 second.")
                 return False
 
-        manual_login_required = self._is_truthy(self.vps_scraper_form_vars["manual_login_required"].get())
-        manual_login_reason = self.vps_scraper_form_vars["manual_login_reason"].get().strip() or None
-
         ctx, error = self._get_server_api_context()
         if error:
             messagebox.showwarning("VPS Scrapers", error)
@@ -2855,12 +2842,11 @@ PY
 
         payload = {
             "is_enabled": self._is_truthy(self.vps_scraper_form_vars["is_enabled"].get()),
-            "proxy_server": proxy_server,
+            "proxy_server": proxy_server or None,
             "proxy_username": self.vps_scraper_form_vars["proxy_username"].get().strip() or None,
             "proxy_password": self.vps_scraper_form_vars["proxy_password"].get().strip() or None,
             "proxy_mode": proxy_mode,
             "proxy_pool": (proxy_pool_raw or None) if proxy_mode == "auto_rotation" else None,
-            "user_data_dir": profile_dir or None,
             "search_queries": self.vps_scraper_form_vars["search_queries"].get().strip() or None,
             "priority": priority,
             "lane_override": (
@@ -2869,14 +2855,12 @@ PY
                 else str(self.vps_scraper_form_vars["lane_override"].get() or "").strip().lower()
             ),
             "route_interval_seconds": route_interval_seconds,
-            "manual_login_required": manual_login_required,
-            "manual_login_reason": manual_login_reason,
         }
 
         response_payload = {}
         try:
             response = requests.put(
-                f"{ctx['base_url']}/worker-routes/{worker_name}/{route_name}",
+                f"{ctx['base_url']}/routes/{route_name}",
                 headers=ctx["headers"],
                 json=payload,
                 timeout=(8, 30),
@@ -2913,20 +2897,19 @@ PY
         warnings = response_payload.get("warnings") if isinstance(response_payload, dict) else None
         if warnings:
             self._show_vps_route_warnings(warnings)
-        self.selected_vps_scraper_key = f"{worker_name}::{route_name}"
+        self.selected_vps_scraper_key = f"route::{route_name}"
         self._refresh_vps_scraper_tree(preserve_selection=True)
-        self.status_bar.config(text=f"Saved VPS route {worker_name}/{route_name}")
+        self.status_bar.config(text=f"Saved central route {route_name}")
         return True
 
     def _delete_vps_scraper_route(self):
-        worker_name = self.vps_scraper_form_vars["worker_name"].get().strip()
         route_name = self.vps_scraper_form_vars["route_name"].get().strip()
         
-        if not worker_name or not route_name:
-            messagebox.showwarning("Delete Failed", "Cannot delete. Worker Name and Route Name must be specified.")
+        if not route_name:
+            messagebox.showwarning("Delete Failed", "Cannot delete. Route Name must be specified.")
             return False
 
-        if not messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete route '{route_name}' on worker '{worker_name}'?"):
+        if not messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete central route '{route_name}'?"):
             return False
 
         ctx, error = self._get_server_api_context()
@@ -2936,7 +2919,7 @@ PY
 
         try:
             response = requests.delete(
-                f"{ctx['base_url']}/worker-routes/{worker_name}/{route_name}",
+                f"{ctx['base_url']}/routes/{route_name}",
                 headers=ctx["headers"],
                 timeout=(8, 30),
             )
@@ -2945,28 +2928,28 @@ PY
             response.raise_for_status()
         except requests.HTTPError as exc:
             messagebox.showerror("Delete Failed", f"Failed to delete VPS scraper route:\n{exc}")
-            self.status_bar.config(text=f"Failed to delete VPS scraper route {worker_name}/{route_name}")
+            self.status_bar.config(text=f"Failed to delete central route {route_name}")
             return False
         except Exception as exc:
             messagebox.showerror("Delete Failed", f"Failed to delete VPS scraper route:\n{exc}")
-            self.status_bar.config(text=f"Failed to delete VPS scraper route {worker_name}/{route_name}")
+            self.status_bar.config(text=f"Failed to delete central route {route_name}")
             return False
 
         self.selected_vps_scraper_key = None
         self._clear_vps_scraper_form()
         self._refresh_vps_scraper_tree(preserve_selection=False)
-        self.status_bar.config(text=f"Deleted VPS route {worker_name}/{route_name}")
+        self.status_bar.config(text=f"Deleted central route {route_name}")
         return True
 
     def _delete_selected_vps_scraper_route(self):
         key, worker_name, route_name = self._selected_vps_route_identity()
-        if not key or not worker_name or not route_name:
+        if not key or not route_name:
             messagebox.showwarning("No Selection", "Select a VPS scraper route first.")
             return
 
         if not messagebox.askyesno(
-            "Delete VPS Scraper Route",
-            f"Delete route '{route_name}' for worker '{worker_name}'?",
+            "Delete Central Route",
+            f"Delete central route '{route_name}'?",
         ):
             return
 
@@ -2978,7 +2961,7 @@ PY
         response_payload = {}
         try:
             response = requests.delete(
-                f"{ctx['base_url']}/worker-routes/{worker_name}/{route_name}",
+                f"{ctx['base_url']}/routes/{route_name}",
                 headers=ctx["headers"],
                 timeout=(8, 25),
             )
@@ -2995,12 +2978,21 @@ PY
             self._show_vps_route_warnings(warnings)
         self._clear_vps_scraper_form()
         self._refresh_vps_scraper_tree(preserve_selection=False)
-        self.status_bar.config(text=f"Deleted VPS route {worker_name}/{route_name}")
+        self.status_bar.config(text=f"Deleted central route {route_name}")
 
     def _request_vps_route_retest(self):
         key, worker_name, route_name = self._selected_vps_route_identity()
         if not key or not worker_name or not route_name:
             messagebox.showwarning("No Selection", "Select a VPS scraper route first.")
+            return
+        route_record = self.vps_scraper_records_by_key.get(key) or {}
+        route = route_record.get("route") or {}
+        if not bool(route.get("is_synthetic_health_row")):
+            messagebox.showinfo(
+                "Execution Profiles",
+                "Central routes are retried automatically by the scheduler. "
+                "Manual retest and manual-login recovery are managed on execution profiles, not on central routes.",
+            )
             return
 
         if not messagebox.askyesno(
@@ -3048,9 +3040,20 @@ PY
 
     def _bulk_clear_vps_worker_manual_login(self):
         _, worker_name, _ = self._selected_vps_route_identity()
+        selected_key = self.selected_vps_scraper_key
+        route_record = self.vps_scraper_records_by_key.get(selected_key or "") or {}
+        route = route_record.get("route") or {}
+        if selected_key and not bool(route.get("is_synthetic_health_row")):
+            messagebox.showinfo(
+                "Execution Profiles",
+                "Manual-login state is now tracked on execution profiles. "
+                "Use the execution-profile health view or API workflow for profile quarantine recovery.",
+            )
+            return
         worker_name = str(worker_name or "").strip()
         if not worker_name:
-            worker_name = self.vps_scraper_form_vars.get("worker_name", tk.StringVar(value="")).get().strip()
+            worker_name_var = self.vps_scraper_form_vars.get("worker_name")
+            worker_name = worker_name_var.get().strip() if worker_name_var is not None else ""
         if not worker_name:
             messagebox.showwarning("Missing Worker", "Select a route or set Worker Name first.")
             return
@@ -3310,7 +3313,8 @@ PY
         return raw_profile
 
     def _start_vps_manual_login(self):
-        proxy_mode = str(self.vps_scraper_form_vars.get("proxy_mode", tk.StringVar(value="fixed")).get() or "").strip().lower()
+        proxy_mode_var = self.vps_scraper_form_vars.get("proxy_mode")
+        proxy_mode = str(proxy_mode_var.get() if proxy_mode_var is not None else "fixed").strip().lower()
         if proxy_mode == "fixed":
             self._apply_selected_proxy_profile()
         worker_name = self.vps_scraper_form_vars["worker_name"].get().strip()
@@ -3344,10 +3348,6 @@ PY
         if not route_name:
             route_name = self._suggest_route_name_for_worker(worker_name, profile_dir)
             self.vps_scraper_form_vars["route_name"].set(route_name)
-        if not proxy_server:
-            messagebox.showwarning("Validation Error", "Proxy Server is required.")
-            return
-
         # Ensure this manual-login target is persisted in route registry immediately.
         if not self._save_vps_scraper_route(allow_remap=False):
             return
@@ -3358,21 +3358,26 @@ PY
             return
 
         host_profile = self._container_to_host_profile_path(profile_dir, ctx["project_dir"])
-        try:
-            proxy_parts = self._parse_vps_proxy_server(proxy_server, proxy_username, proxy_password)
-        except ValueError as exc:
-            messagebox.showwarning("Validation Error", str(exc))
-            return
+        if proxy_server:
+            try:
+                proxy_parts = self._parse_vps_proxy_server(proxy_server, proxy_username, proxy_password)
+            except ValueError as exc:
+                messagebox.showwarning("Validation Error", str(exc))
+                return
 
-        direct_proxy = f"{proxy_parts['scheme']}://{proxy_parts['host']}:{proxy_parts['port']}"
-        bridge_required = bool(proxy_parts["username"] or proxy_parts["password"])
-        if bridge_required:
-            auth_user = quote(str(proxy_parts["username"] or ""), safe="")
-            auth_password = quote(str(proxy_parts["password"] or ""), safe="")
-            auth_fragment = f"#{auth_user}:{auth_password}" if auth_user or auth_password else ""
-            upstream_proxy = f"{direct_proxy}{auth_fragment}"
+            direct_proxy = f"{proxy_parts['scheme']}://{proxy_parts['host']}:{proxy_parts['port']}"
+            bridge_required = bool(proxy_parts["username"] or proxy_parts["password"])
+            if bridge_required:
+                auth_user = quote(str(proxy_parts["username"] or ""), safe="")
+                auth_password = quote(str(proxy_parts["password"] or ""), safe="")
+                auth_fragment = f"#{auth_user}:{auth_password}" if auth_user or auth_password else ""
+                upstream_proxy = f"{direct_proxy}{auth_fragment}"
+            else:
+                upstream_proxy = direct_proxy
         else:
-            upstream_proxy = direct_proxy
+            direct_proxy = ""
+            upstream_proxy = ""
+            bridge_required = False
 
         profile_q = shlex.quote(host_profile)
         direct_proxy_q = shlex.quote(direct_proxy)
@@ -3486,12 +3491,16 @@ PY
                 fi
 
                 echo "Profile path: $PROFILE"
-                echo "Proxy route: $PROXY"
-                IP_CHECK=$(curl -m 12 -s --proxy "$PROXY" https://ipv4.icanhazip.com || true)
-                if [ -n "$IP_CHECK" ]; then
-                  echo "Proxy egress IP: $(echo "$IP_CHECK" | tr -d '\\n')"
+                if [ -n "$PROXY" ]; then
+                  echo "Proxy route: $PROXY"
+                  IP_CHECK=$(curl -m 12 -s --proxy "$PROXY" https://ipv4.icanhazip.com || true)
+                  if [ -n "$IP_CHECK" ]; then
+                    echo "Proxy egress IP: $(echo "$IP_CHECK" | tr -d '\\n')"
+                  else
+                    echo "Warning: Proxy egress IP check failed (curl via proxy returned no response)."
+                  fi
                 else
-                  echo "Warning: Proxy egress IP check failed (curl via proxy returned no response)."
+                  echo "Proxy route: Dolphin/profile-bound or direct network (no route override)"
                 fi
                 COOKIE_STATUS=$(python3 - "$PROFILE" <<'PY'
 import sqlite3
@@ -3554,7 +3563,11 @@ PY
                   export XAUTHORITY="$HOME/.Xauthority"
                 fi
 
-                CMD="$BROWSER --user-data-dir=\\"$PROFILE\\" --proxy-server=\\"$PROXY\\" \\"$LOGIN_URL\\""
+                if [ -n "$PROXY" ]; then
+                  CMD="$BROWSER --user-data-dir=\\"$PROFILE\\" --proxy-server=\\"$PROXY\\" \\"$LOGIN_URL\\""
+                else
+                  CMD="$BROWSER --user-data-dir=\\"$PROFILE\\" \\"$LOGIN_URL\\""
+                fi
                 if [ -z "${{DISPLAY:-}}" ]; then
                   echo "DISPLAY is not set and no VNC display was detected."
                   echo "Run this command inside your VPS desktop/VNC session:"
@@ -3565,7 +3578,11 @@ PY
                 if [ -n "${{XAUTHORITY:-}}" ]; then
                   echo "Using XAUTHORITY=$XAUTHORITY"
                 fi
-                nohup "$BROWSER" --user-data-dir="$PROFILE" --proxy-server="$PROXY" "$LOGIN_URL" >/tmp/iphone_flipper_vps_manual_login.log 2>&1 &
+                if [ -n "$PROXY" ]; then
+                  nohup "$BROWSER" --user-data-dir="$PROFILE" --proxy-server="$PROXY" "$LOGIN_URL" >/tmp/iphone_flipper_vps_manual_login.log 2>&1 &
+                else
+                  nohup "$BROWSER" --user-data-dir="$PROFILE" "$LOGIN_URL" >/tmp/iphone_flipper_vps_manual_login.log 2>&1 &
+                fi
                 echo "Manual login browser launched on VPS."
                 echo "Launch command: $CMD"
                 echo "Log: /tmp/iphone_flipper_vps_manual_login.log"
@@ -6552,7 +6569,7 @@ PY
             "lane_override": tk.StringVar(value="auto"),
             "route_interval_seconds": tk.StringVar(),
             "user_data_dir": tk.StringVar(),
-            "proxy_profile": tk.StringVar(value="Custom (manual proxy)"),
+            "proxy_profile": tk.StringVar(value=VPS_PROXY_PROFILE_DIRECT),
             "proxy_mode": tk.StringVar(value="fixed"),
             "proxy_server": tk.StringVar(),
             "proxy_username": tk.StringVar(),
@@ -6844,9 +6861,9 @@ PY
         self.vps_scraper_tree = ttk.Treeview(
             table_frame,
             columns=(
-                "Worker",
+                "Legacy Worker",
                 "Route",
-                "Profile",
+                "Queries",
                 "Lane",
                 "Score",
                 "Status",
@@ -6857,9 +6874,9 @@ PY
             selectmode="browse",
         )
         for col, width in [
-            ("Worker", 160),
+            ("Legacy Worker", 160),
             ("Route", 220),
-            ("Profile", 180),
+            ("Queries", 180),
             ("Lane", 100),
             ("Score", 90),
             ("Status", 180),
@@ -6891,8 +6908,8 @@ PY
         form_frame.pack(fill=tk.BOTH, expand=True)
 
         fields = [
-            ("Worker Name (e.g., worker_1)", "worker_name"),
-            ("Profile Name/ID (e.g., profile_29)", "user_data_dir"),
+            ("Legacy Worker Origin (read-only)", "worker_name"),
+            ("Execution Profiles (managed separately)", "user_data_dir"),
             ("Route Name (Identifier)", "route_name"),
             ("Scrape Search Queries (CSV)", "search_queries"),
         ]
@@ -6904,7 +6921,10 @@ PY
         # Generate inputs
         for idx, (label, key) in enumerate(fields):
             ttk.Label(form_frame, text=label + ":").pack(anchor="w", pady=(8, 2))
-            ttk.Entry(form_frame, textvariable=self.vps_scraper_form_vars[key]).pack(fill="x")
+            entry = ttk.Entry(form_frame, textvariable=self.vps_scraper_form_vars[key])
+            if key in {"worker_name", "user_data_dir"}:
+                entry.state(["readonly"])
+            entry.pack(fill="x")
 
         ttk.Label(form_frame, text="Lane Override:").pack(anchor="w", pady=(8, 2))
         lane_override_dropdown = ttk.Combobox(
@@ -6921,11 +6941,14 @@ PY
             textvariable=self.vps_scraper_form_vars["proxy_profile"],
             state="readonly",
         )
-        proxy_dropdown["values"] = list(self.vps_proxy_profile_options.keys()) + ["Custom (manual proxy)"]
+        proxy_dropdown["values"] = list(self.vps_proxy_profile_options.keys()) or [
+            VPS_PROXY_PROFILE_DIRECT,
+            VPS_PROXY_PROFILE_CUSTOM,
+        ]
         proxy_dropdown.pack(fill="x")
 
         # Custom Proxy Overrides
-        custom_frame = ttk.LabelFrame(form_frame, text="Custom Proxy Override (IP:PORT)")
+        custom_frame = ttk.LabelFrame(form_frame, text="Optional Route Proxy Override (IP:PORT)")
         custom_frame.pack(fill="x", pady=(10, 0), ipady=5)
         ttk.Entry(custom_frame, textvariable=self.vps_scraper_form_vars["proxy_server"]).pack(fill="x", padx=5, pady=5)
         
@@ -6937,13 +6960,15 @@ PY
             offvalue="0"
         ).pack(anchor="w", pady=(10, 0))
 
-        ttk.Checkbutton(
+        manual_login_checkbox = ttk.Checkbutton(
             form_frame,
-            text="Force Manual Login Required",
+            text="Manual Login is managed on execution profiles",
             variable=self.vps_scraper_form_vars["manual_login_required"],
             onvalue="1",
             offvalue="0"
-        ).pack(anchor="w", pady=(5, 0))
+        )
+        manual_login_checkbox.state(["disabled"])
+        manual_login_checkbox.pack(anchor="w", pady=(5, 0))
 
         computed_lane_frame = ttk.LabelFrame(form_frame, text="Computed Scheduler State")
         computed_lane_frame.pack(fill="x", pady=(12, 0), ipady=4)
