@@ -711,14 +711,59 @@ Condition accuracy is a critical decision parameter and currently constrained by
   - [x] API payload compatibility with nullable `thumbnail_url`
 - [x] Fresh 2026-03-10 code audit found no additional undocumented code-level features/process enhancements beyond the approved Phase 5 work and the earlier audit sections
 
+### Phase 6 Completed (This Update)
+
+- [x] Added shared Phase 6 runtime-ops/config contracts:
+  - [x] Redis runtime-config hash `flipper:runtime_config`
+  - [x] typed runtime-config helper with cached reads and authenticated write support
+  - [x] operator-adjustable lane thresholds for Phase 4 scheduler scoring
+  - [x] `NOTIFICATION_CONSUMER_DRAIN` drain control for the notification consumer
+- [x] Added authenticated operator API endpoints:
+  - [x] `GET /ops/realtime-health`
+  - [x] `GET /ops/stream-backlog`
+  - [x] `GET /ops/runtime-config`
+  - [x] `PUT /ops/runtime-config`
+  - [x] `GET /ops/notification-dead-letter`
+  - [x] `POST /ops/replay/notifications`
+- [x] Added notification dead-letter + replay tooling:
+  - [x] Redis Stream `stream:notification_dead_letter`
+  - [x] shared dead-letter codec carrying original listing-stream payload + failure metadata
+  - [x] terminal delivery failures now write a dead-letter entry, mark the ledger `failed_terminal`, and `XACK` the original listing stream entry
+  - [x] bounded replay tooling resets `failed_terminal` ledger rows and republishes only dead-lettered notification events back onto `stream:listings`
+- [x] Added backlog/health visibility:
+  - [x] worker publish-health fields persisted on `worker_heartbeats`
+  - [x] Redis backlog inspection for `stream:listings`, `stream:listing_enrichment`, and `stream:notification_dead_letter`
+  - [x] notification consumer lag/pending summary and websocket connection count exposed through `GET /ops/realtime-health`
+- [x] Added operational observability:
+  - [x] `runtime_config_snapshot`
+  - [x] `runtime_config_updated`
+  - [x] `notification_consumer_drain_state`
+  - [x] `notification_dead_letter_written`
+  - [x] `notification_dead_letter_failed`
+  - [x] `notification_replay_requested`
+  - [x] `notification_replay_completed`
+  - [x] `stream_backlog_inspected`
+  - [x] `realtime_health_inspected`
+- [x] Deployment/runtime hardening:
+  - [x] compose `stop_grace_period` added for `notification_worker` and `enrichment_worker`
+  - [x] existing Redis-backed feature flags remain the authoritative rollback switches for live push, notification consumer, priority scheduler, route lanes, and background enrichment
+- [x] Added targeted tests for:
+  - [x] runtime-config parsing/cache/update behavior
+  - [x] dead-letter codec round-trip
+  - [x] notification consumer dead-letter, drain-mode, and replay-fallback behavior
+  - [x] API runtime-config mutation, backlog inspection, realtime health, and replay
+  - [x] scheduler lane-threshold override behavior
+  - [x] worker publish-health persistence/failure recording
+- [x] Fresh 2026-03-10 code audit found no newly undocumented code-level features/process enhancements beyond the approved Phase 6 work and the earlier audit sections
+
 ### Planned Next Phases
 
 - [x] Phase 5: hot-path payload slimming and background enrichment for non-critical fields
-- [ ] Phase 6: reliability/replay/operator controls (health endpoints, backlog visibility, replay tooling, live push rollback switches)
+- [x] Phase 6: reliability/replay/operator controls (health endpoints, backlog visibility, replay tooling, live push rollback switches)
 
 ### Upgrade-Track Notes
 
-- Current baseline after Phase 5 rollout: Postgres remains authoritative, Redis pub/sub fanout stays active as the API trigger for normalized WebSocket fanout, Redis Streams publishing remains enabled, notification delivery remains on the dedicated notification consumer, priority scheduling / route lanes remain enabled, and cold-field enrichment now runs on a separate Redis Streams consumer so the first discovery-to-alert path no longer waits on description/seller/thumbnail backfill.
+- Current baseline after Phase 6 rollout: Postgres remains authoritative, Redis pub/sub fanout stays active as the API trigger for normalized WebSocket fanout, Redis Streams publishing remains enabled, notification delivery remains on the dedicated notification consumer, priority scheduling / route lanes remain enabled, cold-field enrichment remains on its own Redis Streams consumer, and operators now have authenticated API control over flags/runtime thresholds plus dead-letter/replay and backlog inspection.
 - VPS rollout state on 2026-03-10:
   - `ENABLE_REDIS_STREAM_EVENTS=1`
   - `ENABLE_NOTIFICATION_CONSUMER=1`
@@ -789,6 +834,10 @@ Condition accuracy is a critical decision parameter and currently constrained by
   - alert pipeline does not block on deep enrichment
   - CPU and memory usage per worker decrease or remain flat
   - notification payload remains sufficient for decision-making
+- Acceptance criteria now met after Phase 6:
+  - notification service can be restarted without data loss
+  - backlog and consumer lag can be measured and inspected
+  - the new realtime subsystems can be disabled or tuned through authenticated Redis-backed operator controls without manual Redis access
 
 ---
 
@@ -837,4 +886,4 @@ Fresh audit note (2026-03-10): no additional undocumented code-level features we
 
 ## Current Focus Recommendation
 
-Active priority is **V3.0 Phase 6**. The next implementation step should focus on reliability/replay/operator controls on top of the separated fast alert path and background enrichment path while keeping the broader **Phase 5A** server-migration direction intact. Dolphin Anty VPS installation remains operational. Remaining high-impact items after Phase 5 acceptance: replay/operator tooling, backlog/health visibility, and deeper `legacy_utils.py` coverage.
+Active priority remains the broader **Phase 5A** server-migration hardening track plus optional later-phase profiling work. V3.0 Phase 6 reliability/replay/operator controls are now implemented. Remaining high-impact items after Phase 6 acceptance: deeper `legacy_utils.py` coverage, continued server migration cleanup, and any optional post-V3 performance studies only if profiling justifies them.

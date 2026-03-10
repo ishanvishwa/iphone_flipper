@@ -185,9 +185,18 @@ CREATE TABLE IF NOT EXISTS worker_heartbeats (
     query_count INTEGER NOT NULL DEFAULT 0,
     last_run_started_at TIMESTAMPTZ,
     last_run_finished_at TIMESTAMPTZ,
+    last_event_publish_at TIMESTAMPTZ,
+    last_event_publish_status TEXT,
+    last_event_publish_error TEXT,
+    last_stream_event_id TEXT,
     last_error TEXT,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS last_event_publish_at TIMESTAMPTZ;
+ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS last_event_publish_status TEXT;
+ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS last_event_publish_error TEXT;
+ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS last_stream_event_id TEXT;
 
 CREATE TABLE IF NOT EXISTS worker_scrape_events (
     id BIGSERIAL PRIMARY KEY,

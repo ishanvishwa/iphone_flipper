@@ -14,10 +14,23 @@ from fastapi.encoders import jsonable_encoder
 from fastapi import FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
-from server.services.common.feature_flags import FLAG_HASH_KEY, RedisFeatureFlags
+from redis.exceptions import ResponseError
+from server.services.common.feature_flags import DEFAULT_FEATURE_FLAGS, FLAG_HASH_KEY, RedisFeatureFlags
+from server.services.common.notification_dead_letter import (
+    NOTIFICATION_DEAD_LETTER_STREAM_NAME,
+    NotificationDeadLetterEvent,
+)
 from server.services.common.observability import emit_json_log, monotonic_duration_ms, utc_now_iso
 from server.services.common.route_lanes import normalize_route_lane
+from server.services.common.runtime_config import (
+    DEFAULT_RUNTIME_CONFIG,
+    RUNTIME_CONFIG_HASH_KEY,
+    RedisRuntimeConfig,
+    parse_runtime_config_value,
+)
 from server.services.common.schema_ensure import ensure_worker_tables as ensure_common_worker_tables
+from server.services.common.stream_events import LISTING_STREAM_MAXLEN, LISTING_STREAM_NAME, ListingStreamEvent
+from server.services.common.enrichment_events import LISTING_ENRICHMENT_STREAM_NAME
 
 APP_ENV = os.getenv("APP_ENV", "production")
 API_TOKEN = os.getenv("APP_API_TOKEN", "")
@@ -139,6 +152,18 @@ class ProxyStatsResetRequest(BaseModel):
     clear_failures: bool = True
 
 
+class RuntimeConfigUpdateRequest(BaseModel):
+    feature_flags: dict[str, bool | None] | None = None
+    runtime_config: dict[str, bool | float | None] | None = None
+
+
+class NotificationReplayRequest(BaseModel):
+    window_minutes: int = Field(default=60, ge=1, le=1440)
+    limit: int = Field(default=100, ge=1, le=500)
+    dry_run: bool = False
+    listing_id: str | None = Field(default=None, max_length=255)
+
+
 def _assert_api_token(token: str | None) -> None:
     if not API_TOKEN:
         if APP_ENV == "production":
@@ -212,6 +237,137 @@ async def _is_gui_websocket_push_enabled() -> bool:
     if feature_flags is None:
         return False
     return await feature_flags.is_enabled("ENABLE_GUI_WEBSOCKET_PUSH")
+
+
+async def _runtime_config_snapshot() -> dict[str, bool | float]:
+    runtime_config: RedisRuntimeConfig | None = getattr(app.state, "runtime_config", None)
+    if runtime_config is None:
+        return dict(DEFAULT_RUNTIME_CONFIG)
+    return await runtime_config.snapshot()
+
+
+def _stream_id_from_epoch_ms(epoch_ms: int) -> str:
+    return f"{max(0, int(epoch_ms))}-0"
+
+
+def _normalize_stream_info(raw_info: Any) -> dict[str, Any]:
+    if not isinstance(raw_info, dict):
+        return {"length": 0, "last_generated_id": None, "last_entry_id": None}
+    last_entry = raw_info.get("last-entry")
+    last_entry_id = None
+    if isinstance(last_entry, (list, tuple)) and last_entry:
+        last_entry_id = str(last_entry[0])
+    return {
+        "length": int(raw_info.get("length") or 0),
+        "last_generated_id": str(raw_info.get("last-generated-id") or "") or None,
+        "last_entry_id": last_entry_id,
+    }
+
+
+def _normalize_group_info(raw_groups: Any) -> list[dict[str, Any]]:
+    groups: list[dict[str, Any]] = []
+    for raw_group in list(raw_groups or []):
+        if not isinstance(raw_group, dict):
+            continue
+        groups.append(
+            {
+                "name": str(raw_group.get("name") or ""),
+                "consumers": int(raw_group.get("consumers") or 0),
+                "pending": int(raw_group.get("pending") or 0),
+                "lag": int(raw_group.get("lag") or 0),
+                "last_delivered_id": str(raw_group.get("last-delivered-id") or "") or None,
+                "entries_read": int(raw_group.get("entries-read") or 0),
+            }
+        )
+    return groups
+
+
+def _normalize_xpending_summary(raw_pending: Any) -> dict[str, Any]:
+    if isinstance(raw_pending, dict):
+        consumers = raw_pending.get("consumers") or []
+        normalized_consumers: list[dict[str, Any]] = []
+        for item in list(consumers):
+            if isinstance(item, dict):
+                normalized_consumers.append(
+                    {
+                        "name": str(item.get("name") or ""),
+                        "pending": int(item.get("pending") or 0),
+                    }
+                )
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                normalized_consumers.append({"name": str(item[0] or ""), "pending": int(item[1] or 0)})
+        return {
+            "pending": int(raw_pending.get("pending") or 0),
+            "min": str(raw_pending.get("min") or "") or None,
+            "max": str(raw_pending.get("max") or "") or None,
+            "consumers": normalized_consumers,
+        }
+    if isinstance(raw_pending, (list, tuple)) and len(raw_pending) >= 4:
+        consumers = []
+        for item in list(raw_pending[3] or []):
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                consumers.append({"name": str(item[0] or ""), "pending": int(item[1] or 0)})
+        return {
+            "pending": int(raw_pending[0] or 0),
+            "min": str(raw_pending[1] or "") or None,
+            "max": str(raw_pending[2] or "") or None,
+            "consumers": consumers,
+        }
+    return {"pending": 0, "min": None, "max": None, "consumers": []}
+
+
+async def _fetch_stream_backlog(stream_name: str) -> dict[str, Any]:
+    redis_client: Redis = app.state.redis
+    try:
+        info = await redis_client.xinfo_stream(stream_name)
+    except ResponseError as exc:
+        if "no such key" in str(exc).lower():
+            return {"stream_name": stream_name, "length": 0, "groups": [], "exists": False}
+        raise
+
+    groups_raw = await redis_client.xinfo_groups(stream_name)
+    groups = _normalize_group_info(groups_raw)
+    for group in groups:
+        try:
+            pending_raw = await redis_client.xpending(stream_name, group["name"])
+        except ResponseError:
+            pending_raw = {}
+        group["pending_summary"] = _normalize_xpending_summary(pending_raw)
+
+    normalized_info = _normalize_stream_info(info)
+    return {
+        "stream_name": stream_name,
+        "exists": True,
+        "length": normalized_info["length"],
+        "last_generated_id": normalized_info["last_generated_id"],
+        "last_entry_id": normalized_info["last_entry_id"],
+        "groups": groups,
+    }
+
+
+async def _load_dead_letter_entries(
+    *,
+    window_minutes: int,
+    limit: int,
+    listing_id: str | None = None,
+) -> list[tuple[str, NotificationDeadLetterEvent]]:
+    redis_client: Redis = app.state.redis
+    now_ms = int(time.time() * 1000)
+    min_id = _stream_id_from_epoch_ms(now_ms - (max(1, int(window_minutes)) * 60 * 1000))
+    raw_entries = await redis_client.xrange(
+        NOTIFICATION_DEAD_LETTER_STREAM_NAME,
+        min=min_id,
+        max="+",
+        count=max(1, int(limit)),
+    )
+    entries: list[tuple[str, NotificationDeadLetterEvent]] = []
+    listing_filter = (listing_id or "").strip()
+    for raw_id, raw_fields in list(raw_entries or []):
+        event = NotificationDeadLetterEvent.from_redis_fields(dict(raw_fields or {}))
+        if listing_filter and event.listing_id != listing_filter:
+            continue
+        entries.append((str(raw_id), event))
+    return entries
 
 
 def _listing_row_to_item(row: asyncpg.Record) -> dict[str, Any]:
@@ -420,11 +576,18 @@ async def startup() -> None:
         decode_responses=True,
     )
     app.state.feature_flags = RedisFeatureFlags(app.state.redis, hash_key=FLAG_HASH_KEY)
+    app.state.runtime_config = RedisRuntimeConfig(app.state.redis, hash_key=RUNTIME_CONFIG_HASH_KEY)
     emit_json_log(
         "feature_flag_snapshot",
         service="api",
         flag_hash_key=FLAG_HASH_KEY,
         flags=await app.state.feature_flags.snapshot(),
+    )
+    emit_json_log(
+        "runtime_config_snapshot",
+        service="api",
+        runtime_config_hash_key=RUNTIME_CONFIG_HASH_KEY,
+        runtime_config=await app.state.runtime_config.snapshot(),
     )
     app.state.ws_manager = WebSocketConnectionManager()
     app.state.redis_listener_task = asyncio.create_task(_redis_listener())
@@ -575,6 +738,269 @@ async def healthz() -> dict[str, Any]:
     if not payload["ok"]:
         raise HTTPException(status_code=503, detail=payload)
     return payload
+
+
+@app.get("/ops/runtime-config")
+async def get_runtime_config(
+    x_api_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    await _auth_rest(x_api_token)
+    feature_flags: RedisFeatureFlags = app.state.feature_flags
+    runtime_config: RedisRuntimeConfig = app.state.runtime_config
+    return {
+        "feature_flags": await feature_flags.snapshot(),
+        "runtime_config": await runtime_config.snapshot(),
+    }
+
+
+@app.put("/ops/runtime-config")
+async def update_runtime_config(
+    payload: RuntimeConfigUpdateRequest,
+    x_api_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    await _auth_rest(x_api_token)
+    feature_flags: RedisFeatureFlags = app.state.feature_flags
+    runtime_config: RedisRuntimeConfig = app.state.runtime_config
+
+    requested_flags = dict(payload.feature_flags or {})
+    unsupported_flags = sorted(set(requested_flags) - set(DEFAULT_FEATURE_FLAGS))
+    if unsupported_flags:
+        raise HTTPException(status_code=400, detail=f"Unsupported feature_flags keys: {', '.join(unsupported_flags)}")
+
+    requested_runtime = dict(payload.runtime_config or {})
+    unsupported_runtime = sorted(set(requested_runtime) - set(DEFAULT_RUNTIME_CONFIG))
+    if unsupported_runtime:
+        raise HTTPException(status_code=400, detail=f"Unsupported runtime_config keys: {', '.join(unsupported_runtime)}")
+
+    normalized_runtime: dict[str, bool | float | None] = {}
+    for key, value in requested_runtime.items():
+        if value is None:
+            normalized_runtime[key] = None
+        else:
+            normalized_runtime[key] = parse_runtime_config_value(value, DEFAULT_RUNTIME_CONFIG[key])
+
+    flags_snapshot = await feature_flags.set_flag_values(requested_flags) if requested_flags else await feature_flags.snapshot()
+    runtime_snapshot = await runtime_config.set_values(normalized_runtime) if normalized_runtime else await runtime_config.snapshot()
+
+    if requested_flags.get("ENABLE_GUI_WEBSOCKET_PUSH") is False:
+        await _close_all_ws_clients_disabled("feature_flag_off")
+
+    emit_json_log(
+        "runtime_config_updated",
+        service="api",
+        feature_flag_updates=requested_flags or None,
+        runtime_config_updates=normalized_runtime or None,
+        feature_flags=flags_snapshot,
+        runtime_config=runtime_snapshot,
+    )
+    return {
+        "ok": True,
+        "feature_flags": flags_snapshot,
+        "runtime_config": runtime_snapshot,
+    }
+
+
+@app.get("/ops/stream-backlog")
+async def get_stream_backlog(
+    x_api_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    await _auth_rest(x_api_token)
+    listings = await _fetch_stream_backlog(LISTING_STREAM_NAME)
+    enrichment = await _fetch_stream_backlog(LISTING_ENRICHMENT_STREAM_NAME)
+    dead_letter = await _fetch_stream_backlog(NOTIFICATION_DEAD_LETTER_STREAM_NAME)
+    emit_json_log(
+        "stream_backlog_inspected",
+        service="api",
+        stream_names=[LISTING_STREAM_NAME, LISTING_ENRICHMENT_STREAM_NAME, NOTIFICATION_DEAD_LETTER_STREAM_NAME],
+    )
+    return {
+        "streams": {
+            "listings": listings,
+            "listing_enrichment": enrichment,
+            "notification_dead_letter": dead_letter,
+        }
+    }
+
+
+@app.get("/ops/realtime-health")
+async def get_realtime_health(
+    x_api_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    await _auth_rest(x_api_token)
+    feature_flags: RedisFeatureFlags = app.state.feature_flags
+    runtime_snapshot = await _runtime_config_snapshot()
+    websocket_client_count = await app.state.ws_manager.active_count()
+    stream_backlog = await get_stream_backlog(x_api_token=x_api_token)
+
+    async with app.state.db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                worker_name,
+                route_name,
+                status,
+                updated_at,
+                last_event_publish_at,
+                last_event_publish_status,
+                last_event_publish_error,
+                last_stream_event_id
+            FROM worker_heartbeats
+            ORDER BY worker_name ASC
+            """
+        )
+    worker_publish_health = [
+        _serialize_datetimes(
+            dict(row),
+            ("updated_at", "last_event_publish_at"),
+        )
+        for row in rows
+    ]
+
+    listings_groups = stream_backlog["streams"]["listings"].get("groups") or []
+    notification_group = next((group for group in listings_groups if group.get("name") == "listing_notifications"), None)
+    dead_letter_length = int(stream_backlog["streams"]["notification_dead_letter"].get("length") or 0)
+    payload = {
+        "feature_flags": await feature_flags.snapshot(),
+        "runtime_config": runtime_snapshot,
+        "websocket_connection_count": websocket_client_count,
+        "notification_consumer": {
+            "drain_enabled": bool(runtime_snapshot.get("NOTIFICATION_CONSUMER_DRAIN")),
+            "group": notification_group,
+        },
+        "dead_letter_queue_size": dead_letter_length,
+        "worker_event_publish_health": worker_publish_health,
+        "stream_backlog": stream_backlog["streams"],
+    }
+    emit_json_log(
+        "realtime_health_inspected",
+        service="api",
+        websocket_connection_count=websocket_client_count,
+        dead_letter_queue_size=dead_letter_length,
+        drain_enabled=bool(runtime_snapshot.get("NOTIFICATION_CONSUMER_DRAIN")),
+    )
+    return payload
+
+
+@app.get("/ops/notification-dead-letter")
+async def get_notification_dead_letter(
+    window_minutes: int = Query(default=60, ge=1, le=1440),
+    limit: int = Query(default=100, ge=1, le=500),
+    listing_id: str | None = Query(default=None),
+    x_api_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    await _auth_rest(x_api_token)
+    try:
+        entries = await _load_dead_letter_entries(
+            window_minutes=window_minutes,
+            limit=limit,
+            listing_id=listing_id,
+        )
+    except ResponseError as exc:
+        if "no such key" in str(exc).lower():
+            entries = []
+        else:
+            raise
+    items = [
+        {
+            "dead_letter_event_id": dead_letter_event_id,
+            **event.to_redis_fields(),
+        }
+        for dead_letter_event_id, event in entries
+    ]
+    return {
+        "count": len(items),
+        "window_minutes": window_minutes,
+        "items": items,
+    }
+
+
+@app.post("/ops/replay/notifications")
+async def replay_notification_dead_letters(
+    payload: NotificationReplayRequest,
+    x_api_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    await _auth_rest(x_api_token)
+    try:
+        entries = await _load_dead_letter_entries(
+            window_minutes=payload.window_minutes,
+            limit=payload.limit,
+            listing_id=payload.listing_id,
+        )
+    except ResponseError as exc:
+        if "no such key" in str(exc).lower():
+            entries = []
+        else:
+            raise
+    replay_candidates = entries[: payload.limit]
+    emit_json_log(
+        "notification_replay_requested",
+        service="api",
+        window_minutes=payload.window_minutes,
+        limit=payload.limit,
+        dry_run=payload.dry_run,
+        requested_listing_id=(payload.listing_id or "").strip() or None,
+        candidate_count=len(replay_candidates),
+    )
+
+    replayed_items: list[dict[str, Any]] = []
+    if payload.dry_run:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "count": len(replay_candidates),
+            "items": [
+                {"dead_letter_event_id": dead_letter_event_id, "listing_id": event.listing_id}
+                for dead_letter_event_id, event in replay_candidates
+            ],
+        }
+
+    async with app.state.db_pool.acquire() as conn:
+        async with conn.transaction():
+            for dead_letter_event_id, dead_letter in replay_candidates:
+                row = await conn.fetchrow(
+                    """
+                    UPDATE notification_delivery_ledger
+                    SET
+                        status = 'pending',
+                        last_error = NULL,
+                        updated_at = NOW()
+                    WHERE listing_id = $1
+                      AND status = 'failed_terminal'
+                    RETURNING listing_id
+                    """,
+                    dead_letter.listing_id,
+                )
+                if row is None:
+                    continue
+                replay_event = dead_letter.to_listing_stream_event()
+                replayed_stream_event_id = await app.state.redis.xadd(
+                    LISTING_STREAM_NAME,
+                    replay_event.to_redis_fields(),
+                    maxlen=LISTING_STREAM_MAXLEN,
+                    approximate=True,
+                )
+                replayed_items.append(
+                    {
+                        "dead_letter_event_id": dead_letter_event_id,
+                        "listing_id": dead_letter.listing_id,
+                        "replayed_stream_event_id": str(replayed_stream_event_id),
+                    }
+                )
+
+    emit_json_log(
+        "notification_replay_completed",
+        service="api",
+        window_minutes=payload.window_minutes,
+        limit=payload.limit,
+        replayed_count=len(replayed_items),
+        requested_listing_id=(payload.listing_id or "").strip() or None,
+    )
+    return {
+        "ok": True,
+        "dry_run": False,
+        "count": len(replayed_items),
+        "items": replayed_items,
+    }
 
 
 @app.get("/listings")

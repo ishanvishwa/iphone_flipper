@@ -43,6 +43,10 @@ from server.services.common.enrichment_events import (  # noqa: E402
     has_cold_enrichment_payload,
     split_listing_for_fast_path,
 )
+from server.services.common.runtime_config import (  # noqa: E402
+    RUNTIME_CONFIG_HASH_KEY,
+    RedisRuntimeConfig,
+)
 from server.services.common.observability import (  # noqa: E402
     emit_json_log,
     emit_json_payload,
@@ -1367,11 +1371,13 @@ def _select_next_route(
     now: datetime | None = None,
     *,
     use_priority_scheduler: bool = False,
+    runtime_config: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     return select_next_route_from_module(
         routes=routes,
         now=now,
         use_priority_scheduler=use_priority_scheduler,
+        runtime_config=runtime_config,
     )
 
 
@@ -1380,11 +1386,13 @@ def _annotate_routes_with_priority(
     *,
     now: datetime,
     fallback_interval_seconds: float,
+    runtime_config: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     return annotate_routes_with_priority_from_module(
         routes=routes,
         now=now,
         fallback_interval_seconds=fallback_interval_seconds,
+        runtime_config=runtime_config,
     )
 
 
@@ -2137,7 +2145,7 @@ async def _upsert_worker_heartbeat(
     last_error: str | None = None,
     started_at: datetime | None = None,
     finished_at: datetime | None = None,
-) -> None:
+    ) -> None:
     query = """
         INSERT INTO worker_heartbeats (
             worker_name,
@@ -2174,6 +2182,52 @@ async def _upsert_worker_heartbeat(
             finished_at,
             (last_error or "").strip()[:2000] or None,
         )
+
+
+async def _record_worker_event_publish_health(
+    pool: asyncpg.Pool,
+    *,
+    route_name: str | None,
+    publish_status: str,
+    published_at: str | None,
+    last_error: str | None = None,
+    stream_event_id: str | None = None,
+) -> None:
+    if not hasattr(pool, "acquire"):
+        return
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO worker_heartbeats (
+                    worker_name,
+                    route_name,
+                    status,
+                    last_event_publish_at,
+                    last_event_publish_status,
+                    last_event_publish_error,
+                    last_stream_event_id,
+                    updated_at
+                ) VALUES (
+                    $1, $2, 'idle', $3::timestamptz, $4, $5, $6, NOW()
+                )
+                ON CONFLICT (worker_name) DO UPDATE SET
+                    route_name = COALESCE(EXCLUDED.route_name, worker_heartbeats.route_name),
+                    last_event_publish_at = EXCLUDED.last_event_publish_at,
+                    last_event_publish_status = EXCLUDED.last_event_publish_status,
+                    last_event_publish_error = EXCLUDED.last_event_publish_error,
+                    last_stream_event_id = COALESCE(EXCLUDED.last_stream_event_id, worker_heartbeats.last_stream_event_id),
+                    updated_at = NOW()
+                """,
+                WORKER_NAME,
+                (route_name or "").strip() or None,
+                published_at,
+                (publish_status or "").strip() or None,
+                (last_error or "").strip()[:2000] or None,
+                (stream_event_id or "").strip() or None,
+            )
+    except Exception as exc:
+        logging.debug("[%s] failed to record worker publish health: %s", WORKER_NAME, exc)
 
 
 async def _record_scrape_events(
@@ -2535,13 +2589,47 @@ async def _process_listing_event(
         else:
             stream_publish_status = "suppressed_unchanged"
 
-    listing_event_published_ts, redis_publish_latency_ms = await _publish_listing_event(
-        redis_client=redis_client,
-        event_name=event_name,
-        listing=listing,
-        metadata=metadata,
-    )
+    try:
+        listing_event_published_ts, redis_publish_latency_ms = await _publish_listing_event(
+            redis_client=redis_client,
+            event_name=event_name,
+            listing=listing,
+            metadata=metadata,
+        )
+    except Exception as exc:
+        publish_error = str(exc)[:500]
+        await _record_worker_event_publish_health(
+            pool=pool,
+            route_name=route_name,
+            publish_status="failed",
+            published_at=utc_now_iso(),
+            last_error=publish_error,
+            stream_event_id=stream_event_id,
+        )
+        emit_json_log(
+            "listing_event_publish_failed",
+            listing_id=listing_id,
+            event_id=event_id,
+            worker_name=WORKER_NAME,
+            route_name=route_name,
+            event_name=event_name,
+            listing_seen_ts=listing_seen_ts,
+            listing_persisted_ts=listing_persisted_ts,
+            stream_name=LISTING_STREAM_NAME,
+            stream_event_id=stream_event_id,
+            stream_publish_status=stream_publish_status,
+            error=publish_error,
+        )
+        raise
     _increment_latency_metric(cycle_metrics, "redis_publish_latency_ms", redis_publish_latency_ms)
+    await _record_worker_event_publish_health(
+        pool=pool,
+        route_name=route_name,
+        publish_status="ok",
+        published_at=listing_event_published_ts,
+        last_error=None,
+        stream_event_id=stream_event_id,
+    )
 
     enrichment_event_id: str | None = None
     enrichment_enqueued_ts: str | None = None
@@ -3449,12 +3537,20 @@ async def _main() -> None:
         decode_responses=True,
     )
     feature_flags = RedisFeatureFlags(redis_client, hash_key=FLAG_HASH_KEY)
+    runtime_config = RedisRuntimeConfig(redis_client, hash_key=RUNTIME_CONFIG_HASH_KEY)
     emit_json_log(
         "feature_flag_snapshot",
         service="worker",
         worker_name=WORKER_NAME,
         flag_hash_key=FLAG_HASH_KEY,
         flags=await feature_flags.snapshot(),
+    )
+    emit_json_log(
+        "runtime_config_snapshot",
+        service="worker",
+        worker_name=WORKER_NAME,
+        runtime_config_hash_key=RUNTIME_CONFIG_HASH_KEY,
+        runtime_config=await runtime_config.snapshot(),
     )
 
     logging.info(
@@ -3476,7 +3572,7 @@ async def _main() -> None:
 
     # Enter main scrape event loop
     try:
-        await _run_worker_loop(pool, redis_client, feature_flags)
+        await _run_worker_loop(pool, redis_client, feature_flags, runtime_config)
     except asyncio.CancelledError:
         logging.info("[%s] Worker shut down requested.", WORKER_NAME)
 
@@ -3485,6 +3581,7 @@ async def _run_worker_loop(
     pool: asyncpg.Pool,
     redis_client: Redis,
     feature_flags: RedisFeatureFlags | None,
+    runtime_config: RedisRuntimeConfig | None,
 ) -> None:
     logging.info("[%s] worker loop online", WORKER_NAME)
     global _SINGLE_ROUTE_ENFORCEMENT_ACTIVE
@@ -3550,17 +3647,22 @@ async def _run_worker_loop(
                     )
 
                 now_dt = datetime.now(timezone.utc)
+                runtime_snapshot: dict[str, Any] | None = None
+                if runtime_config is not None:
+                    runtime_snapshot = await runtime_config.snapshot()
                 if route_lanes_enabled and routes:
                     _annotate_routes_with_priority(
                         routes,
                         now=now_dt,
                         fallback_interval_seconds=effective_interval_seconds,
+                        runtime_config=runtime_snapshot,
                     )
                     await _persist_route_priority_state(pool=pool, routes=routes)
                 route = _select_next_route(
                     routes,
                     now=now_dt,
                     use_priority_scheduler=priority_scheduler_enabled,
+                    runtime_config=runtime_snapshot,
                 )
                 
                 if route is None:

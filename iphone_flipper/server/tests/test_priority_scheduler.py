@@ -90,6 +90,29 @@ class PrioritySchedulerTests(unittest.TestCase):
         self.assertEqual(lane_interval_multiplier("hot"), 1.0)
         self.assertGreater(lane_interval_multiplier("sweep"), lane_interval_multiplier("warm"))
 
+    def test_runtime_config_thresholds_can_promote_route_to_hot(self) -> None:
+        now = datetime(2026, 3, 10, tzinfo=timezone.utc)
+        route = {
+            "route_name": "route-thresholds",
+            "priority": 100,
+            "next_run_at": now - timedelta(seconds=15),
+            "route_interval_seconds": 30,
+            "avg_result_count": 1.0,
+            "profitable_hit_rate": 0.2,
+            "recent_duplicate_ratio": 0.0,
+            "status": "ENABLED",
+            "consecutive_failures": 0,
+        }
+
+        annotate_routes_with_priority(
+            [route],
+            now=now,
+            fallback_interval_seconds=30.0,
+            runtime_config={"ROUTE_LANE_HOT_PROFITABLE_HIT_RATE_MIN": 0.15},
+        )
+
+        self.assertEqual(route["computed_lane"], "hot")
+
 
 if __name__ == "__main__":
     unittest.main()

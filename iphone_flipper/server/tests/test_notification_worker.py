@@ -66,6 +66,10 @@ class _FakeLedgerConnection:
             row["last_stream_event_id"] = str(args[1])
             row["status"] = "retry_pending"
             row["last_error"] = args[2]
+        elif "SET last_stream_event_id = $2, status = 'failed_terminal'" in normalized:
+            row["last_stream_event_id"] = str(args[1])
+            row["status"] = "failed_terminal"
+            row["last_error"] = args[2]
         elif "SET last_stream_event_id = $2, status = 'sent'" in normalized:
             row["last_stream_event_id"] = str(args[1])
             row["status"] = "sent"
@@ -101,6 +105,7 @@ class _FakeRedis:
         self.xautoclaim_result: object = ("0-0", [], [])
         self.xreadgroup_result: object = []
         self.group_create_error: Exception | None = None
+        self.xadd_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
 
     async def xgroup_create(self, *args, **kwargs):
         self.group_create_calls.append((args, kwargs))
@@ -117,6 +122,10 @@ class _FakeRedis:
 
     async def xreadgroup(self, *args, **kwargs):
         return self.xreadgroup_result
+
+    async def xadd(self, *args, **kwargs):
+        self.xadd_calls.append((args, kwargs))
+        return "1741604700000-0"
 
 
 def _build_stream_event(
@@ -300,6 +309,7 @@ class NotificationConsumerTests(unittest.IsolatedAsyncioTestCase):
         ledger.mark_attempt_started = AsyncMock()
         ledger.mark_sent = AsyncMock()
         ledger.mark_retry_pending = AsyncMock()
+        ledger.mark_failed_terminal = AsyncMock()
         stream_event_id, fields = _build_stream_event(listing_id="listing-retry")
         consumer = notification_worker.NotificationConsumer(
             redis_client=redis_client,
@@ -318,13 +328,46 @@ class NotificationConsumerTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await consumer.process_stream_entry(stream_event_id, fields)
 
-        self.assertEqual(result, "retry_pending")
+        self.assertEqual(result, "dead_lettered")
         self.assertEqual(ledger.mark_attempt_started.await_count, 2)
         ledger.mark_sent.assert_not_awaited()
-        ledger.mark_retry_pending.assert_awaited_once()
-        self.assertEqual(redis_client.acked, [])
+        ledger.mark_failed_terminal.assert_awaited_once()
+        ledger.mark_retry_pending.assert_not_awaited()
+        self.assertEqual(redis_client.acked, [(notification_worker.LISTING_STREAM_NAME, consumer.consumer_group, stream_event_id)])
+        self.assertEqual(len(redis_client.xadd_calls), 1)
         sleep_mock.assert_awaited_once_with(1.0)
-        self.assertEqual(emit_mock.call_args.kwargs["notification_status"], "retry_pending")
+        self.assertEqual(emit_mock.call_args.kwargs["notification_status"], "failed_terminal")
+
+    async def test_process_stream_entry_keeps_unacked_when_dead_letter_write_fails(self) -> None:
+        redis_client = _FakeRedis()
+        redis_client.xadd = AsyncMock(side_effect=RuntimeError("dead letter unavailable"))
+        feature_flags = MagicMock()
+        feature_flags.is_enabled = AsyncMock(return_value=True)
+        ledger = MagicMock()
+        ledger.prepare = AsyncMock(return_value="send")
+        ledger.mark_attempt_started = AsyncMock()
+        ledger.mark_sent = AsyncMock()
+        ledger.mark_retry_pending = AsyncMock()
+        ledger.mark_failed_terminal = AsyncMock()
+        stream_event_id, fields = _build_stream_event(listing_id="listing-retry-fallback")
+        consumer = notification_worker.NotificationConsumer(
+            redis_client=redis_client,
+            feature_flags=feature_flags,
+            ledger=ledger,
+            send_telegram_func=AsyncMock(return_value=False),
+            send_fcm_func=None,
+            pacer=MagicMock(wait_turn=AsyncMock()),
+            retry_attempts=2,
+            retry_base_delay_seconds=0.5,
+        )
+
+        with patch.object(notification_worker.asyncio, "sleep", AsyncMock()):
+            result = await consumer.process_stream_entry(stream_event_id, fields)
+
+        self.assertEqual(result, "retry_pending")
+        ledger.mark_retry_pending.assert_awaited_once()
+        ledger.mark_failed_terminal.assert_not_awaited()
+        self.assertEqual(redis_client.acked, [])
 
     async def test_run_once_reclaims_pending_entries_with_xautoclaim(self) -> None:
         redis_client = _FakeRedis()
@@ -377,6 +420,52 @@ class NotificationConsumerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(processed, 1)
         self.assertEqual(redis_client.acked, [(notification_worker.LISTING_STREAM_NAME, consumer.consumer_group, stream_event_id)])
+
+    async def test_run_once_drain_mode_skips_new_entries_but_claims_pending(self) -> None:
+        redis_client = _FakeRedis()
+        pending_event_id, pending_fields = _build_stream_event(listing_id="listing-pending-drain")
+        new_event_id, new_fields = _build_stream_event(listing_id="listing-new-drain")
+        redis_client.xautoclaim_result = ("0-0", [(pending_event_id, pending_fields)], [])
+        redis_client.xreadgroup_result = [
+            (notification_worker.LISTING_STREAM_NAME, [(new_event_id, new_fields)])
+        ]
+        feature_flags = MagicMock()
+        feature_flags.is_enabled = AsyncMock(return_value=True)
+        runtime_config = MagicMock()
+        runtime_config.get_bool = AsyncMock(return_value=True)
+        ledger = MagicMock()
+        ledger.prepare = AsyncMock(return_value="send")
+        ledger.mark_attempt_started = AsyncMock()
+        ledger.mark_sent = AsyncMock()
+        ledger.mark_retry_pending = AsyncMock()
+        ledger.mark_failed_terminal = AsyncMock()
+        consumer = notification_worker.NotificationConsumer(
+            redis_client=redis_client,
+            feature_flags=feature_flags,
+            runtime_config=runtime_config,
+            ledger=ledger,
+            send_telegram_func=AsyncMock(return_value=True),
+            send_fcm_func=None,
+            pacer=MagicMock(wait_turn=AsyncMock()),
+        )
+
+        processed = await consumer.run_once()
+
+        self.assertEqual(processed, 1)
+        self.assertEqual(redis_client.acked, [(notification_worker.LISTING_STREAM_NAME, consumer.consumer_group, pending_event_id)])
+
+    async def test_store_marks_failed_terminal_status(self) -> None:
+        pool = _FakeLedgerPool()
+        store = notification_worker.NotificationLedgerStore(pool)
+
+        await store.prepare("listing-failed", "1741604400000-0", True, "eligible")
+        await store.mark_failed_terminal("listing-failed", "1741604400000-0", "telegram failed")
+
+        entry = await store.get("listing-failed")
+
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.status, "failed_terminal")
+        self.assertEqual(entry.last_error, "telegram failed")
 
 
 if __name__ == "__main__":

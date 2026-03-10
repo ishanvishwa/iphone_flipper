@@ -2340,3 +2340,105 @@ This keeps `dev-log.md` actionable for both engineering and operations.
   - production still has no persisted `worker_routes` after the Phase 4 acceptance cleanup, so Phase 4 remains enabled but inert until operators create DB-backed routes again through the API/GUI
 
 ---
+
+### §43 – V3.0 Phase 6: Reliability, Replay, and Operator Controls (2026-03-10)
+
+- Summary: Implemented Phase 6 of the approved V3.0 upgrade track. The realtime path is now operable under failure: operators can inspect backlog and consumer lag through authenticated API endpoints, adjust runtime controls without manual Redis access, drain the notification consumer safely, inspect notification dead-letter entries, and replay bounded dead-letter windows back onto `stream:listings`.
+- Motivation:
+  - make the post-Phase-5 realtime path debuggable and recoverable without shelling into Redis
+  - prevent terminal notification failures from accumulating as permanently pending poison entries
+  - expose rollback/tuning controls for live push, scheduler behavior, and lane thresholds through the existing API surface
+- Changes:
+  - added shared runtime-config support in `server/services/common/runtime_config.py`:
+    - Redis hash `flipper:runtime_config`
+    - typed cached runtime config with bool/float parsing
+    - Phase 4 lane thresholds moved out of hard-coded scheduler constants into runtime config defaults:
+      - `ROUTE_LANE_HOT_SCORE_MIN=5.5`
+      - `ROUTE_LANE_HOT_PROFITABLE_HIT_RATE_MIN=0.35`
+      - `ROUTE_LANE_SWEEP_SCORE_MAX=2.4`
+      - `ROUTE_LANE_SWEEP_PROFITABLE_HIT_RATE_MAX=0.10`
+      - `ROUTE_LANE_SWEEP_AVG_RESULT_COUNT_MAX=2.0`
+    - added `NOTIFICATION_CONSUMER_DRAIN`
+  - extended `server/services/common/feature_flags.py`:
+    - authenticated API can now mutate `flipper:flags` safely instead of requiring manual `HSET`
+    - existing flags remain the authoritative rollback switches for live push, notification consumer, route lanes, priority scheduling, and background enrichment
+  - added notification dead-letter + replay support:
+    - shared dead-letter codec in `server/services/common/notification_dead_letter.py`
+    - new Redis stream `stream:notification_dead_letter` with capped retention
+    - `notification_worker.py` now writes terminal failures to dead-letter, marks the notification ledger `failed_terminal`, and `XACK`s the original `stream:listings` entry
+    - replay is intentionally bounded and operator-driven: only dead-lettered notification events within a requested time window are eligible for republish
+  - added API-first operator tooling in `server/services/api/app/main.py`:
+    - `GET /ops/realtime-health`
+    - `GET /ops/stream-backlog`
+    - `GET /ops/runtime-config`
+    - `PUT /ops/runtime-config`
+    - `GET /ops/notification-dead-letter`
+    - `POST /ops/replay/notifications`
+    - `PUT /ops/runtime-config` updates both `flipper:flags` and `flipper:runtime_config`, and immediately closes live websocket clients when `ENABLE_GUI_WEBSOCKET_PUSH=0`
+  - added worker publish-health persistence:
+    - `worker_heartbeats` now records `last_event_publish_at`, `last_event_publish_status`, `last_event_publish_error`, and `last_stream_event_id`
+    - worker event publication health is now queryable through the API instead of only through logs
+  - added operational observability:
+    - `runtime_config_snapshot`
+    - `runtime_config_updated`
+    - `notification_consumer_drain_state`
+    - `notification_dead_letter_written`
+    - `notification_dead_letter_failed`
+    - `notification_replay_requested`
+    - `notification_replay_completed`
+    - `stream_backlog_inspected`
+    - `realtime_health_inspected`
+  - compose/deploy hardening:
+    - added `stop_grace_period: 45s` for `notification_worker` and `enrichment_worker`
+    - kept `server/scripts/deploy_vps.sh` service set unchanged because it already deploys all relevant services for Phases 2-5
+  - fresh audit result:
+    - no additional undocumented code-level features or process enhancements were found beyond the approved Phase 6 work and the previously captured audit sections
+- Files touched:
+  - `server/services/common/feature_flags.py`
+  - `server/services/common/runtime_config.py`
+  - `server/services/common/notification_dead_letter.py`
+  - `server/services/common/schema_ensure.py`
+  - `server/services/worker/scheduler.py`
+  - `server/services/worker/worker.py`
+  - `server/services/worker/notification_worker.py`
+  - `server/services/worker/enrichment_worker.py`
+  - `server/services/api/app/main.py`
+  - `server/services/api/sql/001_init.sql`
+  - `server/infra/docker-compose.yml`
+  - `server/tests/test_feature_flags.py`
+  - `server/tests/test_runtime_config.py`
+  - `server/tests/test_notification_dead_letter.py`
+  - `server/tests/test_notification_worker.py`
+  - `server/tests/test_api_ops.py`
+  - `server/tests/test_priority_scheduler.py`
+  - `server/tests/test_worker_publish_health.py`
+  - `architecture.md`
+  - `roadmap.md`
+  - `dev-log.md`
+- Decision/rationale:
+  - Phase 6 stays API-first. No GUI operator panel was added in this phase.
+  - Replay is limited to dead-letter notification entries, not arbitrary full-stream rewind, to avoid creating a second event-recovery architecture or re-triggering already-sent alerts.
+  - Notification drain mode claims/finishes pending work but deliberately does not read new `>` entries until the drain flag is cleared, so maintenance windows are measurable and non-destructive.
+  - Worker publish-health writes are best-effort telemetry only and do not block the listing path if the heartbeat write fails.
+- Validation performed:
+  - local compile sanity:
+    - `python3 -m py_compile server/services/common/feature_flags.py server/services/common/runtime_config.py server/services/common/notification_dead_letter.py server/services/worker/scheduler.py server/services/worker/worker.py server/services/worker/notification_worker.py server/services/worker/enrichment_worker.py server/services/api/app/main.py`
+  - focused Phase 6 pytest coverage:
+    - `PYTHONPATH=iphone_flipper ./.venv/bin/python -m pytest iphone_flipper/server/tests/test_runtime_config.py iphone_flipper/server/tests/test_notification_dead_letter.py iphone_flipper/server/tests/test_notification_worker.py iphone_flipper/server/tests/test_api_ops.py iphone_flipper/server/tests/test_priority_scheduler.py iphone_flipper/server/tests/test_worker_publish_health.py -q`
+    - result: `31 passed`
+  - full server regression:
+    - `PYTHONPATH=iphone_flipper ./.venv/bin/python -m pytest iphone_flipper/server/tests -q`
+    - result: `142 passed`
+- Acceptance criteria status:
+  - `Can restart notification service without data loss.`  
+    Implemented through the existing consumer-group model plus Phase 6 operational controls; rollout verification still needs to run on the VPS after deploy.
+  - `Can measure and inspect backlog.`  
+    Implemented through `/ops/stream-backlog` and `/ops/realtime-health`.
+  - `Can disable any new subsystem via feature flags.`  
+    Implemented through authenticated `PUT /ops/runtime-config` backed by `flipper:flags`.
+  - dead-letter/replay sanity:
+    - implemented through `stream:notification_dead_letter` plus bounded `POST /ops/replay/notifications`
+- Remaining rollout task:
+  - deploy the Phase 6 branch to `ubuntu@15.235.185.32`, verify the new ops endpoints and dead-letter/replay flow against the live stack, then leave production in the normal drained=`false` state with the existing Phase 0-5 flags preserved
+
+---

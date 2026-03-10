@@ -44,3 +44,23 @@ class RedisFeatureFlagsTests(unittest.IsolatedAsyncioTestCase):
         snapshot = await flags.snapshot()
 
         self.assertEqual(snapshot, DEFAULT_FEATURE_FLAGS)
+
+    async def test_set_flag_values_updates_and_resets_fields(self) -> None:
+        redis_client = AsyncMock()
+        redis_client.hgetall.return_value = {
+            "ENABLE_PRIORITY_SCHEDULER": "1",
+            "ENABLE_ROUTE_LANES": "0",
+        }
+        flags = RedisFeatureFlags(redis_client=redis_client)
+
+        snapshot = await flags.set_flag_values(
+            {
+                "ENABLE_PRIORITY_SCHEDULER": True,
+                "ENABLE_ROUTE_LANES": None,
+            }
+        )
+
+        redis_client.hset.assert_awaited_once()
+        redis_client.hdel.assert_awaited_once()
+        self.assertTrue(snapshot["ENABLE_PRIORITY_SCHEDULER"])
+        self.assertFalse(snapshot["ENABLE_ROUTE_LANES"])

@@ -33,7 +33,8 @@ async def ensure_worker_tables(pool: asyncpg.Pool, include_triggers: bool = Fals
                 (5, 'Schema versioning table'),
                 (6, 'Notification delivery ledger'),
                 (7, 'Priority scheduler route lanes and metrics'),
-                (8, 'Background enrichment fields and ledger')
+                (8, 'Background enrichment fields and ledger'),
+                (9, 'Phase 6 runtime controls and publish health')
             ON CONFLICT (version) DO NOTHING;
             """
         )
@@ -353,10 +354,26 @@ async def ensure_worker_tables(pool: asyncpg.Pool, include_triggers: bool = Fals
                 query_count INTEGER NOT NULL DEFAULT 0,
                 last_run_started_at TIMESTAMPTZ,
                 last_run_finished_at TIMESTAMPTZ,
+                last_event_publish_at TIMESTAMPTZ,
+                last_event_publish_status TEXT,
+                last_event_publish_error TEXT,
+                last_stream_event_id TEXT,
                 last_error TEXT,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             """
+        )
+        await conn.execute(
+            "ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS last_event_publish_at TIMESTAMPTZ;"
+        )
+        await conn.execute(
+            "ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS last_event_publish_status TEXT;"
+        )
+        await conn.execute(
+            "ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS last_event_publish_error TEXT;"
+        )
+        await conn.execute(
+            "ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS last_stream_event_id TEXT;"
         )
         await conn.execute(
             """

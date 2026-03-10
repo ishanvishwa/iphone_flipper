@@ -22,6 +22,7 @@ from redis.exceptions import ResponseError
 from server.services.common.enrichment_events import LISTING_ENRICHMENT_STREAM_NAME, ListingEnrichmentEvent
 from server.services.common.feature_flags import FLAG_HASH_KEY, RedisFeatureFlags
 from server.services.common.observability import emit_json_log, monotonic_duration_ms, timestamp_delta_ms, utc_now_iso
+from server.services.common.runtime_config import RUNTIME_CONFIG_HASH_KEY, RedisRuntimeConfig
 from server.services.common.schema_ensure import ensure_worker_tables as ensure_common_worker_tables
 
 logger = logging.getLogger(__name__)
@@ -608,11 +609,18 @@ async def run_enrichment_worker() -> None:
         decode_responses=True,
     )
     feature_flags = RedisFeatureFlags(redis_client, hash_key=FLAG_HASH_KEY)
+    runtime_config = RedisRuntimeConfig(redis_client, hash_key=RUNTIME_CONFIG_HASH_KEY)
     emit_json_log(
         "feature_flag_snapshot",
         service="enrichment_worker",
         flag_hash_key=FLAG_HASH_KEY,
         flags=await feature_flags.snapshot(),
+    )
+    emit_json_log(
+        "runtime_config_snapshot",
+        service="enrichment_worker",
+        runtime_config_hash_key=RUNTIME_CONFIG_HASH_KEY,
+        runtime_config=await runtime_config.snapshot(),
     )
     consumer = EnrichmentConsumer(
         redis_client=redis_client,

@@ -7,6 +7,7 @@ from typing import Any
 
 import asyncpg
 
+from server.services.common.runtime_config import DEFAULT_RUNTIME_CONFIG
 from server.services.common.route_lanes import VALID_ROUTE_LANES, normalize_route_lane
 
 from .runtime import RouteStatus, compute_next_run_at, select_due_route
@@ -35,6 +36,21 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return float(default)
+
+
+def _lane_thresholds(config: dict[str, Any] | None = None) -> dict[str, float]:
+    snapshot = dict(DEFAULT_RUNTIME_CONFIG)
+    if config:
+        snapshot.update(config)
+    return {
+        "hot_score_min": _safe_float(snapshot.get("ROUTE_LANE_HOT_SCORE_MIN"), 5.5),
+        "hot_profit_rate_min": _safe_float(snapshot.get("ROUTE_LANE_HOT_PROFITABLE_HIT_RATE_MIN"), 0.35),
+        "sweep_score_max": _safe_float(snapshot.get("ROUTE_LANE_SWEEP_SCORE_MAX"), 2.4),
+        "sweep_profit_rate_max": _safe_float(snapshot.get("ROUTE_LANE_SWEEP_PROFITABLE_HIT_RATE_MAX"), 0.10),
+        "sweep_avg_result_count_max": _safe_float(snapshot.get("ROUTE_LANE_SWEEP_AVG_RESULT_COUNT_MAX"), 2.0),
+    }
+
+
 def lane_interval_multiplier(lane: Any) -> float:
     normalized = normalize_route_lane(lane, allow_none=False)
     return _LANE_INTERVAL_MULTIPLIER.get(normalized, 1.0)
@@ -91,8 +107,10 @@ def compute_route_priority(
     *,
     now: datetime | None = None,
     fallback_interval_seconds: float = 60.0,
+    runtime_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     now_dt = _normalize_dt(now, datetime.now(timezone.utc))
+    thresholds = _lane_thresholds(runtime_config)
     interval_seconds = route_interval_seconds(route=route, fallback_seconds=fallback_interval_seconds)
     next_run_at = _normalize_dt(route.get("next_run_at"), now_dt)
     last_selected_at = route.get("last_selected_at")
@@ -139,9 +157,16 @@ def compute_route_priority(
     )
 
     computed_lane = "warm"
-    if priority_score >= 5.5 or profitable_hit_rate >= 0.35:
+    if (
+        priority_score >= thresholds["hot_score_min"]
+        or profitable_hit_rate >= thresholds["hot_profit_rate_min"]
+    ):
         computed_lane = "hot"
-    elif priority_score < 2.4 and profitable_hit_rate < 0.1 and avg_result_count < 2.0:
+    elif (
+        priority_score < thresholds["sweep_score_max"]
+        and profitable_hit_rate < thresholds["sweep_profit_rate_max"]
+        and avg_result_count < thresholds["sweep_avg_result_count_max"]
+    ):
         computed_lane = "sweep"
 
     lane_override = normalize_route_lane(route.get("lane_override"))
@@ -166,6 +191,7 @@ def compute_route_priority(
         "due_age_seconds": round(due_age_seconds, 3),
         "revisit_age_seconds": round(revisit_age_seconds, 3),
         "lane_interval_multiplier": lane_interval_multiplier(effective_lane),
+        "lane_thresholds": thresholds,
     }
 
 
@@ -174,6 +200,7 @@ def annotate_routes_with_priority(
     *,
     now: datetime | None = None,
     fallback_interval_seconds: float = 60.0,
+    runtime_config: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     now_dt = _normalize_dt(now, datetime.now(timezone.utc))
     for route in routes:
@@ -182,6 +209,7 @@ def annotate_routes_with_priority(
                 route,
                 now=now_dt,
                 fallback_interval_seconds=fallback_interval_seconds,
+                runtime_config=runtime_config,
             )
         )
     return routes
@@ -192,6 +220,7 @@ def select_next_route(
     now: datetime | None = None,
     *,
     use_priority_scheduler: bool = False,
+    runtime_config: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     if not routes:
         return None
@@ -205,7 +234,7 @@ def select_next_route(
         if due_at > now_dt:
             continue
         if "priority_score" not in route or "effective_lane" not in route:
-            route.update(compute_route_priority(route, now=now_dt))
+            route.update(compute_route_priority(route, now=now_dt, runtime_config=runtime_config))
         lane = normalize_route_lane(route.get("effective_lane"), allow_none=False)
         score = _safe_float(route.get("priority_score"))
         due_routes.append(

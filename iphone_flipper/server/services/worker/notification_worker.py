@@ -21,7 +21,16 @@ from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 
 from server.services.common.feature_flags import FLAG_HASH_KEY, RedisFeatureFlags
+from server.services.common.notification_dead_letter import (
+    NOTIFICATION_DEAD_LETTER_STREAM_MAXLEN,
+    NOTIFICATION_DEAD_LETTER_STREAM_NAME,
+    build_notification_dead_letter_event,
+)
 from server.services.common.observability import emit_json_log, monotonic_duration_ms, timestamp_delta_ms, utc_now_iso
+from server.services.common.runtime_config import (
+    RUNTIME_CONFIG_HASH_KEY,
+    RedisRuntimeConfig,
+)
 from server.services.common.schema_ensure import ensure_worker_tables as ensure_common_worker_tables
 from server.services.common.stream_events import LISTING_STREAM_NAME, ListingStreamEvent
 
@@ -463,6 +472,24 @@ class NotificationLedgerStore:
                     error,
                 )
 
+    async def mark_failed_terminal(self, listing_id: str, stream_event_id: str, error: str) -> None:
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await _acquire_listing_advisory_lock(conn, listing_id)
+                await conn.execute(
+                    f"""
+                    UPDATE {NOTIFICATION_LEDGER_TABLE}
+                    SET last_stream_event_id = $2,
+                        status = 'failed_terminal',
+                        last_error = $3,
+                        updated_at = NOW()
+                    WHERE listing_id = $1
+                    """,
+                    listing_id,
+                    stream_event_id,
+                    error,
+                )
+
     async def mark_sent(self, listing_id: str, stream_event_id: str) -> None:
         async with self._pool.acquire() as conn:
             async with conn.transaction():
@@ -502,7 +529,7 @@ class NotificationStats:
     notifications_sent: int = 0
     suppressed: int = 0
     duplicates: int = 0
-    retry_pending: int = 0
+    dead_lettered: int = 0
     errors: int = 0
     started_at: float = field(default_factory=time.monotonic)
 
@@ -513,6 +540,7 @@ class NotificationConsumer:
         redis_client: Redis,
         feature_flags: RedisFeatureFlags,
         ledger: NotificationLedgerStore,
+        runtime_config: RedisRuntimeConfig | None = None,
         *,
         consumer_group: str = NOTIFICATION_CONSUMER_GROUP,
         consumer_name: str | None = None,
@@ -527,6 +555,7 @@ class NotificationConsumer:
     ) -> None:
         self._redis = redis_client
         self._feature_flags = feature_flags
+        self._runtime_config = runtime_config or RedisRuntimeConfig(None)
         self._ledger = ledger
         self._consumer_group = str(consumer_group or NOTIFICATION_CONSUMER_GROUP)
         self._consumer_name = str(consumer_name or _notification_consumer_name())
@@ -539,6 +568,7 @@ class NotificationConsumer:
         self._read_count = max(1, int(read_count or 1))
         self._block_ms = max(1, int(block_ms or 1))
         self.stats = NotificationStats()
+        self._last_drain_state: bool | None = None
 
     @property
     def consumer_group(self) -> str:
@@ -589,6 +619,46 @@ class NotificationConsumer:
         )
         return _normalize_xreadgroup_result(raw_result)
 
+    async def _publish_dead_letter(
+        self,
+        event: ListingStreamEvent,
+        *,
+        stream_event_id: str,
+        failure_status: str,
+        last_error: str,
+        attempt_count: int,
+    ) -> tuple[str, str]:
+        dead_lettered_at = utc_now_iso()
+        payload = build_notification_dead_letter_event(
+            stream_event_id=stream_event_id,
+            event=event,
+            failure_status=failure_status,
+            last_error=last_error,
+            attempt_count=attempt_count,
+            dead_lettered_at=dead_lettered_at,
+        )
+        dead_letter_event_id = await self._redis.xadd(
+            NOTIFICATION_DEAD_LETTER_STREAM_NAME,
+            payload.to_redis_fields(),
+            maxlen=NOTIFICATION_DEAD_LETTER_STREAM_MAXLEN,
+            approximate=True,
+        )
+        return str(dead_letter_event_id), dead_lettered_at
+
+    async def _drain_mode_enabled(self) -> bool:
+        enabled = await self._runtime_config.get_bool("NOTIFICATION_CONSUMER_DRAIN")
+        if self._last_drain_state is None or self._last_drain_state != enabled:
+            self._last_drain_state = enabled
+            emit_json_log(
+                "notification_consumer_drain_state",
+                service="notification_worker",
+                stream_name=LISTING_STREAM_NAME,
+                consumer_group=self._consumer_group,
+                consumer_name=self._consumer_name,
+                drain_enabled=enabled,
+            )
+        return enabled
+
     async def _attempt_delivery(self, event: ListingStreamEvent, stream_event_id: str) -> str:
         message = _build_telegram_card(event)
         last_error = "telegram_delivery_failed"
@@ -637,10 +707,38 @@ class NotificationConsumer:
             if attempt < self._retry_attempts:
                 await asyncio.sleep(self._retry_base_delay_seconds * (2 ** (attempt - 1)))
 
-        await self._ledger.mark_retry_pending(str(event.listing_id), stream_event_id, last_error)
-        self.stats.retry_pending += 1
+        try:
+            dead_letter_event_id, dead_lettered_at = await self._publish_dead_letter(
+                event,
+                stream_event_id=stream_event_id,
+                failure_status="failed_terminal",
+                last_error=last_error,
+                attempt_count=self._retry_attempts,
+            )
+        except Exception:
+            await self._ledger.mark_retry_pending(str(event.listing_id), stream_event_id, last_error)
+            emit_json_log(
+                "notification_dead_letter_failed",
+                listing_id=str(event.listing_id),
+                event_id=stream_event_id,
+                worker_name=str(event.worker_name or "") or None,
+                route_name=str(event.route_name or "") or None,
+                event_name=str(event.event_name or ""),
+                stream_name=LISTING_STREAM_NAME,
+                stream_event_id=stream_event_id,
+                dead_letter_stream_name=NOTIFICATION_DEAD_LETTER_STREAM_NAME,
+                notification_channel="telegram",
+                notification_status="retry_pending",
+                persisted_at=str(event.persisted_at or "") or None,
+                last_error=last_error,
+                attempt=self._retry_attempts,
+            )
+            return "retry_pending"
+
+        await self._ledger.mark_failed_terminal(str(event.listing_id), stream_event_id, last_error)
+        self.stats.dead_lettered += 1
         emit_json_log(
-            "notification_delivery_result",
+            "notification_dead_letter_written",
             listing_id=str(event.listing_id),
             event_id=stream_event_id,
             worker_name=str(event.worker_name or "") or None,
@@ -648,14 +746,17 @@ class NotificationConsumer:
             event_name=str(event.event_name or ""),
             stream_name=LISTING_STREAM_NAME,
             stream_event_id=stream_event_id,
+            dead_letter_stream_name=NOTIFICATION_DEAD_LETTER_STREAM_NAME,
+            dead_letter_event_id=dead_letter_event_id,
+            dead_lettered_at=dead_lettered_at,
             notification_channel="telegram",
-            notification_status="retry_pending",
+            notification_status="failed_terminal",
             persisted_at=str(event.persisted_at or "") or None,
             notification_sent_ts=None,
             last_error=last_error,
             attempt=self._retry_attempts,
         )
-        return "retry_pending"
+        return "dead_lettered"
 
     async def process_stream_entry(self, stream_event_id: str, fields: dict[str, str]) -> str:
         self.stats.events_received += 1
@@ -706,7 +807,7 @@ class NotificationConsumer:
             return action
 
         result = await self._attempt_delivery(event, stream_event_id)
-        if result == "sent":
+        if result in {"sent", "dead_lettered"}:
             await self._ack(stream_event_id)
         return result
 
@@ -716,6 +817,7 @@ class NotificationConsumer:
             return 0
 
         processed = 0
+        drain_mode_enabled = await self._drain_mode_enabled()
         for stream_event_id, fields in await self._claim_idle_entries():
             try:
                 await self.process_stream_entry(stream_event_id, fields)
@@ -724,22 +826,23 @@ class NotificationConsumer:
                 self.stats.errors += 1
                 logger.exception("Failed to process reclaimed stream entry %s", stream_event_id)
 
-        for stream_event_id, fields in await self._read_new_entries():
-            try:
-                await self.process_stream_entry(stream_event_id, fields)
-                processed += 1
-            except Exception:
-                self.stats.errors += 1
-                logger.exception("Failed to process new stream entry %s", stream_event_id)
+        if not drain_mode_enabled:
+            for stream_event_id, fields in await self._read_new_entries():
+                try:
+                    await self.process_stream_entry(stream_event_id, fields)
+                    processed += 1
+                except Exception:
+                    self.stats.errors += 1
+                    logger.exception("Failed to process new stream entry %s", stream_event_id)
 
         if processed and self.stats.events_received % 100 == 0:
             logger.info(
-                "Notification stats: received=%d sent=%d suppressed=%d duplicates=%d retry_pending=%d errors=%d",
+                "Notification stats: received=%d sent=%d suppressed=%d duplicates=%d dead_lettered=%d errors=%d",
                 self.stats.events_received,
                 self.stats.notifications_sent,
                 self.stats.suppressed,
                 self.stats.duplicates,
-                self.stats.retry_pending,
+                self.stats.dead_lettered,
                 self.stats.errors,
             )
         return processed
@@ -773,16 +876,24 @@ async def run_notification_worker() -> None:
         decode_responses=True,
     )
     feature_flags = RedisFeatureFlags(redis_client, hash_key=FLAG_HASH_KEY)
+    runtime_config = RedisRuntimeConfig(redis_client, hash_key=RUNTIME_CONFIG_HASH_KEY)
     emit_json_log(
         "feature_flag_snapshot",
         service="notification_worker",
         flag_hash_key=FLAG_HASH_KEY,
         flags=await feature_flags.snapshot(),
     )
+    emit_json_log(
+        "runtime_config_snapshot",
+        service="notification_worker",
+        runtime_config_hash_key=RUNTIME_CONFIG_HASH_KEY,
+        runtime_config=await runtime_config.snapshot(),
+    )
 
     consumer = NotificationConsumer(
         redis_client=redis_client,
         feature_flags=feature_flags,
+        runtime_config=runtime_config,
         ledger=NotificationLedgerStore(pool),
     )
     await consumer.ensure_consumer_group()

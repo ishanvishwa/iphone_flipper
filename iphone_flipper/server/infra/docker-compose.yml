@@ -93,6 +93,7 @@ services:
       context: ../..
       dockerfile: server/services/worker/Dockerfile
     restart: unless-stopped
+    stop_grace_period: 45s
     command: ["python", "-m", "server.services.worker.notification_worker"]
     env_file:
       - ../.env
@@ -123,6 +124,7 @@ services:
       context: ../..
       dockerfile: server/services/worker/Dockerfile
     restart: unless-stopped
+    stop_grace_period: 45s
     command: ["python", "-m", "server.services.worker.enrichment_worker"]
     env_file:
       - ../.env
