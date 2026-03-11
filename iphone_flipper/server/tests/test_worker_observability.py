@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import unittest
 import asyncio
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 os.environ.setdefault("IPHONE_FLIPPER_DB_PATH", "/tmp/iphone_flipper_worker_test.db")
@@ -895,3 +896,78 @@ class WorkerObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.outcome, worker.CycleOutcome.WAIT_QUERY_SHARD)
         self.assertEqual(result.error_category, worker.ErrorCategory.QUERY_SHARD_LOCK_UNAVAILABLE)
         self.assertEqual(result.details["query_lock_status"], "all_locked")
+
+    async def test_query_lock_contention_temporarily_suppresses_route_selection(self) -> None:
+        now = datetime(2026, 3, 12, 0, 0, tzinfo=timezone.utc)
+        route = {
+            "worker_name": "worker",
+            "route_name": "worker_3__env_default",
+            "source": "central",
+            "route_interval_seconds": 30,
+        }
+        worker._ROUTE_LOCK_CONTENTION_UNTIL.clear()
+        worker._PROFILE_LOCK_CONTENTION_UNTIL.clear()
+        self.addCleanup(worker._ROUTE_LOCK_CONTENTION_UNTIL.clear)
+        self.addCleanup(worker._PROFILE_LOCK_CONTENTION_UNTIL.clear)
+
+        backoff_seconds = worker._record_lock_contention_backoff(
+            route=route,
+            profile=None,
+            outcome=worker.CycleOutcome.WAIT_QUERY_SHARD,
+            now=now,
+        )
+
+        filtered_routes = worker._filter_routes_for_lock_contention([route], now=now)
+        self.assertEqual(backoff_seconds, 15.0)
+        self.assertEqual(filtered_routes, [])
+        self.assertAlmostEqual(
+            worker._seconds_until_route_lock_contention_release([route], now=now) or 0.0,
+            15.0,
+            places=3,
+        )
+
+    async def test_profile_lock_contention_temporarily_suppresses_profile_selection(self) -> None:
+        now = datetime(2026, 3, 12, 0, 0, tzinfo=timezone.utc)
+        route = {
+            "worker_name": "worker",
+            "route_name": "worker_2__env_default",
+            "source": "central",
+            "route_interval_seconds": 60,
+        }
+        profile = {"user_data_dir": "/app/runtime/browser_profile_1"}
+        worker._ROUTE_LOCK_CONTENTION_UNTIL.clear()
+        worker._PROFILE_LOCK_CONTENTION_UNTIL.clear()
+        self.addCleanup(worker._ROUTE_LOCK_CONTENTION_UNTIL.clear)
+        self.addCleanup(worker._PROFILE_LOCK_CONTENTION_UNTIL.clear)
+
+        backoff_seconds = worker._record_lock_contention_backoff(
+            route=route,
+            profile=profile,
+            outcome=worker.CycleOutcome.WAIT_PROFILE_LOCK,
+            now=now,
+        )
+
+        filtered_profiles = worker._filter_execution_profiles_for_lock_contention([profile], now=now)
+        filtered_routes = worker._filter_routes_for_lock_contention([route], now=now)
+        self.assertEqual(backoff_seconds, 10.0)
+        self.assertEqual(filtered_profiles, [])
+        self.assertEqual(filtered_routes, [route])
+        self.assertAlmostEqual(
+            worker._seconds_until_profile_lock_contention_release([profile], now=now) or 0.0,
+            10.0,
+            places=3,
+        )
+
+    async def test_central_profile_lock_does_not_globally_reschedule_route(self) -> None:
+        route = {"worker_name": "worker", "route_name": "worker_2__env_default", "source": "central"}
+        worker_route = {"worker_name": "worker", "route_name": "env_default", "source": "db"}
+
+        self.assertFalse(
+            worker._should_schedule_route_after_cycle(route, worker.CycleOutcome.WAIT_PROFILE_LOCK)
+        )
+        self.assertTrue(
+            worker._should_schedule_route_after_cycle(route, worker.CycleOutcome.WAIT_QUERY_SHARD)
+        )
+        self.assertTrue(
+            worker._should_schedule_route_after_cycle(worker_route, worker.CycleOutcome.WAIT_PROFILE_LOCK)
+        )

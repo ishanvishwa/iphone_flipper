@@ -477,6 +477,8 @@ _V4_PIPELINE_ALERT_LAST_SENT_AT: dict[str, datetime] = {}
 _V4_DOM_CIRCUIT_ALERT_LAST_SENT_AT: dict[str, datetime] = {}
 _ROUTE_CONSECUTIVE_BAD_CYCLES: dict[str, int] = {}
 _ROUTE_SESSION_QUERY_COUNTS: dict[str, int] = {}
+_ROUTE_LOCK_CONTENTION_UNTIL: dict[str, datetime] = {}
+_PROFILE_LOCK_CONTENTION_UNTIL: dict[str, datetime] = {}
 _SINGLE_ROUTE_ENFORCEMENT_ACTIVE = False
 _CENTRAL_ROUTE_DISPATCH_COUNT = 0
 _WORKER_SHUTDOWN_EVENT: asyncio.Event | None = None
@@ -573,6 +575,137 @@ def _route_key(route: dict[str, Any]) -> str:
     worker_name = str(route.get("worker_name") or WORKER_NAME).strip() or WORKER_NAME
     route_name = str(route.get("route_name") or "unknown").strip() or "unknown"
     return f"{worker_name}::{route_name}"
+
+
+def _profile_contention_key(profile: Mapping[str, Any] | None) -> str | None:
+    value = str((profile or {}).get("user_data_dir") or "").strip().lower()
+    return value or None
+
+
+def _prune_lock_contention_state(now: datetime | None = None) -> None:
+    now_dt = now or datetime.now(timezone.utc)
+    for cache in (_ROUTE_LOCK_CONTENTION_UNTIL, _PROFILE_LOCK_CONTENTION_UNTIL):
+        expired_keys = [key for key, until in cache.items() if until <= now_dt]
+        for key in expired_keys:
+            cache.pop(key, None)
+
+
+def _set_contention_until(cache: dict[str, datetime], key: str | None, until: datetime) -> None:
+    cache_key = str(key or "").strip()
+    if not cache_key:
+        return
+    current = cache.get(cache_key)
+    if current is None or until > current:
+        cache[cache_key] = until
+
+
+def _seconds_until_contention_release(
+    cache: Mapping[str, datetime],
+    keys: list[str],
+    *,
+    now: datetime | None = None,
+) -> float | None:
+    now_dt = now or datetime.now(timezone.utc)
+    remaining_seconds: list[float] = []
+    for key in keys:
+        until = cache.get(str(key or "").strip())
+        if until is None:
+            continue
+        seconds = (until - now_dt).total_seconds()
+        if seconds > 0:
+            remaining_seconds.append(seconds)
+    if not remaining_seconds:
+        return None
+    return min(remaining_seconds)
+
+
+def _filter_routes_for_lock_contention(
+    routes: list[dict[str, Any]],
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    _prune_lock_contention_state(now)
+    return [route for route in routes if _route_key(route) not in _ROUTE_LOCK_CONTENTION_UNTIL]
+
+
+def _filter_execution_profiles_for_lock_contention(
+    profiles: list[dict[str, Any]],
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    _prune_lock_contention_state(now)
+    filtered: list[dict[str, Any]] = []
+    for profile in profiles:
+        profile_key = _profile_contention_key(profile)
+        if profile_key and profile_key in _PROFILE_LOCK_CONTENTION_UNTIL:
+            continue
+        filtered.append(profile)
+    return filtered
+
+
+def _seconds_until_route_lock_contention_release(
+    routes: list[dict[str, Any]],
+    *,
+    now: datetime | None = None,
+) -> float | None:
+    keys = [_route_key(route) for route in routes]
+    return _seconds_until_contention_release(_ROUTE_LOCK_CONTENTION_UNTIL, keys, now=now)
+
+
+def _seconds_until_profile_lock_contention_release(
+    profiles: list[dict[str, Any]],
+    *,
+    now: datetime | None = None,
+) -> float | None:
+    keys = [key for key in (_profile_contention_key(profile) for profile in profiles) if key]
+    return _seconds_until_contention_release(_PROFILE_LOCK_CONTENTION_UNTIL, keys, now=now)
+
+
+def _lock_contention_backoff_seconds(route: Mapping[str, Any], outcome: CycleOutcome) -> float:
+    route_interval_seconds = _route_interval_seconds(
+        dict(route),
+        fallback_seconds=float(WORKER_WAIT_BACKOFF_SECONDS),
+    )
+    capped_interval_seconds = max(
+        float(WORKER_WAIT_BACKOFF_SECONDS),
+        min(15.0, float(route_interval_seconds)),
+    )
+    if outcome == CycleOutcome.WAIT_PROFILE_LOCK:
+        return max(float(WORKER_WAIT_BACKOFF_SECONDS), min(10.0, capped_interval_seconds))
+    if outcome == CycleOutcome.WAIT_QUERY_SHARD:
+        return capped_interval_seconds
+    return float(WORKER_WAIT_BACKOFF_SECONDS)
+
+
+def _record_lock_contention_backoff(
+    *,
+    route: dict[str, Any],
+    profile: Mapping[str, Any] | None,
+    outcome: CycleOutcome,
+    now: datetime | None = None,
+) -> float:
+    now_dt = now or datetime.now(timezone.utc)
+    _prune_lock_contention_state(now_dt)
+    backoff_seconds = _lock_contention_backoff_seconds(route, outcome)
+    until = now_dt + timedelta(seconds=backoff_seconds)
+
+    if outcome == CycleOutcome.WAIT_QUERY_SHARD:
+        _set_contention_until(_ROUTE_LOCK_CONTENTION_UNTIL, _route_key(route), until)
+    elif outcome == CycleOutcome.WAIT_PROFILE_LOCK:
+        _set_contention_until(_PROFILE_LOCK_CONTENTION_UNTIL, _profile_contention_key(profile), until)
+        if str(route.get("source") or "").strip().lower() != "central":
+            _set_contention_until(_ROUTE_LOCK_CONTENTION_UNTIL, _route_key(route), until)
+
+    return backoff_seconds
+
+
+def _should_schedule_route_after_cycle(route: Mapping[str, Any], outcome: CycleOutcome) -> bool:
+    route_source = str(route.get("source") or "").strip().lower()
+    if route_source not in {"db", "central"}:
+        return False
+    if route_source == "central" and outcome == CycleOutcome.WAIT_PROFILE_LOCK:
+        return False
+    return True
 
 
 def _normalize_route_status(raw: str | None) -> str:
@@ -6113,14 +6246,27 @@ async def _run_worker_loop(
                     )
                     await _persist_route_priority_state(pool=pool, routes=routes)
 
+                routes_for_selection = _filter_routes_for_lock_contention(routes, now=now_dt)
+                profiles_for_selection = _filter_execution_profiles_for_lock_contention(
+                    execution_profiles,
+                    now=now_dt,
+                )
+                route_contention_wait_seconds = _seconds_until_route_lock_contention_release(
+                    routes,
+                    now=now_dt,
+                )
+                profile_contention_wait_seconds = _seconds_until_profile_lock_contention_release(
+                    execution_profiles,
+                    now=now_dt,
+                )
                 prefer_non_hot = False
-                if central_route_dispatch_enabled and execution_profiles:
-                    selected_profile = _select_execution_profile(execution_profiles)
+                if central_route_dispatch_enabled and profiles_for_selection:
+                    selected_profile = _select_execution_profile(profiles_for_selection)
                     exploration_every_n = _central_route_exploration_every_n(runtime_snapshot)
                     if priority_scheduler_enabled and exploration_every_n > 0:
                         prefer_non_hot = ((_CENTRAL_ROUTE_DISPATCH_COUNT + 1) % exploration_every_n) == 0
                 route = _select_next_route(
-                    routes,
+                    routes_for_selection,
                     now=now_dt,
                     use_priority_scheduler=priority_scheduler_enabled,
                     runtime_config=runtime_snapshot,
@@ -6145,7 +6291,11 @@ async def _run_worker_loop(
                     if central_route_dispatch_enabled:
                         has_configured_routes = await _has_configured_central_routes(pool)
                         has_execution_profiles = await _has_execution_profiles(pool)
-                        due_in_seconds = seconds_until_next_route(routes=routes, now=now_dt) if routes else None
+                        due_in_seconds = (
+                            seconds_until_next_route(routes=routes_for_selection, now=now_dt)
+                            if routes_for_selection
+                            else None
+                        )
                         cooldown_in_seconds = await _seconds_until_next_execution_profile_cooldown_release(pool)
                         manual_required_count = await _count_manual_login_required_execution_profiles(pool)
                         heartbeat_status = "scheduled_wait"
@@ -6172,15 +6322,33 @@ async def _run_worker_loop(
                                     f"All execution profiles are cooling down. "
                                     f"Next profile becomes eligible in {int(max(0, cooldown_in_seconds))}s."
                                 )
+                            elif profile_contention_wait_seconds is not None:
+                                heartbeat_status = "wait_profile_lock"
+                                waiting_reason = (
+                                    "Execution profile is temporarily skipped after recent lock contention. "
+                                    f"Retrying in {int(max(1, profile_contention_wait_seconds))}s."
+                                )
                             else:
                                 heartbeat_status = "wait_profile_lock"
                                 waiting_reason = "No eligible execution profile is currently available."
-                            sleep_target_seconds = max(0.1, cooldown_in_seconds or effective_interval_seconds)
-                        elif routes and due_in_seconds is not None:
+                            sleep_target_seconds = max(
+                                0.1,
+                                cooldown_in_seconds
+                                or profile_contention_wait_seconds
+                                or effective_interval_seconds,
+                            )
+                        elif routes_for_selection and due_in_seconds is not None:
                             waiting_reason = (
                                 f"No central route is due yet. Next route becomes eligible in {int(max(0, due_in_seconds))}s."
                             )
                             sleep_target_seconds = max(0.1, due_in_seconds)
+                        elif route_contention_wait_seconds is not None:
+                            heartbeat_status = "wait_query_shard"
+                            waiting_reason = (
+                                "Central route is temporarily skipped after recent query lock contention. "
+                                f"Retrying in {int(max(1, route_contention_wait_seconds))}s."
+                            )
+                            sleep_target_seconds = max(0.1, route_contention_wait_seconds)
                         else:
                             heartbeat_status = "cooldown"
                             waiting_reason = "No eligible central routes are currently available."
@@ -6189,15 +6357,26 @@ async def _run_worker_loop(
                         has_configured_routes = await _has_configured_worker_routes(pool)
                         if has_configured_routes:
                             manual_required_count = await _count_manual_login_required_routes(pool)
-                            due_in_seconds = seconds_until_next_route(routes=routes, now=now_dt) if routes else None
+                            due_in_seconds = (
+                                seconds_until_next_route(routes=routes_for_selection, now=now_dt)
+                                if routes_for_selection
+                                else None
+                            )
                             cooldown_in_seconds = await _seconds_until_next_cooldown_release(pool)
 
                             heartbeat_status = "scheduled_wait"
-                            if routes and due_in_seconds is not None:
+                            if routes_for_selection and due_in_seconds is not None:
                                 waiting_reason = (
                                     f"No route is due yet. Next route becomes eligible in {int(max(0, due_in_seconds))}s."
                                 )
                                 sleep_target_seconds = max(0.1, due_in_seconds)
+                            elif route_contention_wait_seconds is not None:
+                                heartbeat_status = "wait_query_shard"
+                                waiting_reason = (
+                                    "Route is temporarily skipped after recent query/profile lock contention. "
+                                    f"Retrying in {int(max(1, route_contention_wait_seconds))}s."
+                                )
+                                sleep_target_seconds = max(0.1, route_contention_wait_seconds)
                             else:
                                 heartbeat_status = "cooldown"
                                 if manual_required_count > 0:
@@ -6469,6 +6648,7 @@ async def _run_worker_loop(
                         outcome=outcome,
                         category=error_category,
                     )
+                    contention_backoff_seconds: float | None = None
                     wait_status: str
                     wait_reason: str
                     if outcome == CycleOutcome.WAIT_PROXY:
@@ -6482,11 +6662,23 @@ async def _run_worker_loop(
                     elif outcome == CycleOutcome.WAIT_PROFILE_LOCK:
                         wait_status = "wait_profile_lock"
                         wait_reason = reason or "Profile lock unavailable."
-                        next_interval_seconds = float(WORKER_WAIT_BACKOFF_SECONDS)
+                        contention_backoff_seconds = _record_lock_contention_backoff(
+                            route=route,
+                            profile=execution_profile,
+                            outcome=outcome,
+                            now=finished_at,
+                        )
+                        next_interval_seconds = float(contention_backoff_seconds or WORKER_WAIT_BACKOFF_SECONDS)
                     elif outcome == CycleOutcome.WAIT_QUERY_SHARD:
                         wait_status = "wait_query_shard"
                         wait_reason = reason or "Query shard lock unavailable."
-                        next_interval_seconds = float(WORKER_WAIT_BACKOFF_SECONDS)
+                        contention_backoff_seconds = _record_lock_contention_backoff(
+                            route=route,
+                            profile=execution_profile,
+                            outcome=outcome,
+                            now=finished_at,
+                        )
+                        next_interval_seconds = float(contention_backoff_seconds or WORKER_WAIT_BACKOFF_SECONDS)
                     else:
                         wait_status = "wait_signal_pause"
                         wait_reason = reason or (
@@ -6787,7 +6979,7 @@ async def _run_worker_loop(
                     result=cycle_result,
                 )
 
-                if str(route.get("source") or "").strip().lower() in {"db", "central"}:
+                if _should_schedule_route_after_cycle(route, outcome):
                     await _schedule_route_next_run_at(
                         pool=pool,
                         route=route,
