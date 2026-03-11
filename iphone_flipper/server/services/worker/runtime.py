@@ -25,6 +25,7 @@ class ErrorCategory(str, Enum):
     NO_PROXY_AVAILABLE = "no_proxy_available"
     PROXY_MISMATCH = "proxy_mismatch"
     PROXY_PROVIDER_SATURATED = "proxy_provider_saturated"
+    BROWSER_SESSION_LOST = "browser_session_lost"
     PROFILE_LOCK_UNAVAILABLE = "profile_lock_unavailable"
     QUERY_SHARD_LOCK_UNAVAILABLE = "query_shard_lock_unavailable"
     SIGNAL_RISK = "signal_risk"
@@ -214,6 +215,15 @@ def classify_error(reason: str | None) -> ErrorCategory:
         return ErrorCategory.NO_PROXY_AVAILABLE
     if "proxy_mismatch" in text or "proxy mismatch" in text:
         return ErrorCategory.PROXY_MISMATCH
+    if (
+        "browser_launch_failed:" in text
+        or "browser_session_lost:" in text
+        or "target page, context or browser has been closed" in text
+        or "browser has been closed" in text
+        or "browser disconnected" in text
+        or (("econnreset" in text or "econnrefused" in text) and "proxy" not in text)
+    ):
+        return ErrorCategory.BROWSER_SESSION_LOST
     if "profile lock unavailable" in text:
         return ErrorCategory.PROFILE_LOCK_UNAVAILABLE
     if "query shard lock unavailable" in text:

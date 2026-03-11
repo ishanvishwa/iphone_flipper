@@ -117,6 +117,12 @@ def build_cycle_telemetry_payload(
         query_lock_status = str(details.get("query_lock_status") or "").strip()
         if query_lock_status:
             payload["query_lock_status"] = query_lock_status
+        browser_launch_mode = str(details.get("browser_launch_mode") or "").strip()
+        if browser_launch_mode:
+            payload["browser_launch_mode"] = browser_launch_mode
+        browser_failure_stage = str(details.get("browser_failure_stage") or "").strip()
+        if browser_failure_stage:
+            payload["browser_failure_stage"] = browser_failure_stage
         selected_query = str(details.get("selected_query") or "").strip()
         if selected_query:
             payload["selected_query"] = selected_query

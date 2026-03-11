@@ -10,7 +10,15 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
-from scraper.browser import launch_browser_context, random_delay, stop_dolphin_profile
+from scraper.browser import (
+    BrowserSessionError,
+    BrowserSessionLostError,
+    is_benign_browser_shutdown_error,
+    is_browser_session_error,
+    launch_browser_context,
+    random_delay,
+    stop_dolphin_profile,
+)
 from scraper.config import DB_PATH
 from scraper.parsers import (
     assess_condition,
@@ -49,6 +57,7 @@ class MarketplaceSession:
     runtime_settings: Dict[str, Any]
     close_browser_explicitly: bool = True
     stop_profile_on_close: bool = True
+    launch_mode: str = "unknown"
 
 
 @dataclass
@@ -195,11 +204,20 @@ async def open_profile_session(
     runtime_identity = str(profile_id or user_data_dir or "").strip()
     if not runtime_identity:
         raise ValueError("A Dolphin profile_id or user_data_dir is required.")
-    playwright, browser, context, page = await launch_browser_context(
+    launch_result = await launch_browser_context(
         headless=headless,
         profile_id=profile_id,
         user_data_dir=user_data_dir,
     )
+    if hasattr(launch_result, "playwright"):
+        playwright = launch_result.playwright
+        browser = launch_result.browser
+        context = launch_result.context
+        page = launch_result.page
+        launch_mode = str(getattr(launch_result, "launch_mode", "unknown") or "unknown")
+    else:
+        playwright, browser, context, page = launch_result
+        launch_mode = "unknown"
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     return MarketplaceSession(
@@ -214,6 +232,7 @@ async def open_profile_session(
         runtime_settings=runtime_settings,
         close_browser_explicitly=profile_id is not None,
         stop_profile_on_close=profile_id is not None,
+        launch_mode=launch_mode,
     )
 
 
@@ -231,16 +250,19 @@ async def close_profile_session(
     try:
         await session.context.close()
     except Exception as exc:
-        errors.append(exc)
+        if not is_benign_browser_shutdown_error(exc):
+            errors.append(exc)
     if session.close_browser_explicitly and session.browser is not None:
         try:
             await session.browser.close()
         except Exception as exc:
-            errors.append(exc)
+            if not is_benign_browser_shutdown_error(exc):
+                errors.append(exc)
     try:
         await session.playwright.stop()
     except Exception as exc:
-        errors.append(exc)
+        if not is_benign_browser_shutdown_error(exc):
+            errors.append(exc)
 
     effective_stop_profile = session.stop_profile_on_close if stop_profile is None else bool(stop_profile)
     if effective_stop_profile:
@@ -527,6 +549,18 @@ async def _execute_queries_on_page(
             )
             if MANUAL_LOGIN_REQUIRED_PREFIX.lower() in error_text.lower():
                 manual_login_error = error_text
+            if is_browser_session_error(error_text):
+                raise BrowserSessionLostError(
+                    f"Browser session lost while executing query '{query}': {error_text}",
+                    failure_stage="in_query",
+                    launch_mode=session.launch_mode,
+                    details={
+                        "runtime_identity": session.profile_id,
+                        "query": query,
+                        "query_index": index,
+                        "query_total": total_queries,
+                    },
+                ) from e
         finally:
             try:
                 page.remove_listener("response", on_response)
@@ -608,7 +642,17 @@ async def execute_family_claim(
     scroll_max_rounds_override: Optional[int] = None,
     apply_inter_query_delay: bool = False,
 ) -> MarketplaceClaimExecution:
-    page = await session.context.new_page()
+    try:
+        page = await session.context.new_page()
+    except Exception as exc:
+        if is_browser_session_error(exc):
+            raise BrowserSessionLostError(
+                f"Browser session lost before opening a fresh family page: {exc}",
+                failure_stage="new_page",
+                launch_mode=session.launch_mode,
+                details={"runtime_identity": session.profile_id},
+            ) from exc
+        raise
     try:
         return await _execute_queries_on_page(
             session,
@@ -635,11 +679,23 @@ async def scrape_marketplace(
     search_queries: Optional[List[str]] = None,
     scroll_target_cards_override: Optional[int] = None,
     scroll_max_rounds_override: Optional[int] = None,
+    raise_browser_errors: bool = False,
 ) -> List[Dict[str, Any]]:
     """Run the main Facebook Marketplace scraping pipeline."""
     session: MarketplaceSession | None = None
     try:
         session = await open_profile_session(profile_id, headless=False)
+        if progress_callback:
+            try:
+                progress_callback(
+                    {
+                        "event": "browser_session_ready",
+                        "launch_mode": session.launch_mode,
+                        "runtime_identity": session.profile_id,
+                    }
+                )
+            except Exception:
+                pass
         return await execute_session_queries(
             session,
             progress_callback=progress_callback,
@@ -648,6 +704,24 @@ async def scrape_marketplace(
             scroll_target_cards_override=scroll_target_cards_override,
             scroll_max_rounds_override=scroll_max_rounds_override,
         )
+    except BrowserSessionError as e:
+        if progress_callback:
+            try:
+                progress_callback(
+                    {
+                        "event": "browser_session_error",
+                        "error": str(e),
+                        "launch_mode": e.launch_mode,
+                        "failure_stage": e.failure_stage,
+                        **(e.details or {}),
+                    }
+                )
+            except Exception:
+                pass
+        print(f"Scraper pipeline failed: {e}")
+        if raise_browser_errors:
+            raise
+        return []
     except Exception as e:
         print(f"Scraper pipeline failed: {e}")
         return []

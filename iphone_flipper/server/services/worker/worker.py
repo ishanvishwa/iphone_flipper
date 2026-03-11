@@ -154,6 +154,7 @@ except Exception:
         "search_queries",
         "scroll_target_cards_override",
         "scroll_max_rounds_override",
+        "raise_browser_errors",
     }
 
 PGHOST = os.getenv("PGHOST", "postgres")
@@ -5391,6 +5392,8 @@ async def _run_scrape_cycle(
     persona_extra_headers: dict[str, str] | None = None
     persona_details: dict[str, Any] | None = None
     persona_digest: str | None = None
+    browser_launch_mode: str | None = None
+    browser_failure_stage: str | None = None
     lease_keepalive_stop = asyncio.Event()
     lease_keepalive_tasks: list[asyncio.Task] = []
     lease_keepalive_failure: dict[str, str] = {}
@@ -5519,6 +5522,7 @@ async def _run_scrape_cycle(
 
     def _on_progress(payload: dict[str, Any]) -> None:
         nonlocal proxy_expected_ip, proxy_observed_ip, proxy_ip_check_status
+        nonlocal browser_launch_mode, browser_failure_stage
         event = payload.get("event")
         if event == "proxy_ip_check":
             expected_ip = str(payload.get("expected_ip") or "").strip()
@@ -5530,6 +5534,22 @@ async def _run_scrape_cycle(
                 proxy_observed_ip = observed_ip
             if status_value:
                 proxy_ip_check_status = status_value
+            return
+
+        if event == "browser_session_ready":
+            launch_mode = str(payload.get("launch_mode") or "").strip()
+            if launch_mode:
+                browser_launch_mode = launch_mode
+            browser_failure_stage = None
+            return
+
+        if event == "browser_session_error":
+            launch_mode = str(payload.get("launch_mode") or "").strip()
+            failure_stage = str(payload.get("failure_stage") or payload.get("browser_failure_stage") or "").strip()
+            if launch_mode:
+                browser_launch_mode = launch_mode
+            if failure_stage:
+                browser_failure_stage = failure_stage
             return
 
         if event == "query_start":
@@ -5712,6 +5732,7 @@ async def _run_scrape_cycle(
                 "search_queries": query_override,
                 "scroll_target_cards_override": WORKER_SCROLL_TARGET_CARDS,
                 "scroll_max_rounds_override": WORKER_SCROLL_MAX_ROUNDS,
+                "raise_browser_errors": True,
             }
             # Remove unsupported kwargs if any
             unsupported_kwargs = [
@@ -5748,7 +5769,21 @@ async def _run_scrape_cycle(
             else:
                 scrape_task.result()
         except Exception as exc:
-            if not isinstance(exc, NoProxyAvailableError):
+            error_category = classify_error(str(exc))
+            error_details = getattr(exc, "details", None)
+            if isinstance(error_details, dict):
+                if dolphin_profile_id:
+                    error_details.setdefault("dolphin_profile_id", str(dolphin_profile_id))
+                if available_profiles and dolphin_profile_id:
+                    for profile in available_profiles:
+                        if str(profile.get("id")) == str(dolphin_profile_id):
+                            error_details.setdefault("dolphin_profile_name", str(profile.get("name") or ""))
+                            break
+                if browser_launch_mode:
+                    error_details.setdefault("browser_launch_mode", browser_launch_mode)
+                if browser_failure_stage:
+                    error_details.setdefault("browser_failure_stage", browser_failure_stage)
+            if not isinstance(exc, NoProxyAvailableError) and error_category != ErrorCategory.BROWSER_SESSION_LOST:
                 await _record_proxy_failure(pool=pool, proxy_key=proxy_key)
             raise
         finally:
@@ -5778,6 +5813,8 @@ async def _run_scrape_cycle(
             "query_lock_status": query_lock_status,
             "query_lock_skipped_count": query_lock_skipped_count,
             "selected_query": selected_query,
+            "browser_launch_mode": browser_launch_mode,
+            "browser_failure_stage": browser_failure_stage,
             "page_text_sample": " ".join(query_error_text_samples)[-500:],
             "proxy_expected_ip": proxy_expected_ip,
             "proxy_observed_ip": proxy_observed_ip,
@@ -5963,6 +6000,9 @@ async def _run_scrape_cycle_with_retry(
                 details=cycle_details,
             )
         except Exception as exc:
+            error_details = getattr(exc, "details", None)
+            if isinstance(error_details, dict):
+                cycle_details.update(error_details)
             last_reason = str(exc) or "unknown scrape error"
             category = classify_error(last_reason)
             if _is_manual_login_required_error(last_reason) or category == ErrorCategory.AUTH_REQUIRED:
@@ -6738,14 +6778,14 @@ async def _run_worker_loop(
 
                     base_reason = reason or "unknown scrape failure"
 
-                    # Record per-profile failure
-                    await _record_dolphin_profile_outcome(
-                        pool=pool,
-                        profile_id=_cycle_dolphin_id,
-                        success=False,
-                        profile_name=(cycle_result.details or {}).get("dolphin_profile_name", ""),
-                        reason=base_reason,
-                    )
+                    if error_category == ErrorCategory.BROWSER_SESSION_LOST:
+                        await _record_dolphin_profile_outcome(
+                            pool=pool,
+                            profile_id=_cycle_dolphin_id,
+                            success=False,
+                            profile_name=(cycle_result.details or {}).get("dolphin_profile_name", ""),
+                            reason=base_reason,
+                        )
 
                     failure_counts = counts_toward_bad_cycles(outcome, error_category)
                     derived_status = derive_route_status_for_bad_cycles(

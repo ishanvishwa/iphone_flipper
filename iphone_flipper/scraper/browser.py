@@ -4,6 +4,7 @@ context launching, and human-like random delays.
 """
 
 import asyncio
+from dataclasses import dataclass
 import logging
 import os
 import random
@@ -144,6 +145,81 @@ DOLPHIN_ANTY_TOKEN = os.getenv("DOLPHIN_ANTY_TOKEN", "")
 # The Dolphin browser process runs on the VPS host, not inside Docker.
 # Docker containers must connect to the host's IP, not 127.0.0.1.
 DOLPHIN_WS_HOST = os.getenv("DOLPHIN_WS_HOST", "host.docker.internal")
+DOLPHIN_CDP_CONNECT_RETRIES = 5
+DOLPHIN_CDP_CONNECT_INITIAL_BACKOFF_SECONDS = 1.0
+DOLPHIN_STOP_WAIT_TIMEOUT_SECONDS = 15.0
+DOLPHIN_STOP_WAIT_POLL_SECONDS = 1.0
+BROWSER_LAUNCH_ERROR_PREFIX = "BROWSER_LAUNCH_FAILED:"
+BROWSER_SESSION_LOST_PREFIX = "BROWSER_SESSION_LOST:"
+_BROWSER_SESSION_LOST_MARKERS = (
+    "target page, context or browser has been closed",
+    "browser has been closed",
+    "browser disconnected",
+    "econnreset",
+    "econnrefused",
+    "websocket error",
+    "connect_over_cdp",
+)
+
+
+@dataclass
+class BrowserLaunchResult:
+    playwright: Any
+    browser: Any
+    context: Any
+    page: Any
+    launch_mode: str = "unknown"
+
+    def __iter__(self):
+        yield self.playwright
+        yield self.browser
+        yield self.context
+        yield self.page
+
+
+class BrowserSessionError(RuntimeError):
+    prefix = "BROWSER_SESSION_ERROR:"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure_stage: str,
+        launch_mode: str | None = None,
+        details: Dict[str, Any] | None = None,
+    ) -> None:
+        self.failure_stage = str(failure_stage or "unknown").strip() or "unknown"
+        self.launch_mode = str(launch_mode or "unknown").strip() or "unknown"
+        payload = dict(details or {})
+        payload.setdefault("browser_failure_stage", self.failure_stage)
+        payload.setdefault("browser_launch_mode", self.launch_mode)
+        self.details = payload
+        super().__init__(f"{self.prefix} {message}")
+
+
+class BrowserLaunchError(BrowserSessionError):
+    prefix = BROWSER_LAUNCH_ERROR_PREFIX
+
+
+class BrowserSessionLostError(BrowserSessionError):
+    prefix = BROWSER_SESSION_LOST_PREFIX
+
+
+def is_browser_session_error(error: object) -> bool:
+    if isinstance(error, BrowserSessionError):
+        return True
+    text = str(error or "").strip().lower()
+    if not text:
+        return False
+    return (
+        BROWSER_LAUNCH_ERROR_PREFIX.lower() in text
+        or BROWSER_SESSION_LOST_PREFIX.lower() in text
+        or any(marker in text for marker in _BROWSER_SESSION_LOST_MARKERS)
+    )
+
+
+def is_benign_browser_shutdown_error(error: object) -> bool:
+    return is_browser_session_error(error)
 
 
 def _dolphin_auth_headers() -> dict[str, str]:
@@ -190,72 +266,206 @@ async def list_dolphin_profiles() -> list[dict]:
             return []
 
 
-async def _start_dolphin_profile(profile_id: str) -> str:
-    """Start a Dolphin Anty profile and return the CDP WebSocket endpoint."""
-    headers = _dolphin_auth_headers()
-    async with aiohttp.ClientSession(headers=headers) as session:
-        async with session.get(f"{DOLPHIN_API_URL}/browser_profiles/{profile_id}/start?automation=1") as resp:
+def _build_dolphin_ws_endpoint(automation: Dict[str, Any], profile_id: str, *, stage: str, launch_mode: str) -> str:
+    try:
+        port = int(automation.get("port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    ws_path = str(automation.get("wsEndpoint") or "").strip()
+    if port <= 0:
+        raise BrowserLaunchError(
+            f"Dolphin profile {profile_id} did not return a valid automation port.",
+            failure_stage=stage,
+            launch_mode=launch_mode,
+            details={"dolphin_profile_id": str(profile_id)},
+        )
+    return f"ws://{DOLPHIN_WS_HOST}:{port}{ws_path}"
+
+
+async def _fetch_active_dolphin_ws_endpoint(session: aiohttp.ClientSession, profile_id: str) -> str | None:
+    try:
+        async with session.get(f"{DOLPHIN_API_URL}/browser_profiles/{profile_id}/active") as resp:
+            active_data = await resp.json()
+    except Exception as exc:
+        logger.warning("Failed to query active Dolphin profile %s: %s", profile_id, exc)
+        return None
+
+    if not active_data.get("success") or not active_data.get("automation"):
+        return None
+
+    try:
+        return _build_dolphin_ws_endpoint(
+            active_data.get("automation") or {},
+            profile_id,
+            stage="start",
+            launch_mode="reused",
+        )
+    except BrowserLaunchError as exc:
+        logger.warning("Active Dolphin profile %s returned unusable automation data: %s", profile_id, exc)
+        return None
+
+
+async def _start_or_reuse_dolphin_profile(session: aiohttp.ClientSession, profile_id: str) -> tuple[str, str]:
+    async with session.get(f"{DOLPHIN_API_URL}/browser_profiles/{profile_id}/start?automation=1") as resp:
+        data = await resp.json()
+
+    if data.get("success") and data.get("automation"):
+        return _build_dolphin_ws_endpoint(
+            data["automation"],
+            profile_id,
+            stage="start",
+            launch_mode="fresh_start",
+        ), "fresh_start"
+
+    error_obj = data.get("errorObject") or {}
+    if error_obj.get("code") == "E_BROWSER_RUN_DUPLICATE":
+        logger.info("Dolphin profile %s already running, attempting to reuse active session...", profile_id)
+        active_ws_endpoint = await _fetch_active_dolphin_ws_endpoint(session, profile_id)
+        if active_ws_endpoint:
+            return active_ws_endpoint, "reused"
+        raise BrowserLaunchError(
+            f"Dolphin profile {profile_id} is already running but no active automation endpoint is available.",
+            failure_stage="start",
+            launch_mode="reused",
+            details={"dolphin_profile_id": str(profile_id)},
+        )
+
+    raise BrowserLaunchError(
+        f"Failed to start Dolphin profile {profile_id}: {data}",
+        failure_stage="start",
+        launch_mode="fresh_start",
+        details={"dolphin_profile_id": str(profile_id)},
+    )
+
+
+async def _stop_dolphin_profile_with_session(session: aiohttp.ClientSession, profile_id: str) -> None:
+    try:
+        async with session.get(f"{DOLPHIN_API_URL}/browser_profiles/{profile_id}/stop") as resp:
             data = await resp.json()
+    except Exception as exc:
+        logger.warning("Warning: Failed to stop Dolphin profile %s: %s", profile_id, exc)
+        return
+    if not data.get("success"):
+        logger.warning("Warning: Failed to stop Dolphin profile %s: %s", profile_id, data)
 
-        # Handle "already running" — reuse active session instead of killing it
-        if not data.get("success"):
-            error_obj = data.get("errorObject") or {}
-            if error_obj.get("code") == "E_BROWSER_RUN_DUPLICATE":
-                logger.info("Dolphin profile %s already running, reusing active session...", profile_id)
-                # Query the active profile's automation port
-                try:
-                    async with session.get(f"{DOLPHIN_API_URL}/browser_profiles/{profile_id}/active") as active_resp:
-                        active_data = await active_resp.json()
-                    if active_data.get("success") and active_data.get("automation"):
-                        port = active_data["automation"]["port"]
-                        ws_path = active_data["automation"].get("wsEndpoint", "")
-                        return f"ws://{DOLPHIN_WS_HOST}:{port}{ws_path}"
-                except Exception as exc:
-                    logger.warning("Failed to query active Dolphin profile %s: %s", profile_id, exc)
-                # Fallback: stop and restart if we can't get the active session.
-                # The browser process may take several seconds to fully terminate
-                # after a /stop call, so we retry with increasing waits.
-                logger.info("Dolphin profile %s falling back to stop+restart...", profile_id)
-                async with session.get(f"{DOLPHIN_API_URL}/browser_profiles/{profile_id}/stop") as stop_resp:
-                    await stop_resp.json()
-                for restart_attempt in range(3):
-                    wait_secs = 5 + (restart_attempt * 3)  # 5s, 8s, 11s
-                    await asyncio.sleep(wait_secs)
-                    async with session.get(f"{DOLPHIN_API_URL}/browser_profiles/{profile_id}/start?automation=1") as resp2:
-                        data = await resp2.json()
-                    if data.get("success"):
-                        break
-                    err_obj = data.get("errorObject") or {}
-                    if err_obj.get("code") == "E_BROWSER_RUN_DUPLICATE" and restart_attempt < 2:
-                        logger.warning(
-                            "Dolphin profile %s still running after stop (attempt %d/3), retrying...",
-                            profile_id, restart_attempt + 1,
-                        )
-                        # Re-issue stop in case the first one didn't take effect
-                        try:
-                            async with session.get(f"{DOLPHIN_API_URL}/browser_profiles/{profile_id}/stop") as stop_resp2:
-                                await stop_resp2.json()
-                        except Exception:
-                            pass
-                        continue
-                    break  # Non-duplicate error or last attempt — fall through to error check
 
-        if not data.get("success"):
-            raise RuntimeError(f"Failed to start Dolphin profile {profile_id}: {data}")
+async def _wait_for_dolphin_profile_inactive(session: aiohttp.ClientSession, profile_id: str) -> None:
+    remaining = max(DOLPHIN_STOP_WAIT_POLL_SECONDS, float(DOLPHIN_STOP_WAIT_TIMEOUT_SECONDS))
+    while remaining > 0:
+        active_ws_endpoint = await _fetch_active_dolphin_ws_endpoint(session, profile_id)
+        if not active_ws_endpoint:
+            return
+        await asyncio.sleep(DOLPHIN_STOP_WAIT_POLL_SECONDS)
+        remaining -= DOLPHIN_STOP_WAIT_POLL_SECONDS
+    raise BrowserLaunchError(
+        f"Dolphin profile {profile_id} did not stop cleanly before recycle.",
+        failure_stage="start",
+        launch_mode="recycled_start",
+        details={"dolphin_profile_id": str(profile_id)},
+    )
 
-        port = data["automation"]["port"]
-        ws_path = data["automation"].get("wsEndpoint", "")
-        return f"ws://{DOLPHIN_WS_HOST}:{port}{ws_path}"
+
+async def _hard_recycle_dolphin_profile(session: aiohttp.ClientSession, profile_id: str) -> str:
+    logger.info("Dolphin profile %s performing hard recycle before reconnect...", profile_id)
+    await _stop_dolphin_profile_with_session(session, profile_id)
+    await _wait_for_dolphin_profile_inactive(session, profile_id)
+    async with session.get(f"{DOLPHIN_API_URL}/browser_profiles/{profile_id}/start?automation=1") as resp:
+        data = await resp.json()
+    if not data.get("success") or not data.get("automation"):
+        raise BrowserLaunchError(
+            f"Failed to restart Dolphin profile {profile_id}: {data}",
+            failure_stage="start",
+            launch_mode="recycled_start",
+            details={"dolphin_profile_id": str(profile_id)},
+        )
+    return _build_dolphin_ws_endpoint(
+        data["automation"],
+        profile_id,
+        stage="start",
+        launch_mode="recycled_start",
+    )
+
+
+async def _connect_dolphin_browser(
+    playwright: Any,
+    *,
+    ws_endpoint: str,
+    profile_id: str,
+    launch_mode: str,
+) -> Any:
+    await asyncio.sleep(DOLPHIN_CDP_CONNECT_INITIAL_BACKOFF_SECONDS)
+    for attempt in range(1, DOLPHIN_CDP_CONNECT_RETRIES + 1):
+        try:
+            return await playwright.chromium.connect_over_cdp(ws_endpoint)
+        except Exception as exc:
+            if attempt >= DOLPHIN_CDP_CONNECT_RETRIES:
+                raise BrowserLaunchError(
+                    f"CDP connect failed for profile {profile_id}: {exc}",
+                    failure_stage="connect",
+                    launch_mode=launch_mode,
+                    details={"dolphin_profile_id": str(profile_id)},
+                ) from exc
+            wait_seconds = DOLPHIN_CDP_CONNECT_INITIAL_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            logger.warning(
+                "CDP connect attempt %d/%d failed for profile %s (retrying in %.1fs): %s",
+                attempt,
+                DOLPHIN_CDP_CONNECT_RETRIES,
+                profile_id,
+                wait_seconds,
+                exc,
+            )
+            await asyncio.sleep(wait_seconds)
+
+
+async def _probe_browser_ready(
+    browser: Any,
+    *,
+    profile_id: str,
+    launch_mode: str,
+) -> tuple[Any, Any]:
+    try:
+        context = browser.contexts[0] if browser and getattr(browser, "contexts", None) else await browser.new_context()
+        existing_pages = []
+        try:
+            existing_pages = [page for page in (context.pages or []) if not page.is_closed()]
+        except Exception:
+            existing_pages = []
+        page = existing_pages[0] if existing_pages else await context.new_page()
+        if hasattr(page, "is_closed") and page.is_closed():
+            raise RuntimeError("Browser returned a closed page during readiness probe.")
+        await page.evaluate("() => document.readyState || 'unknown'")
+        if hasattr(page, "is_closed") and page.is_closed():
+            raise RuntimeError("Browser page closed immediately after readiness probe.")
+        return context, page
+    except BrowserLaunchError:
+        raise
+    except Exception as exc:
+        raise BrowserLaunchError(
+            f"Browser ready probe failed for profile {profile_id}: {exc}",
+            failure_stage="ready_probe",
+            launch_mode=launch_mode,
+            details={"dolphin_profile_id": str(profile_id)},
+        ) from exc
+
+
+async def _safe_close_browser_targets(context: Any, browser: Any) -> None:
+    try:
+        if context is not None:
+            await context.close()
+    except Exception:
+        pass
+    try:
+        if browser is not None:
+            await browser.close()
+    except Exception:
+        pass
 
 
 async def stop_dolphin_profile(profile_id: str) -> None:
     """Stop a Dolphin Anty profile."""
     headers = _dolphin_auth_headers()
     async with aiohttp.ClientSession(headers=headers) as session:
-        async with session.get(f"{DOLPHIN_API_URL}/browser_profiles/{profile_id}/stop") as resp:
-            data = await resp.json()
-            if not data.get("success"):
-                logger.warning(f"Warning: Failed to stop Dolphin profile {profile_id}: {data}")
+        await _stop_dolphin_profile_with_session(session, profile_id)
 
 async def launch_browser_context(
     headless: bool,
@@ -279,52 +489,109 @@ async def launch_browser_context(
             if str(token).strip()
         }
 
-    p = await async_playwright().start()
+    p = None
     browser = None
     context = None
+    page = None
+    launch_mode = "unknown"
     try:
+        try:
+            p = await async_playwright().start()
+        except Exception as exc:
+            raise BrowserLaunchError(
+                f"Failed to start Playwright: {exc}",
+                failure_stage="start",
+                launch_mode="fresh_start",
+                details={
+                    "dolphin_profile_id": profile_id_value,
+                    "user_data_dir": user_data_dir_value,
+                },
+            ) from exc
         if profile_id_value:
-            ws_endpoint = await _start_dolphin_profile(profile_id_value)
-
-            # Give the browser process a moment to bind to the debug port.
-            # Dolphin's /start API can return before Chromium is fully listening.
-            await asyncio.sleep(2)
-
-            # Retry CDP connection with exponential backoff — the Dolphin browser
-            # process may not be listening on its debug port immediately after the
-            # API reports it as started.
-            max_cdp_retries = 5
-            cdp_backoff = 2.0  # seconds, doubles each retry
-            for attempt in range(max_cdp_retries):
-                try:
-                    browser = await p.chromium.connect_over_cdp(ws_endpoint)
-                    break
-                except Exception as exc:
-                    if attempt < max_cdp_retries - 1:
-                        wait = cdp_backoff * (2 ** attempt)
-                        logger.warning(
-                            "CDP connect attempt %d/%d failed for profile %s (retrying in %.1fs): %s",
-                            attempt + 1, max_cdp_retries, profile_id_value, wait, exc,
-                        )
-                        await asyncio.sleep(wait)
+            headers = _dolphin_auth_headers()
+            async with aiohttp.ClientSession(headers=headers) as session:
+                last_error: BrowserLaunchError | None = None
+                for recycle_attempt in range(2):
+                    if recycle_attempt == 0:
+                        ws_endpoint, launch_mode = await _start_or_reuse_dolphin_profile(session, profile_id_value)
                     else:
-                        logger.error(
-                            "CDP connect failed after %d attempts for profile %s: %s",
-                            max_cdp_retries, profile_id_value, exc,
+                        ws_endpoint = await _hard_recycle_dolphin_profile(session, profile_id_value)
+                        launch_mode = "recycled_start"
+
+                    try:
+                        browser = await _connect_dolphin_browser(
+                            p,
+                            ws_endpoint=ws_endpoint,
+                            profile_id=profile_id_value,
+                            launch_mode=launch_mode,
                         )
-                        raise
-
-            context = browser.contexts[0] if browser and browser.contexts else await browser.new_context()
+                        context, page = await _probe_browser_ready(
+                            browser,
+                            profile_id=profile_id_value,
+                            launch_mode=launch_mode,
+                        )
+                        break
+                    except BrowserLaunchError as exc:
+                        last_error = exc
+                        logger.warning(
+                            "Dolphin profile %s failed during %s (%s): %s",
+                            profile_id_value,
+                            exc.failure_stage,
+                            launch_mode,
+                            exc,
+                        )
+                        await _safe_close_browser_targets(context, browser)
+                        browser = None
+                        context = None
+                        page = None
+                        if recycle_attempt >= 1:
+                            raise
+                if context is None or page is None:
+                    raise last_error or BrowserLaunchError(
+                        f"Dolphin profile {profile_id_value} failed to produce a usable browser session.",
+                        failure_stage="ready_probe",
+                        launch_mode=launch_mode,
+                        details={"dolphin_profile_id": str(profile_id_value)},
+                    )
         else:
-            os.makedirs(user_data_dir_value or USER_DATA_DIR, exist_ok=True)
-            context = await p.chromium.launch_persistent_context(
-                user_data_dir=user_data_dir_value or str(USER_DATA_DIR),
-                headless=headless,
-                **kwargs,
-            )
+            launch_mode = "fresh_start"
+            launch_dir = user_data_dir_value or str(USER_DATA_DIR)
+            os.makedirs(launch_dir, exist_ok=True)
+            try:
+                context = await p.chromium.launch_persistent_context(
+                    user_data_dir=launch_dir,
+                    headless=headless,
+                    **kwargs,
+                )
+            except Exception as exc:
+                raise BrowserLaunchError(
+                    f"Failed to launch persistent browser context for {launch_dir}: {exc}",
+                    failure_stage="start",
+                    launch_mode=launch_mode,
+                    details={"user_data_dir": launch_dir},
+                ) from exc
             browser = None
-
-        page = context.pages[0] if context.pages else await context.new_page()
+            try:
+                existing_pages = [existing for existing in (context.pages or []) if not existing.is_closed()]
+            except Exception:
+                existing_pages = []
+            page = existing_pages[0] if existing_pages else await context.new_page()
+            if hasattr(page, "is_closed") and page.is_closed():
+                raise BrowserLaunchError(
+                    f"Persistent browser context for {launch_dir} returned a closed page.",
+                    failure_stage="ready_probe",
+                    launch_mode=launch_mode,
+                    details={"user_data_dir": launch_dir},
+                )
+            try:
+                await page.evaluate("() => document.readyState || 'unknown'")
+            except Exception as exc:
+                raise BrowserLaunchError(
+                    f"Persistent browser ready probe failed for {launch_dir}: {exc}",
+                    failure_stage="ready_probe",
+                    launch_mode=launch_mode,
+                    details={"user_data_dir": launch_dir},
+                ) from exc
 
         if effective_blocked_resource_types:
             async def _resource_filter(route):
@@ -347,17 +614,18 @@ async def launch_browser_context(
 
         # Dolphin natively handles stealth (WebGL, fonts, Canvas, etc.)
         # so we do NOT need to apply our old manual stealth scripts here.
-        return p, browser, context, page
+        return BrowserLaunchResult(
+            playwright=p,
+            browser=browser,
+            context=context,
+            page=page,
+            launch_mode=launch_mode,
+        )
     except Exception:
         try:
-            if context is not None:
-                await context.close()
+            await _safe_close_browser_targets(context, browser)
         except Exception:
             pass
-        try:
-            if browser is not None:
-                await browser.close()
-        except Exception:
-            pass
-        await p.stop()
+        if p is not None:
+            await p.stop()
         raise

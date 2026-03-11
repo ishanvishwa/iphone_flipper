@@ -115,6 +115,22 @@ class WorkerRuntimeTests(unittest.TestCase):
             classify_error("proxy_mismatch: expected=1.2.3.4 observed=5.6.7.8"),
             ErrorCategory.PROXY_MISMATCH,
         )
+        self.assertEqual(
+            classify_error("BROWSER_LAUNCH_FAILED: CDP connect failed for profile 7: ECONNREFUSED"),
+            ErrorCategory.BROWSER_SESSION_LOST,
+        )
+        self.assertEqual(
+            classify_error("Page.evaluate: Target page, context or browser has been closed"),
+            ErrorCategory.BROWSER_SESSION_LOST,
+        )
+
+    def test_browser_session_loss_increments_bad_cycles(self) -> None:
+        bad_cycles = next_bad_cycle_count(
+            current_bad_cycles=1,
+            outcome=CycleOutcome.FAIL,
+            category=ErrorCategory.BROWSER_SESSION_LOST,
+        )
+        self.assertEqual(bad_cycles, 2)
 
     def test_route_state_machine_thresholds(self) -> None:
         self.assertEqual(
