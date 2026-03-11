@@ -35,6 +35,7 @@ class _LeaseConn:
         self.families = {int(row["family_id"]): dict(row) for row in (families or [])}
         self.variants = [dict(row) for row in (variants or [])]
         self.queries: list[str] = []
+        self.last_claim_family_args: tuple[object, ...] = ()
 
     async def fetchrow(self, query: str, *args):
         normalized = " ".join(str(query).split())
@@ -47,7 +48,8 @@ class _LeaseConn:
         if normalized.startswith("UPDATE profiles SET profile_lease_token = NULL"):
             return self._release_profile(*args)
         if normalized.startswith("UPDATE query_families SET family_lease_token = $1"):
-            return self._claim_family(*args)
+            self.last_claim_family_args = args
+            return self._claim_family(*args[:2])
         if normalized.startswith("UPDATE query_families SET family_lease_expires_at = NOW() + ($3::INT * INTERVAL '1 second')"):
             return self._heartbeat_family(*args)
         if normalized.startswith("UPDATE query_families SET family_lease_token = NULL"):
@@ -117,9 +119,18 @@ class _LeaseConn:
         return dict(row)
 
     def _claim_family(self, lease_token: str, lease_seconds: int):
+        allowlisted_family_names: set[str] | None = None
+        if len(self.last_claim_family_args) >= 3:
+            allowlisted_family_names = {
+                str(name).strip().lower()
+                for name in (self.last_claim_family_args[2] or [])
+                if str(name).strip()
+            }
         eligible = []
         for row in self.families.values():
             if not bool(row.get("is_enabled", True)):
+                continue
+            if allowlisted_family_names and str(row.get("name") or "").strip().lower() not in allowlisted_family_names:
                 continue
             if row.get("next_due_at") is not None and row["next_due_at"] > self.now:
                 continue
@@ -129,6 +140,7 @@ class _LeaseConn:
             has_enabled_variant = any(
                 int(variant.get("family_id") or 0) == int(row["family_id"])
                 and bool(variant.get("is_enabled", True))
+                and str(variant.get("validation_state") or "pending_validation").strip().lower() == "validated"
                 for variant in self.variants
             )
             if not has_enabled_variant:
@@ -357,6 +369,7 @@ class V4LeaseManagerTests(unittest.IsolatedAsyncioTestCase):
             families=[
                 {
                     "family_id": 1,
+                    "name": "iphone_broad",
                     "is_enabled": True,
                     "priority": 100,
                     "priority_score": 9.5,
@@ -365,6 +378,7 @@ class V4LeaseManagerTests(unittest.IsolatedAsyncioTestCase):
                 },
                 {
                     "family_id": 2,
+                    "name": "iphone_15_pro",
                     "is_enabled": True,
                     "priority": 50,
                     "priority_score": 4.0,
@@ -373,8 +387,8 @@ class V4LeaseManagerTests(unittest.IsolatedAsyncioTestCase):
                 },
             ],
             variants=[
-                {"family_id": 1, "is_enabled": True},
-                {"family_id": 2, "is_enabled": False},
+                {"family_id": 1, "is_enabled": True, "validation_state": "validated"},
+                {"family_id": 2, "is_enabled": True, "validation_state": "pending_validation"},
             ],
         )
         pool = _LeasePool(conn)
@@ -384,6 +398,7 @@ class V4LeaseManagerTests(unittest.IsolatedAsyncioTestCase):
                 pool,
                 lease_token=token,
                 lease_seconds=120,
+                family_names=["iphone_broad"],
             )
 
         results = await asyncio.gather(_claim("family-a"), _claim("family-b"))

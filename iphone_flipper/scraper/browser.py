@@ -260,12 +260,15 @@ async def stop_dolphin_profile(profile_id: str) -> None:
 async def launch_browser_context(
     headless: bool,
     profile_id: Optional[str] = None,
+    user_data_dir: Optional[str] = None,
     blocked_resource_types: Optional[List[str]] = None,
     **kwargs
 ):
-    """Connect to a Dolphin Anty profile over CDP."""
-    if not profile_id:
-        raise ValueError("A Dolphin Anty profile_id is required for V2.2")
+    """Launch a browser context from either a Dolphin profile or a local user-data-dir."""
+    profile_id_value = str(profile_id or "").strip() or None
+    user_data_dir_value = str(user_data_dir or "").strip() or None
+    if not profile_id_value and not user_data_dir_value:
+        raise ValueError("A Dolphin Anty profile_id or local user_data_dir is required.")
 
     if blocked_resource_types is None:
         effective_blocked_resource_types = set(BROWSER_BLOCK_RESOURCE_TYPES)
@@ -276,63 +279,85 @@ async def launch_browser_context(
             if str(token).strip()
         }
 
-    ws_endpoint = await _start_dolphin_profile(profile_id)
-
-    # Give the browser process a moment to bind to the debug port.
-    # Dolphin's /start API can return before Chromium is fully listening.
-    await asyncio.sleep(2)
-
     p = await async_playwright().start()
-
-    # Retry CDP connection with exponential backoff — the Dolphin browser
-    # process may not be listening on its debug port immediately after the
-    # API reports it as started.
-    max_cdp_retries = 5
-    cdp_backoff = 2.0  # seconds, doubles each retry
     browser = None
-    for attempt in range(max_cdp_retries):
-        try:
-            browser = await p.chromium.connect_over_cdp(ws_endpoint)
-            break
-        except Exception as exc:
-            if attempt < max_cdp_retries - 1:
-                wait = cdp_backoff * (2 ** attempt)
-                logger.warning(
-                    "CDP connect attempt %d/%d failed for profile %s (retrying in %.1fs): %s",
-                    attempt + 1, max_cdp_retries, profile_id, wait, exc,
-                )
-                await asyncio.sleep(wait)
-            else:
-                logger.error(
-                    "CDP connect failed after %d attempts for profile %s: %s",
-                    max_cdp_retries, profile_id, exc,
-                )
-                await p.stop()
-                raise
+    context = None
+    try:
+        if profile_id_value:
+            ws_endpoint = await _start_dolphin_profile(profile_id_value)
 
-    context = browser.contexts[0] if browser.contexts else await browser.new_context()
-    page = context.pages[0] if context.pages else await context.new_page()
+            # Give the browser process a moment to bind to the debug port.
+            # Dolphin's /start API can return before Chromium is fully listening.
+            await asyncio.sleep(2)
 
-    if effective_blocked_resource_types:
-        async def _resource_filter(route):
-            try:
-                resource_type = str(route.request.resource_type or "").strip().lower()
-            except Exception:
-                resource_type = ""
-            try:
-                if resource_type in effective_blocked_resource_types:
-                    await route.abort()
-                    return
-                await route.continue_()
-            except Exception:
+            # Retry CDP connection with exponential backoff — the Dolphin browser
+            # process may not be listening on its debug port immediately after the
+            # API reports it as started.
+            max_cdp_retries = 5
+            cdp_backoff = 2.0  # seconds, doubles each retry
+            for attempt in range(max_cdp_retries):
                 try:
+                    browser = await p.chromium.connect_over_cdp(ws_endpoint)
+                    break
+                except Exception as exc:
+                    if attempt < max_cdp_retries - 1:
+                        wait = cdp_backoff * (2 ** attempt)
+                        logger.warning(
+                            "CDP connect attempt %d/%d failed for profile %s (retrying in %.1fs): %s",
+                            attempt + 1, max_cdp_retries, profile_id_value, wait, exc,
+                        )
+                        await asyncio.sleep(wait)
+                    else:
+                        logger.error(
+                            "CDP connect failed after %d attempts for profile %s: %s",
+                            max_cdp_retries, profile_id_value, exc,
+                        )
+                        raise
+
+            context = browser.contexts[0] if browser and browser.contexts else await browser.new_context()
+        else:
+            os.makedirs(user_data_dir_value or USER_DATA_DIR, exist_ok=True)
+            context = await p.chromium.launch_persistent_context(
+                user_data_dir=user_data_dir_value or str(USER_DATA_DIR),
+                headless=headless,
+                **kwargs,
+            )
+            browser = None
+
+        page = context.pages[0] if context.pages else await context.new_page()
+
+        if effective_blocked_resource_types:
+            async def _resource_filter(route):
+                try:
+                    resource_type = str(route.request.resource_type or "").strip().lower()
+                except Exception:
+                    resource_type = ""
+                try:
+                    if resource_type in effective_blocked_resource_types:
+                        await route.abort()
+                        return
                     await route.continue_()
                 except Exception:
-                    pass
+                    try:
+                        await route.continue_()
+                    except Exception:
+                        pass
 
-        await context.route("**/*", _resource_filter)
+            await context.route("**/*", _resource_filter)
 
-    # Dolphin natively handles stealth (WebGL, fonts, Canvas, etc.)
-    # so we do NOT need to apply our old manual stealth scripts here.
-
-    return p, browser, context, page
+        # Dolphin natively handles stealth (WebGL, fonts, Canvas, etc.)
+        # so we do NOT need to apply our old manual stealth scripts here.
+        return p, browser, context, page
+    except Exception:
+        try:
+            if context is not None:
+                await context.close()
+        except Exception:
+            pass
+        try:
+            if browser is not None:
+                await browser.close()
+        except Exception:
+            pass
+        await p.stop()
+        raise

@@ -42,6 +42,7 @@ Author: Codex implementation/update pass
 - V4 state is backfilled from the current V3 scheduler inventory (`execution_profiles`, `worker_heartbeats`, `central_routes`, `route_queries`).
 - Atomic V4 lease helpers now exist and the V4 warm-session runtime path is implemented behind `ENABLE_V4_WARM_RUNTIME`.
 - V4 discovery-side dedupe now exists behind rollout flags: `ENABLE_V4_FIRST_SEEN_DEDUPE` for the Redis first-seen gate and `ENABLE_V4_UPDATE_EVENTS` plus `PRICE_DROP_UPDATE_MODE` for optional price-change/update events.
+- The blueprint alignment pass is now also complete: the warm session opens the claimed `profiles.user_data_dir` directly, rollout is constrained to allowlisted validated families (default `iphone_broad`), price-change updates can flow end to end, and repeated DOM breakage opens a global V4 pause window.
 - The live V3 worker loop remains intact as the default path until the V4 runtime flag is enabled.
 - Phase-end rechecks are now part of the V4 delivery rule: do not proceed to the next stage until the current stage passes its acceptance gate.
 
@@ -115,7 +116,7 @@ Status: Completed on **2026-03-11**
   - open one warm browser session
   - claim one due V4 family at a time
   - heartbeat profile/family leases
-  - release family/profile/browser locks in `finally`
+  - release family/profile leases in `finally`
   - graceful SIGTERM/SIGINT drain request handling
   - healthy idle close writes `available_after`
 - Added V4 warm runtime env defaults to `server/.env.example`:
@@ -229,6 +230,47 @@ Status: Passed
 - Recheck 3:
   - Confirmed `test_notification_worker` could not be executed in this local Python environment because the `redis` package is absent; `notification_worker.py` itself was syntax-checked with `python3 -m py_compile`.
   - Confirmed downstream behavior remains additive because V4 phase-4 logic only engages on V4 metadata and feature flags, leaving the live V3 runtime path untouched.
+
+### Milestone V4-E: Blueprint Alignment Closure
+
+Status: Completed on **2026-03-12**
+
+- Closed the previously identified blueprint/runtime mismatches in the V4 path:
+  - warm-session launch now uses the claimed `profiles.user_data_dir` directly instead of opening a second Dolphin-selected runtime identity
+  - rollout is explicitly scoped to `V4_ROLLOUT_FAMILY_ALLOWLIST` with `iphone_broad` as the default initial family
+  - `IPHONE_BROAD_MIN_GAP_SECONDS=5` and `IPHONE_BROAD_INITIAL_VARIANTS=1` are now enforced for the initial hot-family rollout
+  - family claim/load paths now require enabled `validation_state='validated'` variants
+  - validated variants can now supply `url_template`, which is used as the navigation target during family execution
+  - notification delivery now allows `listing_updated` only for `dedupe_kind='price_change'` and uses a distinct ledger key per `listing_id + mutable_hash`
+  - repeated `DOM_CHANGED` outcomes now open a Redis-backed global pause window so workers stop claiming fresh V4 families until the circuit breaker cools down
+- Updated docs/env defaults for the alignment controls:
+  - `V4_ROLLOUT_FAMILY_ALLOWLIST`
+  - `IPHONE_BROAD_MIN_GAP_SECONDS`
+  - `IPHONE_BROAD_INITIAL_VARIANTS`
+  - `V4_DOM_CHANGED_THRESHOLD`
+  - `V4_DOM_CHANGED_WINDOW_SECONDS`
+  - `V4_DOM_GLOBAL_PAUSE_SECONDS`
+- Expanded targeted coverage:
+  - lease tests now require validated variants and rollout scoping for family claims
+  - worker-runtime tests now assert that V4 opens the claimed profile directory directly
+  - notification-worker tests now cover price-change update delivery-key behavior
+
+### Milestone V4-E Recheck Results
+
+Status: Passed
+
+- Recheck 1:
+  - Confirmed modified runtime modules compile cleanly:
+    `python3 -m py_compile iphone_flipper/scraper/browser.py iphone_flipper/scraper/core.py iphone_flipper/server/services/worker/lease_manager.py iphone_flipper/server/services/worker/worker.py iphone_flipper/server/services/worker/notification_worker.py`
+- Recheck 2:
+  - Confirmed focused runnable regressions pass from the project root:
+    `python3 -m unittest server.tests.test_v4_leases server.tests.test_worker_v4_runtime`
+  - Confirmed broader runnable regressions still pass:
+    `python3 -m unittest server.tests.test_v4_runtime server.tests.test_worker_observability server.tests.test_worker_runtime server.tests.test_stream_events server.tests.test_notification_dead_letter server.tests.test_feature_flags`
+- Recheck 3:
+  - Confirmed notification-worker coverage passes in a stubbed local harness despite missing host `redis`/`asyncpg` installs:
+    `server.tests.test_notification_worker`
+  - Confirmed clean patch formatting via `git diff --check`.
 
 ### Milestone A: Core Automation Foundation
 

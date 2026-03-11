@@ -133,6 +133,8 @@ def _build_stream_event(
     listing_id: str = "listing-1",
     event_name: str = "listing_created",
     potential_profit: float = 100.0,
+    dedupe_kind: str = "",
+    mutable_hash: str = "",
 ) -> tuple[str, dict[str, str]]:
     event = ListingStreamEvent(
         schema_version=LISTING_STREAM_SCHEMA_VERSION,
@@ -151,6 +153,8 @@ def _build_stream_event(
         url="https://example.com/listing-1",
         thumbnail_url="https://example.com/thumb.jpg",
         source="marketplace",
+        dedupe_kind=dedupe_kind,
+        mutable_hash=mutable_hash,
     )
     return "1741604400000-0", event.to_redis_fields()
 
@@ -212,6 +216,19 @@ class NotificationFormattingTests(unittest.TestCase):
         self.assertNotIn("thumb.jpg", message)
         self.assertNotIn("Thumbnail", message)
 
+    def test_notification_gate_allows_price_change_updates(self) -> None:
+        _, fields = _build_stream_event(
+            event_name="listing_updated",
+            dedupe_kind="price_change",
+            mutable_hash="abc123",
+        )
+        event = ListingStreamEvent.from_redis_fields(fields)
+
+        should_send, reason = notification_worker._notification_gate(event)
+
+        self.assertTrue(should_send)
+        self.assertEqual(reason, "eligible")
+
 
 class NotificationConsumerTests(unittest.IsolatedAsyncioTestCase):
     async def test_ensure_consumer_group_ignores_busygroup(self) -> None:
@@ -258,6 +275,48 @@ class NotificationConsumerTests(unittest.IsolatedAsyncioTestCase):
         ledger.mark_sent.assert_awaited_once()
         self.assertEqual(redis_client.acked, [(notification_worker.LISTING_STREAM_NAME, consumer.consumer_group, stream_event_id)])
         self.assertEqual(emit_mock.call_args.kwargs["notification_status"], "sent")
+
+    async def test_process_stream_entry_price_change_update_uses_distinct_delivery_key(self) -> None:
+        redis_client = _FakeRedis()
+        feature_flags = MagicMock()
+        feature_flags.is_enabled = AsyncMock(return_value=True)
+        ledger = MagicMock()
+        ledger.prepare = AsyncMock(return_value="send")
+        ledger.mark_attempt_started = AsyncMock()
+        ledger.mark_sent = AsyncMock()
+        ledger.mark_retry_pending = AsyncMock()
+        stream_event_id, fields = _build_stream_event(
+            listing_id="listing-update-1",
+            event_name="listing_updated",
+            potential_profit=120.0,
+            dedupe_kind="price_change",
+            mutable_hash="hash-1",
+        )
+        consumer = notification_worker.NotificationConsumer(
+            redis_client=redis_client,
+            feature_flags=feature_flags,
+            ledger=ledger,
+            send_telegram_func=AsyncMock(return_value=True),
+            send_fcm_func=None,
+            pacer=MagicMock(wait_turn=AsyncMock()),
+        )
+
+        await consumer.process_stream_entry(stream_event_id, fields)
+
+        ledger.prepare.assert_awaited_once_with(
+            listing_id="listing-update-1::price_change::hash-1",
+            stream_event_id=stream_event_id,
+            should_send=True,
+            reason="eligible",
+        )
+        ledger.mark_attempt_started.assert_awaited_once_with(
+            "listing-update-1::price_change::hash-1",
+            stream_event_id,
+        )
+        ledger.mark_sent.assert_awaited_once_with(
+            "listing-update-1::price_change::hash-1",
+            stream_event_id,
+        )
 
     async def test_process_stream_entry_suppresses_and_acks(self) -> None:
         redis_client = _FakeRedis()

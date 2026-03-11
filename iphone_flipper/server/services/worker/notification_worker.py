@@ -271,7 +271,12 @@ async def _send_fcm_push(event: ListingStreamEvent) -> bool:
 
 
 def _notification_gate(event: ListingStreamEvent) -> tuple[bool, str]:
-    if str(event.event_name or "").strip() != "listing_created":
+    event_name = str(event.event_name or "").strip()
+    dedupe_kind = str(event.dedupe_kind or "").strip()
+    if event_name == "listing_updated":
+        if dedupe_kind != "price_change":
+            return False, "suppressed_non_price_change_update"
+    elif event_name != "listing_created":
         return False, "suppressed_non_created"
     title = str(event.title or "").strip()
     if not title or title == "Untitled listing":
@@ -282,6 +287,15 @@ def _notification_gate(event: ListingStreamEvent) -> tuple[bool, str]:
     if profit < TELEGRAM_NOTIFY_MIN_PROFIT:
         return False, "suppressed_below_profit_threshold"
     return True, "eligible"
+
+
+def _notification_delivery_key(event: ListingStreamEvent) -> str:
+    listing_id = str(event.listing_id or "").strip()
+    if str(event.event_name or "").strip() == "listing_updated":
+        mutable_hash = str(event.mutable_hash or "").strip()
+        if mutable_hash:
+            return f"{listing_id}::price_change::{mutable_hash}"
+    return listing_id
 
 
 @dataclass
@@ -663,9 +677,10 @@ class NotificationConsumer:
     async def _attempt_delivery(self, event: ListingStreamEvent, stream_event_id: str) -> str:
         message = _build_telegram_card(event)
         last_error = "telegram_delivery_failed"
+        delivery_key = _notification_delivery_key(event)
 
         for attempt in range(1, self._retry_attempts + 1):
-            await self._ledger.mark_attempt_started(str(event.listing_id), stream_event_id)
+            await self._ledger.mark_attempt_started(delivery_key, stream_event_id)
             await self._pacer.wait_turn()
             delivery_started = time.monotonic()
             try:
@@ -679,7 +694,7 @@ class NotificationConsumer:
 
             if sent:
                 notification_sent_ts = utc_now_iso()
-                await self._ledger.mark_sent(str(event.listing_id), stream_event_id)
+                await self._ledger.mark_sent(delivery_key, stream_event_id)
                 self.stats.notifications_sent += 1
                 emit_json_log(
                     "notification_delivery_result",
@@ -722,7 +737,7 @@ class NotificationConsumer:
                 attempt_count=self._retry_attempts,
             )
         except Exception:
-            await self._ledger.mark_retry_pending(str(event.listing_id), stream_event_id, last_error)
+            await self._ledger.mark_retry_pending(delivery_key, stream_event_id, last_error)
             emit_json_log(
                 "notification_dead_letter_failed",
                 listing_id=str(event.listing_id),
@@ -742,7 +757,7 @@ class NotificationConsumer:
             )
             return "retry_pending"
 
-        await self._ledger.mark_failed_terminal(str(event.listing_id), stream_event_id, last_error)
+        await self._ledger.mark_failed_terminal(delivery_key, stream_event_id, last_error)
         self.stats.dead_lettered += 1
         emit_json_log(
             "notification_dead_letter_written",
@@ -770,8 +785,9 @@ class NotificationConsumer:
         self.stats.events_received += 1
         event = ListingStreamEvent.from_redis_fields(fields)
         should_send, reason = _notification_gate(event)
+        delivery_key = _notification_delivery_key(event)
         action = await self._ledger.prepare(
-            listing_id=str(event.listing_id),
+            listing_id=delivery_key,
             stream_event_id=stream_event_id,
             should_send=should_send,
             reason=reason,

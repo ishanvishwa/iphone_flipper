@@ -55,7 +55,7 @@ Status: Completed on **2026-03-11**
 - [x] Added flag-gated V4 warm session runtime path behind `ENABLE_V4_WARM_RUNTIME`
 - [x] Added warm session loop around one claimed V4 profile
 - [x] Added family claiming from `query_families`
-- [x] Added `try/finally` family/profile/browser-lock release
+- [x] Added `try/finally` family/profile lease release
 - [x] Added SIGTERM/SIGINT graceful shutdown request handling
 - [x] Added orphaned Chromium lock cleanup before warm-session launch
 - [x] Added idle close behavior with `available_after` stamping on healthy profile release
@@ -101,6 +101,33 @@ Status: Completed on **2026-03-12**
   - [x] downstream behavior remains stable because the existing pub/sub, stream, enrichment, and notification paths are preserved
   - [x] discovery timestamps and dedupe rules are verified by focused worker/stream/telemetry tests
   - [x] rollback path to the V3 runtime remains intact because all V4 phase-4 behavior is V4-only and flag-gated
+
+### Blueprint Alignment Pass
+
+Status: Completed on **2026-03-12**
+
+- [x] Bound the V4 warm session to the claimed `profiles.user_data_dir` instead of opening a separate Dolphin-selected runtime identity
+- [x] Restricted V4 family claims to an explicit rollout allowlist (`V4_ROLLOUT_FAMILY_ALLOWLIST`, default `iphone_broad`)
+- [x] Enforced the broad-family rollout defaults from the blueprint:
+  - [x] `IPHONE_BROAD_MIN_GAP_SECONDS=5`
+  - [x] `IPHONE_BROAD_INITIAL_VARIANTS=1`
+- [x] Enforced validated-family execution:
+  - [x] family claim SQL now requires at least one enabled `validation_state='validated'` variant
+  - [x] V4 runtime loads only validated variants
+  - [x] `url_template` is now honored when a validated variant supplies one
+- [x] Completed the optional update-alert path end to end:
+  - [x] notification gating now permits `listing_updated` only for `dedupe_kind='price_change'`
+  - [x] notification delivery uses a distinct ledger key per `listing_id + mutable_hash` so price-change alerts do not collide with first-seen sends
+- [x] Added the blueprint’s recommended global DOM-breakage safeguard:
+  - [x] `V4_DOM_CHANGED_THRESHOLD`
+  - [x] `V4_DOM_CHANGED_WINDOW_SECONDS`
+  - [x] `V4_DOM_GLOBAL_PAUSE_SECONDS`
+  - [x] worker loop pauses new family claims when the Redis-backed DOM circuit breaker is open
+- [x] Recheck passed:
+  - [x] V4 runtime now launches the claimed profile directory directly and still releases profile leases on session close/failure
+  - [x] lease tests prove family claims require validated variants and can be rollout-scoped to `iphone_broad`
+  - [x] broader runnable regressions still pass after the alignment changes
+  - [x] notification-worker price-change delivery behavior is verified in the local stubbed test harness
 
 ---
 

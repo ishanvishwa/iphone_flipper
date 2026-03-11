@@ -16,7 +16,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import asyncpg
 from redis.asyncio import Redis
@@ -242,6 +242,14 @@ def _parse_float(raw: str | None, default: float, minimum: float = 0.0) -> float
         return max(minimum, float(default))
 
 
+def _parse_csv_tokens(raw: str | None) -> tuple[str, ...]:
+    return tuple(
+        token.strip().lower()
+        for token in str(raw or "").split(",")
+        if token.strip()
+    )
+
+
 WORKER_HEADLESS = _parse_bool(os.getenv("WORKER_HEADLESS", "1"), default=True)
 WORKER_SCROLL_TARGET_CARDS = _parse_optional_int(os.getenv("WORKER_SCROLL_TARGET_CARDS"), minimum=20)
 WORKER_SCROLL_MAX_ROUNDS = _parse_optional_int(os.getenv("WORKER_SCROLL_MAX_ROUNDS"), minimum=2)
@@ -354,6 +362,12 @@ REDIS_FIRST_SEEN_TTL_SECONDS = _parse_int(
 PRICE_DROP_UPDATE_MODE = _normalize_price_drop_update_mode(os.getenv("PRICE_DROP_UPDATE_MODE", "off"))
 V4_DOM_INVESTIGATION_BACKOFF_SECONDS = 300
 V4_INFRA_FAMILY_BACKOFF_SECONDS = 60
+V4_ROLLOUT_FAMILY_ALLOWLIST = _parse_csv_tokens(os.getenv("V4_ROLLOUT_FAMILY_ALLOWLIST", "iphone_broad"))
+IPHONE_BROAD_MIN_GAP_SECONDS = _parse_int(os.getenv("IPHONE_BROAD_MIN_GAP_SECONDS"), default=5, minimum=1)
+IPHONE_BROAD_INITIAL_VARIANTS = _parse_int(os.getenv("IPHONE_BROAD_INITIAL_VARIANTS"), default=1, minimum=1)
+V4_DOM_CHANGED_THRESHOLD = _parse_int(os.getenv("V4_DOM_CHANGED_THRESHOLD"), default=3, minimum=1)
+V4_DOM_CHANGED_WINDOW_SECONDS = _parse_int(os.getenv("V4_DOM_CHANGED_WINDOW_SECONDS"), default=300, minimum=30)
+V4_DOM_GLOBAL_PAUSE_SECONDS = _parse_int(os.getenv("V4_DOM_GLOBAL_PAUSE_SECONDS"), default=600, minimum=30)
 PROXY_HEALTH_FAILURE_BAN_AFTER = _parse_int(os.getenv("PROXY_HEALTH_FAILURE_BAN_AFTER"), default=3, minimum=1)
 PROXY_HEALTH_BASE_BAN_SECONDS = _parse_int(os.getenv("PROXY_HEALTH_BASE_BAN_SECONDS"), default=300, minimum=30)
 PROXY_HEALTH_MAX_BAN_SECONDS = _parse_int(os.getenv("PROXY_HEALTH_MAX_BAN_SECONDS"), default=7200, minimum=60)
@@ -460,6 +474,7 @@ MANUAL_LOGIN_REQUIRED_MARKERS = (
 _PROFILE_FAILURE_ALERT_LAST_SENT_AT: dict[str, datetime] = {}
 _MANUAL_LOGIN_ALERT_LAST_SENT_AT: dict[str, datetime] = {}
 _V4_PIPELINE_ALERT_LAST_SENT_AT: dict[str, datetime] = {}
+_V4_DOM_CIRCUIT_ALERT_LAST_SENT_AT: dict[str, datetime] = {}
 _ROUTE_CONSECUTIVE_BAD_CYCLES: dict[str, int] = {}
 _ROUTE_SESSION_QUERY_COUNTS: dict[str, int] = {}
 _SINGLE_ROUTE_ENFORCEMENT_ACTIVE = False
@@ -475,8 +490,7 @@ DOLPHIN_PROFILE_BLACKLIST_SECONDS = 1800  # 30-min cooldown
 class V4WarmSessionState:
     profile: dict[str, Any]
     profile_lease_token: str
-    browser_profile_id: str
-    browser_profile_lock_id: str | None
+    runtime_identity: str
     session: Any
     started_at: datetime
     last_activity_at: datetime
@@ -1035,6 +1049,109 @@ def _send_telegram_v4_pipeline_alert(
         f"Error: {str(error or '').strip()[:500]}"
     )
     send_telegram(message, parse_mode=None, disable_web_page_preview=True)
+
+
+def _v4_dom_circuit_key(scope: str) -> str:
+    return f"v4:dom_circuit:{scope}"
+
+
+def _should_send_v4_dom_circuit_alert(scope: str, now: datetime | None = None) -> bool:
+    now_dt = now or datetime.now(timezone.utc)
+    alert_key = f"{scope}:{WORKER_NAME}"
+    last_sent_at = _V4_DOM_CIRCUIT_ALERT_LAST_SENT_AT.get(alert_key)
+    if last_sent_at:
+        age_seconds = (now_dt - last_sent_at).total_seconds()
+        if age_seconds < V4_PIPELINE_ALERT_COOLDOWN_SECONDS:
+            return False
+    _V4_DOM_CIRCUIT_ALERT_LAST_SENT_AT[alert_key] = now_dt
+    return True
+
+
+def _send_telegram_v4_dom_circuit_alert(
+    *,
+    route_name: str | None,
+    profile_id: int | None,
+    threshold: int,
+    pause_seconds: int,
+) -> None:
+    if not TELEGRAM_NOTIFICATIONS_ENABLED:
+        return
+    message = (
+        "⚠️ V4 DOM circuit breaker opened\n"
+        f"Worker: {WORKER_NAME}\n"
+        f"Route: {route_name or 'unknown'}\n"
+        f"Profile ID: {profile_id if profile_id is not None else 'unknown'}\n"
+        f"Threshold: {threshold}\n"
+        f"Global pause: {pause_seconds}s\n"
+        "Reason: DOM_CHANGED or missing-feed signals crossed the global safety threshold."
+    )
+    send_telegram(message, parse_mode=None, disable_web_page_preview=True)
+
+
+async def _v4_dom_circuit_pause_remaining_seconds(redis_client: Redis | None) -> int:
+    if redis_client is None:
+        return 0
+    try:
+        ttl_seconds = int(await redis_client.ttl(_v4_dom_circuit_key("pause")) or 0)
+    except Exception:
+        return 0
+    return max(0, ttl_seconds)
+
+
+async def _record_v4_dom_changed_signal(
+    redis_client: Redis | None,
+    *,
+    family: Mapping[str, Any],
+    profile: Mapping[str, Any],
+) -> int:
+    if redis_client is None:
+        return 0
+    window_key = _v4_dom_circuit_key("profiles")
+    pause_key = _v4_dom_circuit_key("pause")
+    route_name = _normalize_optional_text(family.get("name")) or None
+    profile_id = profile.get("profile_id")
+    profile_key = str(profile_id if profile_id is not None else route_name or "unknown")
+    try:
+        await redis_client.sadd(window_key, profile_key)
+        await redis_client.expire(window_key, V4_DOM_CHANGED_WINDOW_SECONDS)
+        affected_profiles = int(await redis_client.scard(window_key) or 0)
+        if affected_profiles < V4_DOM_CHANGED_THRESHOLD:
+            emit_json_log(
+                "v4_dom_changed_signal",
+                worker_name=WORKER_NAME,
+                route_name=route_name,
+                profile_id=profile_id,
+                affected_profiles=affected_profiles,
+                window_seconds=V4_DOM_CHANGED_WINDOW_SECONDS,
+            )
+            return 0
+        await redis_client.set(
+            pause_key,
+            utc_now_iso(),
+            ex=V4_DOM_GLOBAL_PAUSE_SECONDS,
+        )
+    except Exception as exc:
+        logging.warning("[%s] failed to record V4 DOM circuit state: %s", WORKER_NAME, exc)
+        return 0
+
+    emit_json_log(
+        "v4_dom_circuit_open",
+        worker_name=WORKER_NAME,
+        route_name=route_name,
+        profile_id=profile_id,
+        affected_profiles=affected_profiles,
+        threshold=V4_DOM_CHANGED_THRESHOLD,
+        pause_seconds=V4_DOM_GLOBAL_PAUSE_SECONDS,
+    )
+    if _should_send_v4_dom_circuit_alert("global_pause"):
+        await asyncio.to_thread(
+            _send_telegram_v4_dom_circuit_alert,
+            route_name=route_name,
+            profile_id=int(profile_id) if profile_id is not None else None,
+            threshold=V4_DOM_CHANGED_THRESHOLD,
+            pause_seconds=V4_DOM_GLOBAL_PAUSE_SECONDS,
+        )
+    return V4_DOM_GLOBAL_PAUSE_SECONDS
 
 
 async def _resolve_v4_listing_dedupe(
@@ -1990,6 +2107,87 @@ def _build_v4_family_route(profile: dict[str, Any], family: dict[str, Any] | Non
     }
 
 
+async def _apply_v4_rollout_family_overrides(pool: asyncpg.Pool) -> None:
+    if not V4_ROLLOUT_FAMILY_ALLOWLIST:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE query_families
+            SET
+                min_gap_s = CASE
+                    WHEN LOWER(name) = 'iphone_broad' THEN $2::INT
+                    ELSE query_families.min_gap_s
+                END,
+                next_due_at = LEAST(COALESCE(next_due_at, NOW()), NOW())
+            WHERE LOWER(name) = ANY($1::TEXT[])
+            """,
+            list(V4_ROLLOUT_FAMILY_ALLOWLIST),
+            IPHONE_BROAD_MIN_GAP_SECONDS,
+        )
+        await conn.execute(
+            """
+            WITH ranked AS (
+                SELECT
+                    qv.variant_id,
+                    qv.family_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY qv.family_id
+                        ORDER BY qv.variant_order ASC, qv.variant_id ASC
+                    ) AS variant_rank
+                FROM query_variants qv
+                JOIN query_families qf
+                  ON qf.family_id = qv.family_id
+                WHERE LOWER(qf.name) = ANY($1::TEXT[])
+                  AND COALESCE(qv.is_enabled, TRUE) = TRUE
+            )
+            UPDATE query_variants qv
+            SET validation_state = CASE
+                    WHEN ranked.variant_rank <= $2::INT THEN 'validated'
+                    ELSE 'pending_validation'
+                END
+            FROM ranked
+            WHERE ranked.variant_id = qv.variant_id
+            """,
+            list(V4_ROLLOUT_FAMILY_ALLOWLIST),
+            IPHONE_BROAD_INITIAL_VARIANTS,
+        )
+        await conn.execute(
+            """
+            UPDATE query_families qf
+            SET
+                variant_count = COALESCE((
+                    SELECT COUNT(*)::INT
+                    FROM query_variants qv
+                    WHERE qv.family_id = qf.family_id
+                      AND COALESCE(qv.is_enabled, TRUE) = TRUE
+                      AND LOWER(COALESCE(qv.validation_state, 'pending_validation')) = 'validated'
+                ), 0),
+                variant_cursor = CASE
+                    WHEN COALESCE((
+                        SELECT COUNT(*)::INT
+                        FROM query_variants qv
+                        WHERE qv.family_id = qf.family_id
+                          AND COALESCE(qv.is_enabled, TRUE) = TRUE
+                          AND LOWER(COALESCE(qv.validation_state, 'pending_validation')) = 'validated'
+                    ), 0) <= 1 THEN 0
+                    ELSE LEAST(
+                        COALESCE(qf.variant_cursor, 0),
+                        (
+                            SELECT COUNT(*)::INT - 1
+                            FROM query_variants qv
+                            WHERE qv.family_id = qf.family_id
+                              AND COALESCE(qv.is_enabled, TRUE) = TRUE
+                              AND LOWER(COALESCE(qv.validation_state, 'pending_validation')) = 'validated'
+                        )
+                    )
+                END
+            WHERE LOWER(qf.name) = ANY($1::TEXT[])
+            """,
+            list(V4_ROLLOUT_FAMILY_ALLOWLIST),
+        )
+
+
 async def _claim_v4_profile(pool: asyncpg.Pool) -> dict[str, Any] | None:
     return await claim_next_profile_from_module(
         pool,
@@ -2004,6 +2202,7 @@ async def _claim_v4_family(pool: asyncpg.Pool) -> dict[str, Any] | None:
         pool,
         lease_token=uuid.uuid4().hex,
         lease_seconds=FAMILY_LEASE_SECONDS,
+        family_names=V4_ROLLOUT_FAMILY_ALLOWLIST or None,
     )
 
 
@@ -2029,6 +2228,7 @@ async def _load_v4_family_variant(pool: asyncpg.Pool, family: dict[str, Any]) ->
             FROM query_variants
             WHERE family_id = $1
               AND COALESCE(is_enabled, TRUE) = TRUE
+              AND LOWER(COALESCE(validation_state, 'pending_validation')) = 'validated'
             ORDER BY variant_order ASC, variant_id ASC
             """,
             int(family_id),
@@ -2049,6 +2249,17 @@ def _v4_variant_queries(variant: dict[str, Any] | None) -> list[str]:
     if query_text.upper() == "BUCKETS":
         return _get_bucket_queries(num_queries=1)
     return [query_text]
+
+
+def _v4_variant_urls(variant: dict[str, Any] | None) -> list[str]:
+    url_template = str((variant or {}).get("url_template") or "").strip()
+    query_text = str((variant or {}).get("query_text") or "").strip()
+    if not url_template:
+        return []
+    if "{query}" in url_template and query_text:
+        encoded_query = quote(query_text, safe="")
+        return [url_template.replace("{query}", encoded_query)]
+    return [url_template]
 
 
 def _default_v4_claim_error_text(outcome: FamilyClaimOutcome, error_text: str | None) -> str | None:
@@ -2454,40 +2665,12 @@ async def _start_v4_lease_heartbeat_task(
     return asyncio.create_task(_runner())
 
 
-async def _claim_dolphin_profile_for_session(
-    pool: asyncpg.Pool,
-    profile: dict[str, Any],
-) -> tuple[str, str | None]:
-    route = _build_v4_family_route(profile)
-    dolphin_profile_id = (os.getenv("DOLPHIN_PROFILE_ID") or "").strip()
-    if dolphin_profile_id:
-        dolphin_lock_id = await _try_acquire_profile_lock(pool, route, dolphin_profile_id)
-        if not dolphin_lock_id:
-            raise ProfileLockUnavailableError(f"Dolphin profile lock unavailable for {dolphin_profile_id}")
-        return dolphin_profile_id, dolphin_lock_id
-
-    from scraper.browser import list_dolphin_profiles
-
-    available_profiles = await list_dolphin_profiles()
-    if not available_profiles:
-        raise NoProxyAvailableError("No Dolphin Anty profiles are available for warm-session execution.")
-    random.shuffle(available_profiles)
-    blacklisted_profiles = await _fetch_dolphin_profile_blacklist(
-        pool,
-        [str(item.get("id") or "").strip() for item in available_profiles],
-    )
-    for item in available_profiles:
-        profile_id = str(item.get("id") or "").strip()
-        if not profile_id or blacklisted_profiles.get(profile_id):
-            continue
-        dolphin_lock_id = await _try_acquire_profile_lock(pool, route, profile_id)
-        if dolphin_lock_id:
-            return profile_id, dolphin_lock_id
-    raise NoProxyAvailableError("No unlocked Dolphin Anty profile is available for warm-session execution.")
-
-
 async def _open_v4_warm_session(pool: asyncpg.Pool, profile: dict[str, Any]) -> V4WarmSessionState:
-    removed_lock_files = scrub_orphaned_chromium_locks(str(profile.get("user_data_dir") or "").strip() or None)
+    _ = pool
+    user_data_dir = str(profile.get("user_data_dir") or "").strip()
+    if not user_data_dir:
+        raise NoProxyAvailableError("Claimed V4 profile is missing user_data_dir.")
+    removed_lock_files = scrub_orphaned_chromium_locks(user_data_dir or None)
     if removed_lock_files:
         logging.info(
             "[%s] scrubbed orphaned Chromium lock files for %s: %s",
@@ -2495,18 +2678,12 @@ async def _open_v4_warm_session(pool: asyncpg.Pool, profile: dict[str, Any]) -> 
             profile.get("user_data_dir"),
             ", ".join(removed_lock_files),
         )
-    browser_profile_id, browser_profile_lock_id = await _claim_dolphin_profile_for_session(pool, profile)
-    try:
-        session = await open_profile_session(browser_profile_id, headless=WORKER_HEADLESS)
-    except Exception:
-        await _release_profile_lock(pool, _build_v4_family_route(profile), browser_profile_lock_id)
-        raise
+    session = await open_profile_session(user_data_dir=user_data_dir, headless=WORKER_HEADLESS)
     now_dt = datetime.now(timezone.utc)
     return V4WarmSessionState(
         profile=profile,
         profile_lease_token=str(profile.get("profile_lease_token") or ""),
-        browser_profile_id=browser_profile_id,
-        browser_profile_lock_id=browser_profile_lock_id,
+        runtime_identity=user_data_dir,
         session=session,
         started_at=now_dt,
         last_activity_at=now_dt,
@@ -2521,18 +2698,14 @@ async def _close_v4_warm_session(
 ) -> None:
     if warm_session is None:
         return
-    route = _build_v4_family_route(warm_session.profile)
     try:
         await close_profile_session(warm_session.session)
     finally:
-        try:
-            await _release_profile_lock(pool, route, warm_session.browser_profile_lock_id)
-        finally:
-            await _release_v4_profile(
-                pool,
-                warm_session.profile,
-                available_after_seconds=available_after_seconds,
-            )
+        await _release_v4_profile(
+            pool,
+            warm_session.profile,
+            available_after_seconds=available_after_seconds,
+        )
 
 
 async def _run_v4_family_claim(
@@ -2584,7 +2757,8 @@ async def _run_v4_family_claim(
         "end_to_end_alert_latency_ms_count": 0,
     }
     query_override = _v4_variant_queries(variant)
-    selected_query = query_override[0] if query_override else None
+    url_override = _v4_variant_urls(variant)
+    selected_query = str((variant or {}).get("query_text") or "").strip() or (query_override[0] if query_override else None)
 
     def _on_progress(payload: dict[str, Any]) -> None:
         nonlocal final_url, feed_present, empty_state_detected
@@ -2666,6 +2840,7 @@ async def _run_v4_family_claim(
             progress_callback=_on_progress,
             stop_event=_worker_shutdown_event(),
             search_queries=query_override,
+            search_urls=url_override,
             scroll_target_cards_override=WORKER_SCROLL_TARGET_CARDS,
             scroll_max_rounds_override=WORKER_SCROLL_MAX_ROUNDS,
             apply_inter_query_delay=False,
@@ -2735,6 +2910,7 @@ async def _run_v4_worker_loop(
     _ = runtime_config
     logging.info("[%s] V4 warm-session worker loop online", WORKER_NAME)
     config = _v4_warm_session_config()
+    await _apply_v4_rollout_family_overrides(pool)
 
     while not _worker_shutdown_requested():
         if feature_flags is not None and not await feature_flags.is_enabled("ENABLE_V4_WARM_RUNTIME"):
@@ -2787,6 +2963,22 @@ async def _run_v4_worker_loop(
                     if recycle_reason is not None:
                         idle_close = recycle_reason == "idle_close"
                         break
+
+                    dom_pause_remaining = await _v4_dom_circuit_pause_remaining_seconds(redis_client)
+                    if dom_pause_remaining > 0:
+                        await _upsert_worker_heartbeat(
+                            pool=pool,
+                            route_name="",
+                            status="dom_pause",
+                            listings_saved=0,
+                            query_count=0,
+                            last_error=f"V4 DOM circuit breaker active for another {dom_pause_remaining}s.",
+                            started_at=datetime.now(timezone.utc),
+                            finished_at=datetime.now(timezone.utc),
+                            route=_build_v4_family_route(warm_session.profile),
+                        )
+                        await asyncio.sleep(min(float(dom_pause_remaining), float(LEASE_HEARTBEAT_SECONDS)))
+                        continue
 
                     family = await _claim_v4_family(pool)
                     if family is None:
@@ -2875,6 +3067,19 @@ async def _run_v4_worker_loop(
                             family,
                             claim_result,
                         )
+                        if claim_result.outcome == FamilyClaimOutcome.DOM_CHANGED:
+                            pause_seconds = await _record_v4_dom_changed_signal(
+                                redis_client,
+                                family=family,
+                                profile=warm_session.profile,
+                            )
+                            if pause_seconds > 0:
+                                logging.warning(
+                                    "[%s] V4 DOM circuit breaker opened for %ss after family=%s",
+                                    WORKER_NAME,
+                                    pause_seconds,
+                                    family.get("name"),
+                                )
 
                     warm_session.executed_claims += 1
                     warm_session.last_activity_at = datetime.now(timezone.utc)

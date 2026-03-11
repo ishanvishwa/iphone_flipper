@@ -8,6 +8,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 from scraper.browser import launch_browser_context, random_delay, stop_dolphin_profile
 from scraper.config import DB_PATH
@@ -46,6 +47,8 @@ class MarketplaceSession:
     cursor: sqlite3.Cursor
     price_data: Dict[str, Any]
     runtime_settings: Dict[str, Any]
+    close_browser_explicitly: bool = True
+    stop_profile_on_close: bool = True
 
 
 @dataclass
@@ -69,6 +72,38 @@ def _resolve_active_queries(
 
         active_queries = SEARCH_QUERIES[: runtime_settings.get("max_queries_per_run", 5)]
     return active_queries
+
+
+def _default_search_url(query: str) -> str:
+    query_text = str(query or "").strip()
+    if query_text.lower().startswith(("http://", "https://")):
+        return query_text
+    encoded_query = quote(query_text, safe="")
+    return (
+        "https://www.facebook.com/marketplace/perth/search?"
+        f"query={encoded_query}&exact=false&sortBy=creation_time_descend"
+    )
+
+
+def _resolve_query_targets(
+    runtime_settings: Dict[str, Any],
+    *,
+    search_queries: Optional[List[str]] = None,
+    search_urls: Optional[List[str]] = None,
+) -> List[Tuple[str, str]]:
+    explicit_queries = [str(q).strip() for q in (search_queries or []) if str(q).strip()]
+    explicit_urls = [str(url).strip() for url in (search_urls or []) if str(url).strip()]
+    if explicit_urls and not explicit_queries:
+        explicit_queries = list(explicit_urls)
+    active_queries = _resolve_active_queries(runtime_settings, explicit_queries)
+    targets: List[Tuple[str, str]] = []
+    for index, query in enumerate(active_queries):
+        if index < len(explicit_urls):
+            navigation_url = explicit_urls[index]
+        else:
+            navigation_url = _default_search_url(query)
+        targets.append((query, navigation_url))
+    return targets
 
 
 def _resolve_scroll_settings(
@@ -149,18 +184,26 @@ async def _inspect_marketplace_results_surface(page) -> Dict[str, Any]:
 
 
 async def open_profile_session(
-    profile_id: str,
+    profile_id: str | None = None,
     *,
+    user_data_dir: str | None = None,
     headless: bool = False,
 ) -> MarketplaceSession:
     init_db()
     price_data = load_price_list()
     runtime_settings = load_runtime_scraper_settings()
-    playwright, browser, context, page = await launch_browser_context(headless=headless, profile_id=profile_id)
+    runtime_identity = str(profile_id or user_data_dir or "").strip()
+    if not runtime_identity:
+        raise ValueError("A Dolphin profile_id or user_data_dir is required.")
+    playwright, browser, context, page = await launch_browser_context(
+        headless=headless,
+        profile_id=profile_id,
+        user_data_dir=user_data_dir,
+    )
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     return MarketplaceSession(
-        profile_id=profile_id,
+        profile_id=runtime_identity,
         playwright=playwright,
         browser=browser,
         context=context,
@@ -169,13 +212,15 @@ async def open_profile_session(
         cursor=cursor,
         price_data=price_data,
         runtime_settings=runtime_settings,
+        close_browser_explicitly=profile_id is not None,
+        stop_profile_on_close=profile_id is not None,
     )
 
 
 async def close_profile_session(
     session: MarketplaceSession,
     *,
-    stop_profile: bool = True,
+    stop_profile: bool | None = None,
 ) -> None:
     errors: list[BaseException] = []
     try:
@@ -187,16 +232,18 @@ async def close_profile_session(
         await session.context.close()
     except Exception as exc:
         errors.append(exc)
-    try:
-        await session.browser.close()
-    except Exception as exc:
-        errors.append(exc)
+    if session.close_browser_explicitly and session.browser is not None:
+        try:
+            await session.browser.close()
+        except Exception as exc:
+            errors.append(exc)
     try:
         await session.playwright.stop()
     except Exception as exc:
         errors.append(exc)
 
-    if stop_profile:
+    effective_stop_profile = session.stop_profile_on_close if stop_profile is None else bool(stop_profile)
+    if effective_stop_profile:
         try:
             await stop_dolphin_profile(session.profile_id)
         except Exception as exc:
@@ -213,13 +260,18 @@ async def _execute_queries_on_page(
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     stop_event: Any = None,
     search_queries: Optional[List[str]] = None,
+    search_urls: Optional[List[str]] = None,
     scroll_target_cards_override: Optional[int] = None,
     scroll_max_rounds_override: Optional[int] = None,
     apply_inter_query_delay: bool = True,
 ) -> List[Dict[str, Any]]:
     runtime_settings = load_runtime_scraper_settings()
     session.runtime_settings = runtime_settings
-    active_queries = _resolve_active_queries(runtime_settings, search_queries)
+    query_targets = _resolve_query_targets(
+        runtime_settings,
+        search_queries=search_queries,
+        search_urls=search_urls,
+    )
     scroll_target_cards, scroll_max_rounds = _resolve_scroll_settings(
         runtime_settings,
         scroll_target_cards_override=scroll_target_cards_override,
@@ -237,7 +289,7 @@ async def _execute_queries_on_page(
     processed_listings: List[Dict[str, Any]] = []
     seen_listing_ids = set()
     new_listings_count = 0
-    total_queries = len(active_queries)
+    total_queries = len(query_targets)
     processed_queries = 0
     cancelled = False
     manual_login_error = None
@@ -255,7 +307,7 @@ async def _execute_queries_on_page(
         listing_discovery_ts[listing_id] = discovery_ts
         return discovery_ts
 
-    for index, query in enumerate(active_queries, start=1):
+    for index, (query, search_url) in enumerate(query_targets, start=1):
         if stop_event and stop_event.is_set():
             cancelled = True
             emit_progress("cancelled", query_index=processed_queries, query_total=total_queries)
@@ -263,11 +315,6 @@ async def _execute_queries_on_page(
 
         emit_progress("query_start", query=query, query_index=index, query_total=total_queries)
         print(f"  Searching for: {query}")
-
-        search_url = (
-            f"https://www.facebook.com/marketplace/perth/search?"
-            f"query={query.replace(' ', '%20')}&exact=false&sortBy=creation_time_descend"
-        )
 
         from scraper.legacy_utils import (
             _detect_manual_login_required_state,
@@ -531,6 +578,7 @@ async def execute_session_queries(
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     stop_event: Any = None,
     search_queries: Optional[List[str]] = None,
+    search_urls: Optional[List[str]] = None,
     scroll_target_cards_override: Optional[int] = None,
     scroll_max_rounds_override: Optional[int] = None,
     apply_inter_query_delay: bool = True,
@@ -541,6 +589,7 @@ async def execute_session_queries(
         progress_callback=progress_callback,
         stop_event=stop_event,
         search_queries=search_queries,
+        search_urls=search_urls,
         scroll_target_cards_override=scroll_target_cards_override,
         scroll_max_rounds_override=scroll_max_rounds_override,
         apply_inter_query_delay=apply_inter_query_delay,
@@ -554,6 +603,7 @@ async def execute_family_claim(
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     stop_event: Any = None,
     search_queries: Optional[List[str]] = None,
+    search_urls: Optional[List[str]] = None,
     scroll_target_cards_override: Optional[int] = None,
     scroll_max_rounds_override: Optional[int] = None,
     apply_inter_query_delay: bool = False,
@@ -566,6 +616,7 @@ async def execute_family_claim(
             progress_callback=progress_callback,
             stop_event=stop_event,
             search_queries=search_queries,
+            search_urls=search_urls,
             scroll_target_cards_override=scroll_target_cards_override,
             scroll_max_rounds_override=scroll_max_rounds_override,
             apply_inter_query_delay=apply_inter_query_delay,

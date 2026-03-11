@@ -368,15 +368,26 @@ async def claim_next_due_family(
     *,
     lease_token: str,
     lease_seconds: int,
+    family_names: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, object] | None:
     lease_token_value = str(lease_token or "").strip()
     if not lease_token_value:
         return None
 
     safe_lease_seconds = _safe_lease_seconds(lease_seconds)
+    allowlisted_family_names = [
+        str(name).strip().lower()
+        for name in (family_names or [])
+        if str(name).strip()
+    ]
+    family_filter_sql = ""
+    query_args: list[object] = [lease_token_value, safe_lease_seconds]
+    if allowlisted_family_names:
+        family_filter_sql = "\n                  AND LOWER(name) = ANY($3::TEXT[])"
+        query_args.append(allowlisted_family_names)
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            """
+            f"""
             UPDATE query_families
             SET
                 family_lease_token = $1,
@@ -388,11 +399,13 @@ async def claim_next_due_family(
                 WHERE is_enabled = TRUE
                   AND next_due_at <= NOW()
                   AND (family_lease_expires_at IS NULL OR family_lease_expires_at <= NOW())
+                  {family_filter_sql}
                   AND EXISTS (
                         SELECT 1
                         FROM query_variants
                         WHERE query_variants.family_id = query_families.family_id
                           AND COALESCE(query_variants.is_enabled, TRUE) = TRUE
+                          AND LOWER(COALESCE(query_variants.validation_state, 'pending_validation')) = 'validated'
                   )
                 ORDER BY
                     priority_score DESC NULLS LAST,
@@ -404,8 +417,7 @@ async def claim_next_due_family(
             )
             RETURNING *
             """,
-            lease_token_value,
-            safe_lease_seconds,
+            *query_args,
         )
     return _row_to_dict(row)
 
