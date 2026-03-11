@@ -41,6 +41,7 @@ class ListingStreamEventTests(unittest.TestCase):
         self.assertEqual(decoded.listing_id, "listing-1")
         self.assertEqual(decoded.query_index, 2)
         self.assertEqual(decoded.query_total, 10)
+        self.assertEqual(decoded.discovery_ts, "")
         self.assertEqual(decoded.price, 799.0)
         self.assertEqual(decoded.potential_profit, 220.0)
         self.assertEqual(decoded.thumbnail_url, "https://example.com/thumb-1.jpg")
@@ -61,6 +62,9 @@ class ListingStreamEventTests(unittest.TestCase):
             "query_total": 9,
             "query_shard_key": "QUERY_SHARD:def",
             "source": "marketplace",
+            "discovery_ts": "2026-03-09T08:00:00+00:00",
+            "dedupe_kind": "first_seen",
+            "mutable_hash": "price-hash-1",
         }
 
         event = build_listing_stream_event(
@@ -75,6 +79,9 @@ class ListingStreamEventTests(unittest.TestCase):
         self.assertEqual(event.route_name, "profile_1")
         self.assertEqual(event.query_shard_key, "QUERY_SHARD:def")
         self.assertEqual(event.source, "marketplace")
+        self.assertEqual(event.discovery_ts, "2026-03-09T08:00:00+00:00")
+        self.assertEqual(event.dedupe_kind, "first_seen")
+        self.assertEqual(event.mutable_hash, "price-hash-1")
         self.assertEqual(event.thumbnail_url, "https://example.com/thumb-2.jpg")
 
 

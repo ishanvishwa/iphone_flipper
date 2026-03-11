@@ -14,6 +14,9 @@ DEFAULT_FEATURE_FLAGS: dict[str, bool] = {
     "ENABLE_ROUTE_LANES": False,
     "ENABLE_BACKGROUND_ENRICHMENT": False,
     "ENABLE_CENTRAL_ROUTE_DISPATCH": False,
+    "ENABLE_V4_WARM_RUNTIME": False,
+    "ENABLE_V4_FIRST_SEEN_DEDUPE": False,
+    "ENABLE_V4_UPDATE_EVENTS": False,
 }
 
 _TRUE_VALUES = {"1", "true", "yes", "on", "enabled"}

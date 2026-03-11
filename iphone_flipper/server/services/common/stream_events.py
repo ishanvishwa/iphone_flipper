@@ -6,7 +6,7 @@ from typing import Any, Mapping
 
 LISTING_STREAM_NAME = "stream:listings"
 LISTING_STREAM_MAXLEN = 10_000
-LISTING_STREAM_SCHEMA_VERSION = "1"
+LISTING_STREAM_SCHEMA_VERSION = "2"
 
 LISTING_STREAM_COMPARISON_FIELDS: tuple[str, ...] = (
     "title",
@@ -123,6 +123,9 @@ class ListingStreamEvent:
     url: str
     thumbnail_url: str
     source: str
+    discovery_ts: str = ""
+    dedupe_kind: str = ""
+    mutable_hash: str = ""
 
     def to_redis_fields(self) -> dict[str, str]:
         return {
@@ -135,6 +138,7 @@ class ListingStreamEvent:
             "query_index": _normalize_text(self.query_index),
             "query_total": _normalize_text(self.query_total),
             "query_shard_key": _normalize_text(self.query_shard_key),
+            "discovery_ts": _normalize_text(self.discovery_ts),
             "persisted_at": _normalize_text(self.persisted_at),
             "price": _normalize_numeric(self.price),
             "potential_profit": _normalize_numeric(self.potential_profit),
@@ -142,6 +146,8 @@ class ListingStreamEvent:
             "url": _normalize_text(self.url),
             "thumbnail_url": _normalize_text(self.thumbnail_url),
             "source": _normalize_text(self.source),
+            "dedupe_kind": _normalize_text(self.dedupe_kind),
+            "mutable_hash": _normalize_text(self.mutable_hash),
         }
 
     @classmethod
@@ -156,6 +162,7 @@ class ListingStreamEvent:
             query_index=_parse_optional_int(fields.get("query_index")),
             query_total=_parse_optional_int(fields.get("query_total")),
             query_shard_key=_normalize_text(fields.get("query_shard_key")),
+            discovery_ts=_normalize_text(fields.get("discovery_ts")),
             persisted_at=_normalize_text(fields.get("persisted_at")),
             price=_parse_optional_float(fields.get("price")),
             potential_profit=_parse_optional_float(fields.get("potential_profit")),
@@ -163,6 +170,8 @@ class ListingStreamEvent:
             url=_normalize_text(fields.get("url")),
             thumbnail_url=_normalize_text(fields.get("thumbnail_url")),
             source=_normalize_text(fields.get("source")),
+            dedupe_kind=_normalize_text(fields.get("dedupe_kind")),
+            mutable_hash=_normalize_text(fields.get("mutable_hash")),
         )
 
 
@@ -184,6 +193,7 @@ def build_listing_stream_event(
         query_index=_parse_optional_int(metadata.get("query_index")),
         query_total=_parse_optional_int(metadata.get("query_total")),
         query_shard_key=_normalize_text(metadata.get("query_shard_key")),
+        discovery_ts=_normalize_text(metadata.get("discovery_ts") or metadata.get("listing_seen_ts")),
         persisted_at=_normalize_text(persisted_at),
         price=_parse_optional_float(listing.get("price")),
         potential_profit=_parse_optional_float(listing.get("potential_profit")),
@@ -191,4 +201,6 @@ def build_listing_stream_event(
         url=_normalize_text(listing.get("url")),
         thumbnail_url=_normalize_text(listing.get("thumbnail_url")),
         source=_normalize_text(listing.get("source") or metadata.get("source")),
+        dedupe_kind=_normalize_text(metadata.get("dedupe_kind")),
+        mutable_hash=_normalize_text(metadata.get("mutable_hash")),
     )

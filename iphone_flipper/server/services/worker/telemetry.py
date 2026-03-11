@@ -56,6 +56,25 @@ def build_cycle_telemetry_payload(
         payload["redis_stream_publish_failure_count"] = int(
             metrics.get("redis_stream_publish_failure_count", 0) or 0
         )
+        payload["v4_first_seen_gate_latency_ms_sum"] = int(
+            metrics.get("v4_first_seen_gate_latency_ms_sum", 0) or 0
+        )
+        payload["v4_first_seen_gate_latency_ms_count"] = int(
+            metrics.get("v4_first_seen_gate_latency_ms_count", 0) or 0
+        )
+        payload["v4_first_seen_claim_count"] = int(metrics.get("v4_first_seen_claim_count", 0) or 0)
+        payload["v4_first_seen_duplicate_count"] = int(
+            metrics.get("v4_first_seen_duplicate_count", 0) or 0
+        )
+        payload["v4_update_gate_latency_ms_sum"] = int(metrics.get("v4_update_gate_latency_ms_sum", 0) or 0)
+        payload["v4_update_gate_latency_ms_count"] = int(
+            metrics.get("v4_update_gate_latency_ms_count", 0) or 0
+        )
+        payload["v4_update_event_claim_count"] = int(metrics.get("v4_update_event_claim_count", 0) or 0)
+        payload["v4_update_event_duplicate_count"] = int(
+            metrics.get("v4_update_event_duplicate_count", 0) or 0
+        )
+        payload["v4_dedupe_fallback_count"] = int(metrics.get("v4_dedupe_fallback_count", 0) or 0)
         payload["notification_delivery_latency_ms_sum"] = int(
             metrics.get("notification_delivery_latency_ms_sum", 0) or 0
         )

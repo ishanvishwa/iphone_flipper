@@ -224,3 +224,247 @@ async def refresh_proxy_lease(
             safe_lease_seconds,
         )
     return bool(row)
+
+
+def _safe_lease_seconds(lease_seconds: int, *, minimum: int = 30) -> int:
+    return max(minimum, int(lease_seconds or minimum))
+
+
+def _row_to_dict(row: object) -> dict[str, object] | None:
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        return dict(row)
+    return dict(row)
+
+
+async def claim_next_profile(
+    pool: asyncpg.Pool,
+    *,
+    worker_name: str,
+    lease_token: str,
+    lease_seconds: int,
+) -> dict[str, object] | None:
+    worker_name_value = str(worker_name or "").strip()
+    lease_token_value = str(lease_token or "").strip()
+    if not worker_name_value or not lease_token_value:
+        return None
+
+    safe_lease_seconds = _safe_lease_seconds(lease_seconds)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE profiles
+            SET
+                profile_lease_token = $2,
+                profile_lease_expires_at = NOW() + ($3::INT * INTERVAL '1 second'),
+                last_started_at = NOW(),
+                last_heartbeat_at = NOW()
+            WHERE profile_id = (
+                SELECT profile_id
+                FROM profiles
+                WHERE worker_name = $1
+                  AND is_enabled = TRUE
+                  AND status IN ('READY', 'DEGRADED', 'THROTTLED')
+                  AND COALESCE(manual_login_required, FALSE) = FALSE
+                  AND (cooldown_until IS NULL OR cooldown_until <= NOW())
+                  AND (available_after IS NULL OR available_after <= NOW())
+                  AND (profile_lease_expires_at IS NULL OR profile_lease_expires_at <= NOW())
+                ORDER BY
+                    CASE status
+                        WHEN 'READY' THEN 0
+                        WHEN 'DEGRADED' THEN 1
+                        WHEN 'THROTTLED' THEN 2
+                        ELSE 9
+                    END,
+                    last_started_at ASC NULLS FIRST,
+                    profile_id ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+            )
+            RETURNING *
+            """,
+            worker_name_value,
+            lease_token_value,
+            safe_lease_seconds,
+        )
+    return _row_to_dict(row)
+
+
+async def heartbeat_profile_lease(
+    pool: asyncpg.Pool,
+    *,
+    profile_id: int | None,
+    lease_token: str,
+    lease_seconds: int,
+) -> dict[str, object] | None:
+    if profile_id is None:
+        return None
+    lease_token_value = str(lease_token or "").strip()
+    if not lease_token_value:
+        return None
+
+    safe_lease_seconds = _safe_lease_seconds(lease_seconds)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE profiles
+            SET
+                profile_lease_expires_at = NOW() + ($3::INT * INTERVAL '1 second'),
+                last_heartbeat_at = NOW()
+            WHERE profile_id = $1
+              AND profile_lease_token = $2
+            RETURNING *
+            """,
+            int(profile_id),
+            lease_token_value,
+            safe_lease_seconds,
+        )
+    return _row_to_dict(row)
+
+
+async def release_profile_lease(
+    pool: asyncpg.Pool,
+    *,
+    profile_id: int | None,
+    lease_token: str,
+    available_after_seconds: int | None = None,
+) -> dict[str, object] | None:
+    if profile_id is None:
+        return None
+    lease_token_value = str(lease_token or "").strip()
+    if not lease_token_value:
+        return None
+
+    safe_available_after = None
+    if available_after_seconds is not None:
+        safe_available_after = max(0, int(available_after_seconds))
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE profiles
+            SET
+                profile_lease_token = NULL,
+                profile_lease_expires_at = NULL,
+                available_after = CASE
+                    WHEN $3::INT IS NULL OR $3::INT <= 0 THEN profiles.available_after
+                    ELSE NOW() + ($3::INT * INTERVAL '1 second')
+                END,
+                last_heartbeat_at = NOW()
+            WHERE profile_id = $1
+              AND profile_lease_token = $2
+            RETURNING *
+            """,
+            int(profile_id),
+            lease_token_value,
+            safe_available_after,
+        )
+    return _row_to_dict(row)
+
+
+async def claim_next_due_family(
+    pool: asyncpg.Pool,
+    *,
+    lease_token: str,
+    lease_seconds: int,
+) -> dict[str, object] | None:
+    lease_token_value = str(lease_token or "").strip()
+    if not lease_token_value:
+        return None
+
+    safe_lease_seconds = _safe_lease_seconds(lease_seconds)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE query_families
+            SET
+                family_lease_token = $1,
+                family_lease_expires_at = NOW() + ($2::INT * INTERVAL '1 second'),
+                last_claimed_at = NOW()
+            WHERE family_id = (
+                SELECT family_id
+                FROM query_families
+                WHERE is_enabled = TRUE
+                  AND next_due_at <= NOW()
+                  AND (family_lease_expires_at IS NULL OR family_lease_expires_at <= NOW())
+                  AND EXISTS (
+                        SELECT 1
+                        FROM query_variants
+                        WHERE query_variants.family_id = query_families.family_id
+                          AND COALESCE(query_variants.is_enabled, TRUE) = TRUE
+                  )
+                ORDER BY
+                    priority_score DESC NULLS LAST,
+                    priority DESC,
+                    next_due_at ASC,
+                    family_id ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+            )
+            RETURNING *
+            """,
+            lease_token_value,
+            safe_lease_seconds,
+        )
+    return _row_to_dict(row)
+
+
+async def heartbeat_family_lease(
+    pool: asyncpg.Pool,
+    *,
+    family_id: int | None,
+    lease_token: str,
+    lease_seconds: int,
+) -> dict[str, object] | None:
+    if family_id is None:
+        return None
+    lease_token_value = str(lease_token or "").strip()
+    if not lease_token_value:
+        return None
+
+    safe_lease_seconds = _safe_lease_seconds(lease_seconds)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE query_families
+            SET
+                family_lease_expires_at = NOW() + ($3::INT * INTERVAL '1 second')
+            WHERE family_id = $1
+              AND family_lease_token = $2
+            RETURNING *
+            """,
+            int(family_id),
+            lease_token_value,
+            safe_lease_seconds,
+        )
+    return _row_to_dict(row)
+
+
+async def release_family_lease(
+    pool: asyncpg.Pool,
+    *,
+    family_id: int | None,
+    lease_token: str,
+) -> dict[str, object] | None:
+    if family_id is None:
+        return None
+    lease_token_value = str(lease_token or "").strip()
+    if not lease_token_value:
+        return None
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE query_families
+            SET
+                family_lease_token = NULL,
+                family_lease_expires_at = NULL
+            WHERE family_id = $1
+              AND family_lease_token = $2
+            RETURNING *
+            """,
+            int(family_id),
+            lease_token_value,
+        )
+    return _row_to_dict(row)

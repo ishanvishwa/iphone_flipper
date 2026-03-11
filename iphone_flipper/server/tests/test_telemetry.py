@@ -29,6 +29,15 @@ class TelemetryPayloadTests(unittest.TestCase):
                 "redis_stream_publish_latency_ms_sum": 7,
                 "redis_stream_publish_latency_ms_count": 2,
                 "redis_stream_publish_failure_count": 1,
+                "v4_first_seen_gate_latency_ms_sum": 5,
+                "v4_first_seen_gate_latency_ms_count": 2,
+                "v4_first_seen_claim_count": 1,
+                "v4_first_seen_duplicate_count": 3,
+                "v4_update_gate_latency_ms_sum": 4,
+                "v4_update_gate_latency_ms_count": 1,
+                "v4_update_event_claim_count": 1,
+                "v4_update_event_duplicate_count": 2,
+                "v4_dedupe_fallback_count": 1,
                 "notification_delivery_latency_ms_sum": 11,
                 "notification_delivery_latency_ms_count": 1,
                 "end_to_end_alert_latency_ms_sum": 120,
@@ -103,6 +112,15 @@ class TelemetryPayloadTests(unittest.TestCase):
         self.assertEqual(payload["redis_stream_publish_latency_ms_sum"], 7)
         self.assertEqual(payload["redis_stream_publish_latency_ms_count"], 2)
         self.assertEqual(payload["redis_stream_publish_failure_count"], 1)
+        self.assertEqual(payload["v4_first_seen_gate_latency_ms_sum"], 5)
+        self.assertEqual(payload["v4_first_seen_gate_latency_ms_count"], 2)
+        self.assertEqual(payload["v4_first_seen_claim_count"], 1)
+        self.assertEqual(payload["v4_first_seen_duplicate_count"], 3)
+        self.assertEqual(payload["v4_update_gate_latency_ms_sum"], 4)
+        self.assertEqual(payload["v4_update_gate_latency_ms_count"], 1)
+        self.assertEqual(payload["v4_update_event_claim_count"], 1)
+        self.assertEqual(payload["v4_update_event_duplicate_count"], 2)
+        self.assertEqual(payload["v4_dedupe_fallback_count"], 1)
         self.assertEqual(payload["notification_delivery_latency_ms_sum"], 11)
         self.assertEqual(payload["notification_delivery_latency_ms_count"], 1)
         self.assertEqual(payload["end_to_end_alert_latency_ms_count"], 1)

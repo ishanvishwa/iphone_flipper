@@ -103,6 +103,7 @@ class NotificationDeadLetterEvent:
             query_index=self.query_index,
             query_total=self.query_total,
             query_shard_key=self.query_shard_key,
+            discovery_ts="",
             persisted_at=self.persisted_at,
             price=self.price,
             potential_profit=self.potential_profit,
@@ -110,6 +111,8 @@ class NotificationDeadLetterEvent:
             url=self.url,
             thumbnail_url=self.thumbnail_url,
             source=self.source,
+            dedupe_kind="",
+            mutable_hash="",
         )
 
 

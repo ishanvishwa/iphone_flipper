@@ -47,6 +47,17 @@ V3.0 upgrade guardrails (approved for the latency/responsiveness track):
   - no notification-before-persistence flow
 - Current baseline now includes Redis pub/sub + normalized API WebSocket live sync + GUI poll fallback, with V3.0 Phase 1 adding Redis Streams dual-write after persistence behind `ENABLE_REDIS_STREAM_EVENTS`, V3.0 Phase 2 adding an optional Redis Streams notification consumer behind `ENABLE_NOTIFICATION_CONSUMER`, V3.0 Phase 3 making desktop sync WebSocket-first behind `ENABLE_GUI_WEBSOCKET_PUSH`, V3.0 Phase 4 adding optional priority scheduling/route lanes behind `ENABLE_ROUTE_LANES` and `ENABLE_PRIORITY_SCHEDULER`, V3.0 Phase 5 adding optional background cold-field enrichment behind `ENABLE_BACKGROUND_ENRICHMENT`, and V3.0 Phase 6 adding authenticated operator controls, backlog/lag inspection, and bounded dead-letter replay around the existing realtime path.
 
+V4 upgrade track (approved additive rollout, phases 1-4 implemented):
+
+- V4 is layered beside the active V3 scheduler rather than replacing it in one cutover.
+- New V4 foundation tables now exist in Postgres: `profiles`, `query_families`, and `query_variants`.
+- V4 phase 1 adds idempotent backfill from `execution_profiles`, `central_routes`, and `route_queries`, plus atomic lease helpers for profile/family claims.
+- V4 phase 2 adds a flag-gated warm-session runtime path (`ENABLE_V4_WARM_RUNTIME`) with claimed profiles, claimed families, try/finally release, graceful shutdown handling, orphaned Chromium lock cleanup, and idle-close `available_after` stamping.
+- V4 phase 3 adds one fresh tab per family claim, explicit claim-outcome classification (`MATCHES`, `EMPTY_FEED`, `DOM_CHANGED`, `CHECKPOINT`, `INFRASTRUCTURE_ERROR`), signal-driven profile transitions, manual-login quarantine, and adaptive `query_families.next_due_at` rescheduling.
+- V4 phase 4 adds Redis first-seen gating ahead of DB upsert for the V4 path, optional price-change/update dedupe behind `ENABLE_V4_UPDATE_EVENTS` plus `PRICE_DROP_UPDATE_MODE`, `discovery_ts` propagation through stream/notification payloads, and fail-open fallback/alerting so downstream behavior remains stable during rollout.
+- The live V3 scheduler path remains intact and rollback-capable; V4 runtime activation is explicit and additive.
+- Every V4 phase must end with a quick recheck before the next phase proceeds: schema/bootstrapping, backfill integrity, lease correctness, then config/docs/final verification.
+
 ## 3. High-Level Component Diagram
 
 ```mermaid
@@ -232,6 +243,10 @@ flowchart TD
 5.28.1 The upgrade-plan Optional B item (`Separate enrichment workers`) was audited on **2026-03-10** and required no further runtime changes. The shipped Phase 5/6 path already satisfies it: discovery workers enqueue only the cold enrichment job, while the separate `enrichment_worker` service owns stream consumption, retry/dedupe, and late row updates.
 5.29 V3.0 Phase 6 adds an API-first operator control plane. Runtime-tunable settings now live in Redis hash `flipper:runtime_config` while the existing `flipper:flags` hash remains the rollback mechanism for live push, notification consumer, route lanes, priority scheduling, and background enrichment. Phase 6 moves the hot/cold path and scheduler thresholds out of manual Redis shell operations by exposing authenticated API read/update endpoints over both hashes.
 5.30 Phase 6 also adds durable notification failure handling around the existing Phase 2 consumer. Terminal notification delivery failures are no longer left as permanently pending group entries; instead they are written to `stream:notification_dead_letter`, the notification ledger is marked `failed_terminal`, and the original `stream:listings` entry is acked. Replay is intentionally bounded and operator-driven: the API can inspect dead-letter entries within a time window and republish only those events back onto `stream:listings` after resetting the matching ledger rows from `failed_terminal` to `pending`.
+5.31 V4 Phase 1 adds the new additive scheduler foundation only: Postgres `profiles`, `query_families`, and `query_variants`; idempotent V3-to-V4 backfill; and atomic `UPDATE ... RETURNING` lease helpers for profile and family claims. The worker runtime does not consume these tables yet in this phase.
+5.32 V4 profile rows are worker-local runtime identities keyed by `user_data_dir`. They carry profile health state, manual-login quarantine metadata, `available_after`, and crash-safe `profile_lease_token/profile_lease_expires_at`.
+5.33 V4 query-family rows represent future schedulable search intent independent of worker ownership. Variants are currently seeded from existing `route_queries.query_text`, with nullable `url_template` reserved for later validated-family execution work.
+5.34 Phase-end verification is now part of the architecture contract for the V4 track: each implementation stage must be rechecked before proceeding so schema, backfill, and lease behavior stay correct while V3 remains live.
 7. API service relays events through Redis/WebSocket-compatible channels; Redis pub/sub remains the live API fanout trigger, and desktop now consumes server changes through a WebSocket-first sync path with incremental cursor polling retained as reconnect/backfill and outage fallback.
 7.1 V3.0 Phase 0 instruments API broadcast latency and GUI poll-sync render timestamps (`gui_pushed_ts`, `gui_rendered_ts`) without changing REST or WebSocket payload shapes.
 7.2 V3.0 Phase 3 adds a desktop sync coordinator (`desktop_sync.py`) that runs in a background thread with its own asyncio loop and `aiohttp` session, derives the WebSocket URL from the configured API base URL, buffers live `listing_snapshot` frames while replay polling catches up from `max(0, since_id - 100)`, then drains buffered frames and stays in live mode until disconnect. On heartbeat timeout, auth failure, live disable, or transport error it falls back to poll-only mode, keeps retrying through transient poll failures, and reconnects the WebSocket with jittered exponential backoff.
@@ -250,13 +265,20 @@ flowchart TD
    - Telegram degradation alerts with cooldown deduplication.
    - **Active integration**: each worker slot checks `proxy_health.is_saturated` before executing a cycle; saturated state skips scraping with `wait_proxy_provider` heartbeat. Post-cycle, `proxy_health.pacing_multiplier` is applied to `next_interval_seconds` when multiplier > 1.0 to dynamically slow workers under provider load.
 8.2 Quiet hours scheduling (`WORKER_QUIET_HOURS_UTC`, format `HH:MM-HH:MM` in UTC) slows scraping during off-peak windows with configurable multiplier (`WORKER_QUIET_HOURS_MULTIPLIER`, default `4.0x`). Midnight-wrapping ranges are supported.
-8.3 Session duration caps (`WORKER_SESSION_MAX_QUERIES`) restart the browser session after N queries to prevent session-length fingerprinting.
+8.3 Legacy V3 session duration caps (`WORKER_SESSION_MAX_QUERIES`) restart the browser session after N queries to prevent session-length fingerprinting.
+8.4 V4 phase 2 introduces a separate warm-session control set for the flag-gated V4 loop: `WORKER_SESSION_MAX_QUERIES`, `WORKER_SESSION_MAX_AGE_SECONDS`, `WORKER_SESSION_IDLE_CLOSE_SECONDS`, `WARM_LOOP_MIN_PAUSE_SECONDS`, and `WARM_LOOP_MAX_PAUSE_SECONDS`.
+8.5 V4 phase 3 now executes one claimed family at a time in a fresh page created from the warm BrowserContext and closed in `finally`. Family claims are classified as `MATCHES`, `EMPTY_FEED`, `DOM_CHANGED`, `CHECKPOINT`, or `INFRASTRUCTURE_ERROR` before the worker updates profile or family state.
+8.6 Profile health transitions in the V4 path are now outcome-driven: `MATCHES` resets the profile to `READY`, `EMPTY_FEED` increments `consecutive_empty_claims` and can push the profile to `THROTTLED`/`COOLDOWN`, `CHECKPOINT` marks `NEEDS_LOGIN`, and `DOM_CHANGED` leaves profile health untouched while widening family backoff.
+8.7 Adaptive V4 family rescheduling now updates `next_due_at`, `variant_cursor`, `consecutive_hits`, `consecutive_empty`, and `last_discovery_at` so hot families stay at `min_gap_s` while empty or broken families back off.
+8.8 V4 phase 4 now captures `discovery_ts` at extraction time, carries it through worker pub/sub and Redis Streams payloads, and stores additive `listings` fields (`discovery_ts`, `first_seen_at`, `last_seen_at`, `current_price`, `last_price_hash`, `persisted_at`, `last_event_kind`) without disturbing the active V3 path.
+8.9 V4 notification/dedupe rollout is explicitly flag-gated. `ENABLE_V4_FIRST_SEEN_DEDUPE` enables the Redis `SET NX` front-door gate for V4 claims, `ENABLE_V4_UPDATE_EVENTS` plus `PRICE_DROP_UPDATE_MODE` enables separate price-change/update events, and any Redis gate failure fails open with structured logs plus throttled operator alerting rather than blocking the existing downstream path.
 
 Implemented baseline artifacts in repository:
 
 - `server/infra/docker-compose.yml` (Caddy TLS reverse proxy, Postgres, Redis, API, notification worker, multi-Worker with `DOLPHIN_ANTY_TOKEN` env)
 - `server/services/api/app/main.py` (health, listing snapshot, WebSocket stream, central route + execution-profile endpoints, legacy worker-route migration helpers, route lane/score serialization)
 - `server/services/worker/worker.py` (continuous scrape + due-route scheduling + per-listing upsert + Redis publish + heartbeat)
+- `server/services/worker/v4_runtime.py` (V4 warm-session limits, idle-close policy, pause selection, orphaned Chromium lock cleanup, claim classification, and adaptive family rescheduling rules)
 - `server/services/worker/notification_worker.py` (Redis Streams consumer-group notification service with durable dedupe ledger, retry/backoff, pacing, Telegram delivery, and best-effort FCM push)
 - `server/services/worker/proxy_monitor.py` (proxy provider real-time health polling with pacing multiplier and Telegram alerts)
 - `server/services/worker/runtime.py` (cycle outcomes, error taxonomy, scheduling/backoff helpers)

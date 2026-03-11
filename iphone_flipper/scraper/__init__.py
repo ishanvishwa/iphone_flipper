@@ -87,6 +87,12 @@ from scraper.browser import (  # noqa: F401
 
 # --- core ---
 from scraper.core import (  # noqa: F401
+    MarketplaceClaimExecution,
+    MarketplaceSession,
+    close_profile_session,
+    execute_family_claim,
+    execute_session_queries,
+    open_profile_session,
     purge_accessory_only_listings,
     recalculate_listing_financials,
     scrape_marketplace,

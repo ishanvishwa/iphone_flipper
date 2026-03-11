@@ -5,7 +5,8 @@ and listing financial recalculation.
 
 import asyncio
 import sqlite3
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from scraper.browser import launch_browser_context, random_delay, stop_dolphin_profile
@@ -34,19 +35,47 @@ from scraper.storage import (
 # ---------------------------------------------------------------------------
 
 
-async def scrape_marketplace(
-    profile_id: str,
-    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
-    stop_event: Any = None,
+@dataclass
+class MarketplaceSession:
+    profile_id: str
+    playwright: Any
+    browser: Any
+    context: Any
+    page: Any
+    conn: sqlite3.Connection
+    cursor: sqlite3.Cursor
+    price_data: Dict[str, Any]
+    runtime_settings: Dict[str, Any]
+
+
+@dataclass
+class MarketplaceClaimExecution:
+    listings: List[Dict[str, Any]]
+    query_diagnostics: List[Dict[str, Any]]
+    cancelled: bool
+    accessory_removed: int = 0
+
+
+def _resolve_active_queries(
+    runtime_settings: Dict[str, Any],
     search_queries: Optional[List[str]] = None,
+) -> List[str]:
+    explicit_queries = [q.strip() for q in (search_queries or []) if str(q).strip()]
+    active_queries = explicit_queries if explicit_queries else load_active_search_queries(
+        max_queries=runtime_settings.get("max_queries_per_run", 5)
+    )
+    if not active_queries:
+        from scraper.config import SEARCH_QUERIES
+
+        active_queries = SEARCH_QUERIES[: runtime_settings.get("max_queries_per_run", 5)]
+    return active_queries
+
+
+def _resolve_scroll_settings(
+    runtime_settings: Dict[str, Any],
     scroll_target_cards_override: Optional[int] = None,
     scroll_max_rounds_override: Optional[int] = None,
-) -> List[Dict[str, Any]]:
-    """Run the main Facebook Marketplace scraping pipeline."""
-    init_db()
-    price_data = load_price_list()
-    runtime_settings = load_runtime_scraper_settings()
-
+) -> tuple[int, int]:
     scroll_target_cards = runtime_settings.get("scrape_scroll_target_cards", 180)
     scroll_max_rounds = runtime_settings.get("scrape_scroll_max_rounds", 14)
     if scroll_target_cards_override is not None:
@@ -59,12 +88,143 @@ async def scrape_marketplace(
             scroll_max_rounds = max(2, int(scroll_max_rounds_override))
         except (TypeError, ValueError):
             pass
-    
-    explicit_queries = [q.strip() for q in (search_queries or []) if str(q).strip()]
-    active_queries = explicit_queries if explicit_queries else load_active_search_queries(max_queries=runtime_settings.get("max_queries_per_run", 5))
-    if not active_queries:
-        from scraper.config import SEARCH_QUERIES
-        active_queries = SEARCH_QUERIES[:runtime_settings.get("max_queries_per_run", 5)]
+    return int(scroll_target_cards), int(scroll_max_rounds)
+
+
+async def _inspect_marketplace_results_surface(page) -> Dict[str, Any]:
+    try:
+        payload = await page.evaluate(
+            """
+            () => {
+                const href = String(window.location.href || "");
+                const path = String(window.location.pathname || "");
+                const text = String(document.body?.innerText || "").toLowerCase();
+                const emptyMarkers = [
+                    "no listings found",
+                    "no results found",
+                    "try a different search",
+                    "we couldn't find anything",
+                    "no matches found",
+                    "there are no products matching your search",
+                    "sorry, this content isn't available right now",
+                ];
+                const emptyStateDetected = emptyMarkers.some((marker) => text.includes(marker));
+                const feedSurfaceSelectors = [
+                    '[data-testid="marketplace_feed_item"]',
+                    '[role="feed"]',
+                    '[data-pagelet*="BrowseFeed"]',
+                    'a[href*="/marketplace/item/"]',
+                ];
+                const feedSurfacePresent = feedSurfaceSelectors.some((selector) => {
+                    try {
+                        return Boolean(document.querySelector(selector));
+                    } catch (error) {
+                        return false;
+                    }
+                });
+                return {
+                    final_url: href,
+                    marketplace_shell_detected: path.includes("/marketplace"),
+                    feed_present: Boolean(feedSurfacePresent || emptyStateDetected),
+                    empty_state_detected: emptyStateDetected,
+                };
+            }
+            """
+        )
+    except Exception:
+        payload = None
+    if not isinstance(payload, dict):
+        return {
+            "final_url": "",
+            "marketplace_shell_detected": False,
+            "feed_present": False,
+            "empty_state_detected": False,
+        }
+    return {
+        "final_url": str(payload.get("final_url") or "").strip(),
+        "marketplace_shell_detected": bool(payload.get("marketplace_shell_detected")),
+        "feed_present": bool(payload.get("feed_present")),
+        "empty_state_detected": bool(payload.get("empty_state_detected")),
+    }
+
+
+async def open_profile_session(
+    profile_id: str,
+    *,
+    headless: bool = False,
+) -> MarketplaceSession:
+    init_db()
+    price_data = load_price_list()
+    runtime_settings = load_runtime_scraper_settings()
+    playwright, browser, context, page = await launch_browser_context(headless=headless, profile_id=profile_id)
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    return MarketplaceSession(
+        profile_id=profile_id,
+        playwright=playwright,
+        browser=browser,
+        context=context,
+        page=page,
+        conn=conn,
+        cursor=cursor,
+        price_data=price_data,
+        runtime_settings=runtime_settings,
+    )
+
+
+async def close_profile_session(
+    session: MarketplaceSession,
+    *,
+    stop_profile: bool = True,
+) -> None:
+    errors: list[BaseException] = []
+    try:
+        session.conn.close()
+    except Exception as exc:
+        errors.append(exc)
+
+    try:
+        await session.context.close()
+    except Exception as exc:
+        errors.append(exc)
+    try:
+        await session.browser.close()
+    except Exception as exc:
+        errors.append(exc)
+    try:
+        await session.playwright.stop()
+    except Exception as exc:
+        errors.append(exc)
+
+    if stop_profile:
+        try:
+            await stop_dolphin_profile(session.profile_id)
+        except Exception as exc:
+            errors.append(exc)
+
+    if errors:
+        raise RuntimeError("; ".join(str(error) for error in errors if str(error)))
+
+
+async def _execute_queries_on_page(
+    session: MarketplaceSession,
+    page: Any,
+    *,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    stop_event: Any = None,
+    search_queries: Optional[List[str]] = None,
+    scroll_target_cards_override: Optional[int] = None,
+    scroll_max_rounds_override: Optional[int] = None,
+    apply_inter_query_delay: bool = True,
+) -> List[Dict[str, Any]]:
+    runtime_settings = load_runtime_scraper_settings()
+    session.runtime_settings = runtime_settings
+    active_queries = _resolve_active_queries(runtime_settings, search_queries)
+    scroll_target_cards, scroll_max_rounds = _resolve_scroll_settings(
+        runtime_settings,
+        scroll_target_cards_override=scroll_target_cards_override,
+        scroll_max_rounds_override=scroll_max_rounds_override,
+    )
 
     def emit_progress(event: str, **payload):
         if not progress_callback:
@@ -74,246 +234,378 @@ async def scrape_marketplace(
         except Exception:
             pass
 
-    processed_listings = []
+    processed_listings: List[Dict[str, Any]] = []
     seen_listing_ids = set()
     new_listings_count = 0
+    total_queries = len(active_queries)
+    processed_queries = 0
+    cancelled = False
+    manual_login_error = None
+    conn = session.conn
+    cursor = session.cursor
+    price_data = session.price_data
+    query_diagnostics: List[Dict[str, Any]] = []
+    listing_discovery_ts: Dict[str, str] = {}
 
-    try:
-        p, browser, context, page = await launch_browser_context(headless=False, profile_id=profile_id)
-        
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        total_queries = len(active_queries)
-        processed_queries = 0
-        cancelled = False
-        manual_login_error = None
-        
-        for index, query in enumerate(active_queries, start=1):
-            if stop_event and stop_event.is_set():
-                cancelled = True
-                emit_progress("cancelled", query_index=processed_queries, query_total=total_queries)
-                break
-                
-            emit_progress("query_start", query=query, query_index=index, query_total=total_queries)
-            print(f"  Searching for: {query}")
-            
-            search_url = f"https://www.facebook.com/marketplace/perth/search?query={query.replace(' ', '%20')}&exact=false&sortBy=creation_time_descend"
-            
-            from scraper.legacy_utils import extract_listings_from_graphql_payload, decode_json_body, merge_listing_candidates, _extract_text_value, _normalize_marketplace_url, _store_listing_candidate, progressive_marketplace_scroll, _detect_manual_login_required_state, _extract_dom_listing_candidates
-            from scraper.config import MANUAL_LOGIN_REQUIRED_PREFIX
-            
-            graphql_candidates = {}
-            graphql_tasks = set()
+    def _mark_discovery_ts(listing_id: str) -> str:
+        discovery_ts = listing_discovery_ts.get(listing_id)
+        if discovery_ts:
+            return discovery_ts
+        discovery_ts = datetime.now(timezone.utc).isoformat()
+        listing_discovery_ts[listing_id] = discovery_ts
+        return discovery_ts
 
-            async def consume_graphql_response(response):
-                try:
-                    request = response.request
-                    if request.method != "POST" or "/api/graphql/" not in response.url:
-                        return
-                    payload = decode_json_body(await response.text())
-                    if not payload:
-                        return
-                    listings_from_payload = extract_listings_from_graphql_payload(payload)
-                    for extracted in listings_from_payload:
-                        listing_id = extracted.get("id")
-                        if not listing_id:
-                            continue
-                        existing = graphql_candidates.get(listing_id)
-                        if not existing:
-                            graphql_candidates[listing_id] = extracted
-                        else:
-                            merged = merge_listing_candidates([existing, extracted])
-                            if merged:
-                                graphql_candidates[listing_id] = merged[0]
-                except Exception:
-                    return
+    for index, query in enumerate(active_queries, start=1):
+        if stop_event and stop_event.is_set():
+            cancelled = True
+            emit_progress("cancelled", query_index=processed_queries, query_total=total_queries)
+            break
 
-            def on_response(response):
-                if "/api/graphql/" not in response.url:
-                    return
-                task = asyncio.create_task(consume_graphql_response(response))
-                graphql_tasks.add(task)
-                task.add_done_callback(lambda done_task: graphql_tasks.discard(done_task))
+        emit_progress("query_start", query=query, query_index=index, query_total=total_queries)
+        print(f"  Searching for: {query}")
 
-            page.on("response", on_response)
-            
+        search_url = (
+            f"https://www.facebook.com/marketplace/perth/search?"
+            f"query={query.replace(' ', '%20')}&exact=false&sortBy=creation_time_descend"
+        )
+
+        from scraper.legacy_utils import (
+            _detect_manual_login_required_state,
+            _extract_dom_listing_candidates,
+            _extract_text_value,
+            _normalize_marketplace_url,
+            _store_listing_candidate,
+            decode_json_body,
+            extract_listings_from_graphql_payload,
+            merge_listing_candidates,
+            progressive_marketplace_scroll,
+        )
+        from scraper.config import MANUAL_LOGIN_REQUIRED_PREFIX
+
+        graphql_candidates = {}
+        graphql_tasks = set()
+
+        async def consume_graphql_response(response):
             try:
-                await page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
-                await random_delay(3, 6)
-                
-                checkpoint_reason = await _detect_manual_login_required_state(page)
-                if checkpoint_reason:
-                    raise RuntimeError(f"{MANUAL_LOGIN_REQUIRED_PREFIX} {checkpoint_reason}")
+                request = response.request
+                if request.method != "POST" or "/api/graphql/" not in response.url:
+                    return
+                payload = decode_json_body(await response.text())
+                if not payload:
+                    return
+                listings_from_payload = extract_listings_from_graphql_payload(payload)
+                for extracted in listings_from_payload:
+                    listing_id = extracted.get("id")
+                    if not listing_id:
+                        continue
+                    extracted["discovery_ts"] = _mark_discovery_ts(str(listing_id))
+                    existing = graphql_candidates.get(listing_id)
+                    if not existing:
+                        graphql_candidates[listing_id] = extracted
+                    else:
+                        merged = merge_listing_candidates([existing, extracted])
+                        if merged:
+                            graphql_candidates[listing_id] = merged[0]
+            except Exception:
+                return
 
-                dom_candidates_by_id = {}
+        def on_response(response):
+            if "/api/graphql/" not in response.url:
+                return
+            task = asyncio.create_task(consume_graphql_response(response))
+            graphql_tasks.add(task)
+            task.add_done_callback(lambda done_task: graphql_tasks.discard(done_task))
 
-                def _dom_candidate_score(candidate: Dict[str, Any]) -> int:
-                    title = str(candidate.get("title") or "")
-                    score = 0
-                    if title:
-                        score += 1
-                    if "iphone" in title.lower():
-                        score += 5
-                    if candidate.get("price"):
-                        score += 3
-                    if len(title) > 15:
-                        score += 1
-                    if candidate.get("url"):
-                        score += 1
-                    return score
+        page.on("response", on_response)
 
-                async def capture_dom_snapshot() -> None:
-                    dom_snapshot = await _extract_dom_listing_candidates(page)
-                    for listing in dom_snapshot:
-                        listing_id = _extract_text_value(listing.get("id"))
-                        if not listing_id:
-                            continue
-                        candidate: Dict[str, Any] = {
-                            "id": listing_id,
-                            "title": _extract_text_value(listing.get("title")),
-                            "url": _normalize_marketplace_url(listing.get("url"), listing_id),
-                            "price": listing.get("price"),
-                            "location": "",
-                            "description": "",
-                            "seller_name": "",
-                        }
-                        candidate_score = _dom_candidate_score(candidate)
-                        existing = dom_candidates_by_id.get(listing_id)
-                        if not existing or candidate_score > int(existing.get("_score", 0)):
-                            candidate["_score"] = candidate_score
-                            dom_candidates_by_id[listing_id] = candidate
+        try:
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
+            await random_delay(3, 6)
 
-                scroll_stats = await progressive_marketplace_scroll(
-                    page,
-                    target_cards=scroll_target_cards,
-                    max_rounds=scroll_max_rounds,
-                    snapshot_callback=capture_dom_snapshot,
-                )
-                await random_delay(0.8, 1.8)
-                
-                checkpoint_reason = await _detect_manual_login_required_state(page)
-                if checkpoint_reason:
-                    raise RuntimeError(f"{MANUAL_LOGIN_REQUIRED_PREFIX} {checkpoint_reason}")
-                await capture_dom_snapshot()
-                
-                if graphql_tasks:
-                    await asyncio.wait(list(graphql_tasks), timeout=8)
-                    
-                normalized_dom_listings = []
-                for listing in dom_candidates_by_id.values():
-                    payload = dict(listing)
-                    payload.pop("_score", None)
-                    normalized_dom_listings.append(payload)
+            checkpoint_reason = await _detect_manual_login_required_state(page)
+            if checkpoint_reason:
+                raise RuntimeError(f"{MANUAL_LOGIN_REQUIRED_PREFIX} {checkpoint_reason}")
 
-                query_listings = merge_listing_candidates(
-                    list(graphql_candidates.values()) + normalized_dom_listings
-                )
-                query_new_saved = 0
-                for listing in query_listings:
+            dom_candidates_by_id = {}
+
+            def _dom_candidate_score(candidate: Dict[str, Any]) -> int:
+                title = str(candidate.get("title") or "")
+                score = 0
+                if title:
+                    score += 1
+                if "iphone" in title.lower():
+                    score += 5
+                if candidate.get("price"):
+                    score += 3
+                if len(title) > 15:
+                    score += 1
+                if candidate.get("url"):
+                    score += 1
+                return score
+
+            async def capture_dom_snapshot() -> None:
+                dom_snapshot = await _extract_dom_listing_candidates(page)
+                for listing in dom_snapshot:
                     listing_id = _extract_text_value(listing.get("id"))
-                    if not listing_id or listing_id in seen_listing_ids:
+                    if not listing_id:
                         continue
-                    seen_listing_ids.add(listing_id)
-                    
-                    saved_listing = _store_listing_candidate(cursor, listing, price_data)
-                    if not saved_listing:
-                        continue
-                        
-                    conn.commit()
-                    new_listings_count += 1
-                    query_new_saved += 1
-                    processed_listings.append(saved_listing)
-                    emit_progress(
-                        "listing_saved",
-                        query=query,
-                        query_index=index,
-                        query_total=total_queries,
-                        new_count=new_listings_count,
-                        listing=saved_listing,
-                    )
-                
-                found_count = len(query_listings)
-                graphql_count = len(graphql_candidates)
-                dom_count = len(normalized_dom_listings)
+                    candidate: Dict[str, Any] = {
+                        "id": listing_id,
+                        "title": _extract_text_value(listing.get("title")),
+                        "url": _normalize_marketplace_url(listing.get("url"), listing_id),
+                        "price": listing.get("price"),
+                        "location": "",
+                        "description": "",
+                        "seller_name": "",
+                        "discovery_ts": _mark_discovery_ts(listing_id),
+                    }
+                    candidate_score = _dom_candidate_score(candidate)
+                    existing = dom_candidates_by_id.get(listing_id)
+                    if not existing or candidate_score > int(existing.get("_score", 0)):
+                        candidate["_score"] = candidate_score
+                        dom_candidates_by_id[listing_id] = candidate
+
+            scroll_stats = await progressive_marketplace_scroll(
+                page,
+                target_cards=scroll_target_cards,
+                max_rounds=scroll_max_rounds,
+                snapshot_callback=capture_dom_snapshot,
+            )
+            await random_delay(0.8, 1.8)
+
+            checkpoint_reason = await _detect_manual_login_required_state(page)
+            if checkpoint_reason:
+                raise RuntimeError(f"{MANUAL_LOGIN_REQUIRED_PREFIX} {checkpoint_reason}")
+            await capture_dom_snapshot()
+
+            if graphql_tasks:
+                await asyncio.wait(list(graphql_tasks), timeout=8)
+
+            normalized_dom_listings = []
+            for listing in dom_candidates_by_id.values():
+                payload = dict(listing)
+                payload.pop("_score", None)
+                normalized_dom_listings.append(payload)
+
+            query_listings = merge_listing_candidates(
+                list(graphql_candidates.values()) + normalized_dom_listings
+            )
+            query_new_saved = 0
+            for listing in query_listings:
+                listing_id = _extract_text_value(listing.get("id"))
+                if not listing_id or listing_id in seen_listing_ids:
+                    continue
+                seen_listing_ids.add(listing_id)
+                listing["discovery_ts"] = (
+                    _extract_text_value(listing.get("discovery_ts"))
+                    or listing_discovery_ts.get(listing_id)
+                    or _mark_discovery_ts(listing_id)
+                )
+
+                saved_listing = _store_listing_candidate(cursor, listing, price_data)
+                if not saved_listing:
+                    continue
+                saved_listing["discovery_ts"] = listing["discovery_ts"]
+
+                conn.commit()
+                new_listings_count += 1
+                query_new_saved += 1
+                processed_listings.append(saved_listing)
                 emit_progress(
-                    "query_result",
+                    "listing_saved",
                     query=query,
                     query_index=index,
                     query_total=total_queries,
-                    found=found_count,
-                    graphql_found=graphql_count,
-                    dom_found=dom_count,
-                    page_cards=scroll_stats.get("visible_cards", 0),
-                    scroll_rounds=scroll_stats.get("scroll_rounds", 0),
-                    new_saved=query_new_saved,
+                    new_count=new_listings_count,
+                    discovery_ts=listing["discovery_ts"],
+                    listing=saved_listing,
                 )
-                
-            except Exception as e:
-                error_text = str(e)
-                print(f"  Error scraping query '{query}': {error_text}")
-                emit_progress("query_error", query=query, query_index=index, query_total=total_queries, error=error_text)
-                if MANUAL_LOGIN_REQUIRED_PREFIX.lower() in error_text.lower():
-                    manual_login_error = error_text
-            finally:
-                try:
-                    page.remove_listener("response", on_response)
-                except Exception:
-                    pass
-                mark_search_query_polled(query)
 
-            processed_queries = index
-            if manual_login_error:
-                break
-                
-            if stop_event and stop_event.is_set():
-                cancelled = True
-                emit_progress("cancelled", query_index=processed_queries, query_total=total_queries)
-                break
-                
-            await random_delay(runtime_settings.get("scrape_delay_min_seconds", 3), runtime_settings.get("scrape_delay_max_seconds", 6))
+            found_count = len(query_listings)
+            graphql_count = len(graphql_candidates)
+            dom_count = len(normalized_dom_listings)
+            page_state = await _inspect_marketplace_results_surface(page)
+            emit_progress(
+                "query_result",
+                query=query,
+                query_index=index,
+                query_total=total_queries,
+                found=found_count,
+                graphql_found=graphql_count,
+                dom_found=dom_count,
+                page_cards=scroll_stats.get("visible_cards", 0),
+                scroll_rounds=scroll_stats.get("scroll_rounds", 0),
+                new_saved=query_new_saved,
+                final_url=page_state["final_url"],
+                marketplace_shell_detected=page_state["marketplace_shell_detected"],
+                feed_present=page_state["feed_present"],
+                empty_state_detected=page_state["empty_state_detected"],
+            )
+            query_diagnostics.append(
+                {
+                    "query": query,
+                    "query_index": index,
+                    "found": found_count,
+                    "graphql_found": graphql_count,
+                    "dom_found": dom_count,
+                    "page_cards": int(scroll_stats.get("visible_cards", 0) or 0),
+                    "scroll_rounds": int(scroll_stats.get("scroll_rounds", 0) or 0),
+                    "new_saved": query_new_saved,
+                    **page_state,
+                }
+            )
 
-        if manual_login_error:
-            conn.close()
-            await context.close()
-            await browser.close()
-            await p.stop()
+        except Exception as e:
+            error_text = str(e)
+            print(f"  Error scraping query '{query}': {error_text}")
+            page_state = await _inspect_marketplace_results_surface(page)
+            emit_progress(
+                "query_error",
+                query=query,
+                query_index=index,
+                query_total=total_queries,
+                error=error_text,
+                final_url=page_state["final_url"],
+                marketplace_shell_detected=page_state["marketplace_shell_detected"],
+                feed_present=page_state["feed_present"],
+                empty_state_detected=page_state["empty_state_detected"],
+            )
+            query_diagnostics.append(
+                {
+                    "query": query,
+                    "query_index": index,
+                    "error": error_text,
+                    **page_state,
+                }
+            )
+            if MANUAL_LOGIN_REQUIRED_PREFIX.lower() in error_text.lower():
+                manual_login_error = error_text
+        finally:
             try:
-                await stop_dolphin_profile(profile_id)
+                page.remove_listener("response", on_response)
             except Exception:
                 pass
-            raise RuntimeError(manual_login_error)
-            
-        removed_accessory_count = purge_accessory_only_listings(cursor)
-        if removed_accessory_count > 0:
-            conn.commit()
-            emit_progress("accessory_cleanup", removed=removed_accessory_count)
-            
-        conn.close()
-        await context.close()
-        await browser.close()
-        await p.stop()
+            mark_search_query_polled(query)
+
+        processed_queries = index
+        if manual_login_error:
+            break
+
+        if stop_event and stop_event.is_set():
+            cancelled = True
+            emit_progress("cancelled", query_index=processed_queries, query_total=total_queries)
+            break
+
+        if apply_inter_query_delay:
+            await random_delay(
+                runtime_settings.get("scrape_delay_min_seconds", 3),
+                runtime_settings.get("scrape_delay_max_seconds", 6),
+            )
+
+    if manual_login_error:
+        raise RuntimeError(manual_login_error)
+
+    removed_accessory_count = purge_accessory_only_listings(cursor)
+    if removed_accessory_count > 0:
+        conn.commit()
+        emit_progress("accessory_cleanup", removed=removed_accessory_count)
+
+    emit_progress(
+        "completed",
+        new_count=new_listings_count,
+        query_index=processed_queries,
+        query_total=total_queries,
+        cancelled=cancelled,
+    )
+    return MarketplaceClaimExecution(
+        listings=processed_listings,
+        query_diagnostics=query_diagnostics,
+        cancelled=cancelled,
+        accessory_removed=removed_accessory_count,
+    )
+
+
+async def execute_session_queries(
+    session: MarketplaceSession,
+    *,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    stop_event: Any = None,
+    search_queries: Optional[List[str]] = None,
+    scroll_target_cards_override: Optional[int] = None,
+    scroll_max_rounds_override: Optional[int] = None,
+    apply_inter_query_delay: bool = True,
+) -> List[Dict[str, Any]]:
+    execution = await _execute_queries_on_page(
+        session,
+        session.page,
+        progress_callback=progress_callback,
+        stop_event=stop_event,
+        search_queries=search_queries,
+        scroll_target_cards_override=scroll_target_cards_override,
+        scroll_max_rounds_override=scroll_max_rounds_override,
+        apply_inter_query_delay=apply_inter_query_delay,
+    )
+    return execution.listings
+
+
+async def execute_family_claim(
+    session: MarketplaceSession,
+    *,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    stop_event: Any = None,
+    search_queries: Optional[List[str]] = None,
+    scroll_target_cards_override: Optional[int] = None,
+    scroll_max_rounds_override: Optional[int] = None,
+    apply_inter_query_delay: bool = False,
+) -> MarketplaceClaimExecution:
+    page = await session.context.new_page()
+    try:
+        return await _execute_queries_on_page(
+            session,
+            page,
+            progress_callback=progress_callback,
+            stop_event=stop_event,
+            search_queries=search_queries,
+            scroll_target_cards_override=scroll_target_cards_override,
+            scroll_max_rounds_override=scroll_max_rounds_override,
+            apply_inter_query_delay=apply_inter_query_delay,
+        )
+    finally:
         try:
-            await stop_dolphin_profile(profile_id)
+            await page.close()
         except Exception:
             pass
-        
-        emit_progress(
-            "completed",
-            new_count=new_listings_count,
-            query_index=processed_queries,
-            query_total=total_queries,
-            cancelled=cancelled,
-        )
-        return processed_listings
 
+
+async def scrape_marketplace(
+    profile_id: str,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    stop_event: Any = None,
+    search_queries: Optional[List[str]] = None,
+    scroll_target_cards_override: Optional[int] = None,
+    scroll_max_rounds_override: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Run the main Facebook Marketplace scraping pipeline."""
+    session: MarketplaceSession | None = None
+    try:
+        session = await open_profile_session(profile_id, headless=False)
+        return await execute_session_queries(
+            session,
+            progress_callback=progress_callback,
+            stop_event=stop_event,
+            search_queries=search_queries,
+            scroll_target_cards_override=scroll_target_cards_override,
+            scroll_max_rounds_override=scroll_max_rounds_override,
+        )
     except Exception as e:
         print(f"Scraper pipeline failed: {e}")
-        try:
-            await stop_dolphin_profile(profile_id)
-        except Exception:
-            pass
         return []
+    finally:
+        if session is not None:
+            try:
+                await close_profile_session(session)
+            except Exception:
+                pass
 
 
 

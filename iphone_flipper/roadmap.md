@@ -10,7 +10,7 @@ This roadmap is a comprehensive implementation plan that combines:
 - Remaining work needed for stability, condition accuracy, and safe automation
 
 Audit date: **2026-03-08**
-Last implementation update: **2026-03-10**
+Last implementation update: **2026-03-12**
 
 ## Roadmap Structure
 
@@ -22,6 +22,85 @@ Last implementation update: **2026-03-10**
 - Phase 5: Reliability, Safety, and Scale
 - Phase 5A: 24x7 Server and Real-Time Sync Migration (approved track)
 - Phase 6: Strategic Expansion
+
+---
+
+## V4 Upgrade Track
+
+### Rollout Rules
+
+- V4 is an additive rollout layered beside the active V3 scheduler/runtime until warm-loop cutover is complete.
+- Every V4 stage ends with a quick recheck and must pass before the next stage begins.
+- Recheck gates cover schema/bootstrap integrity, backfill idempotency, lease correctness, and final regression/docs verification.
+
+### Phase 1: Data Model + Leasing Primitives
+
+Status: Completed on **2026-03-11**
+
+- [x] Added additive V4 tables: `profiles`, `query_families`, `query_variants`
+- [x] Added schema version `12` in runtime schema bootstrap and mirrored it in `server/services/api/sql/001_init.sql`
+- [x] Added idempotent V3-to-V4 backfill from `execution_profiles`, `worker_heartbeats`, `central_routes`, and `route_queries`
+- [x] Added atomic V4 lease helpers for profile and family claim/heartbeat/release using single-statement `UPDATE ... RETURNING`
+- [x] Added targeted tests for schema foundation, backfill query shape, and lease semantics
+- [x] Recheck passed:
+  - [x] schema/bootstrap paths are repeatable
+  - [x] V4 backfill is idempotent by construction and verified by targeted tests
+  - [x] profile/family lease helpers enforce single-winner claims and token-matched release/heartbeat
+  - [x] V3 scheduler tables remain intact and unchanged as the live runtime path
+
+### Phase 2: Worker Runtime Without Full Scraping Changes
+
+Status: Completed on **2026-03-11**
+
+- [x] Added flag-gated V4 warm session runtime path behind `ENABLE_V4_WARM_RUNTIME`
+- [x] Added warm session loop around one claimed V4 profile
+- [x] Added family claiming from `query_families`
+- [x] Added `try/finally` family/profile/browser-lock release
+- [x] Added SIGTERM/SIGINT graceful shutdown request handling
+- [x] Added orphaned Chromium lock cleanup before warm-session launch
+- [x] Added idle close behavior with `available_after` stamping on healthy profile release
+- [x] Refactored scraper runtime into reusable warm-session helpers:
+  - [x] `open_profile_session`
+  - [x] `execute_session_queries`
+  - [x] `close_profile_session`
+- [x] Added targeted tests for V4 warm-session policy and cleanup
+- [x] Recheck passed:
+  - [x] claimed leases release cleanly on shutdown and idle close
+  - [x] no worker relaunch collisions on the same profile directory remain allowed by the tested lease semantics
+  - [x] V3 loop remains available because V4 runtime is feature-flagged off by default
+
+### Phase 3: Scrape Execution + Health Classification
+
+Status: Completed on **2026-03-11**
+
+- [x] Added one fresh tab per family claim inside a warm browser context
+- [x] Added DOM breakage vs empty-feed classification
+- [x] Added V4 profile status transitions from scrape outcomes
+- [x] Added checkpoint/manual-login handling
+- [x] Added adaptive family rescheduling
+- [x] Added reusable family-claim scraper primitive:
+  - [x] `execute_family_claim`
+  - [x] fresh-page creation and close in `finally`
+  - [x] query diagnostics including `feed_present`, `empty_state_detected`, and `final_url`
+- [x] Recheck passed:
+  - [x] DOM breakage classifies separately from empty-feed and does not update profile health
+  - [x] checkpoint/manual-login handling clears family work in the normal `finally` path and quarantines the profile
+  - [x] hot families stay at `min_gap_s` while empty/broken families back off through adaptive `next_due_at`
+  - [x] focused verification passed for phase-3 runtime helpers and compile checks
+
+### Phase 4: Notification and Dedupe Refinements
+
+Status: Completed on **2026-03-12**
+
+- [x] Added V4 first-seen dedupe gate ahead of DB upsert/publish
+- [x] Added optional update/price-change dedupe behind `ENABLE_V4_UPDATE_EVENTS` plus `PRICE_DROP_UPDATE_MODE`
+- [x] Added V4 metrics and alerts
+- [x] Added rollout flags and fail-open fallback paths
+- [x] Added additive listing metadata persistence for `discovery_ts`, first/last seen timestamps, current price hash, and last event kind
+- [x] Recheck passed before cutover:
+  - [x] downstream behavior remains stable because the existing pub/sub, stream, enrichment, and notification paths are preserved
+  - [x] discovery timestamps and dedupe rules are verified by focused worker/stream/telemetry tests
+  - [x] rollback path to the V3 runtime remains intact because all V4 phase-4 behavior is V4-only and flag-gated
 
 ---
 

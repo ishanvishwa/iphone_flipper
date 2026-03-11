@@ -9,7 +9,7 @@ This is a living development log tracking:
 - roadmap drift (manual/additional features)
 - current status and active risks
 
-Last updated: **2026-03-10**
+Last updated: **2026-03-12**
 Author: Codex implementation/update pass
 
 ---
@@ -35,9 +35,200 @@ Author: Codex implementation/update pass
 - Purchase tracking, patterns, conversion scoring, insights
 - GUI-driven workflows for scrape/analysis/price-sheet edits
 
+### V4 Upgrade Snapshot
+
+- V4 phases 1-4 are now implemented additively on the server scheduler path.
+- New V4 Postgres tables exist: `profiles`, `query_families`, `query_variants`.
+- V4 state is backfilled from the current V3 scheduler inventory (`execution_profiles`, `worker_heartbeats`, `central_routes`, `route_queries`).
+- Atomic V4 lease helpers now exist and the V4 warm-session runtime path is implemented behind `ENABLE_V4_WARM_RUNTIME`.
+- V4 discovery-side dedupe now exists behind rollout flags: `ENABLE_V4_FIRST_SEEN_DEDUPE` for the Redis first-seen gate and `ENABLE_V4_UPDATE_EVENTS` plus `PRICE_DROP_UPDATE_MODE` for optional price-change/update events.
+- The live V3 worker loop remains intact as the default path until the V4 runtime flag is enabled.
+- Phase-end rechecks are now part of the V4 delivery rule: do not proceed to the next stage until the current stage passes its acceptance gate.
+
 ---
 
 ## 2. Implementation Timeline (Consolidated)
+
+### Milestone V4-A: V4 Phase 1 Foundation
+
+Status: Completed on **2026-03-11**
+
+- Added schema version `12` and additive V4 tables in both schema bootstrap paths:
+  - `profiles`
+  - `query_families`
+  - `query_variants`
+- Added idempotent V4 backfill from existing V3 scheduler/runtime tables:
+  - `execution_profiles` -> `profiles`
+  - `worker_heartbeats` -> fallback `profiles`
+  - `central_routes` -> `query_families`
+  - `route_queries` -> `query_variants`
+- Added atomic V4 lease helpers in `server/services/worker/lease_manager.py`:
+  - `claim_next_profile`
+  - `heartbeat_profile_lease`
+  - `release_profile_lease`
+  - `claim_next_due_family`
+  - `heartbeat_family_lease`
+  - `release_family_lease`
+- Added V4 phase-1 env defaults to `server/.env.example`:
+  - `PROFILE_LEASE_SECONDS=120`
+  - `FAMILY_LEASE_SECONDS=120`
+  - `LEASE_HEARTBEAT_SECONDS=15`
+  - `PROFILE_MIN_REUSE_SECONDS=180`
+  - `WORKER_NO_PROFILE_BACKOFF_SECONDS=30`
+- Added targeted test coverage for V4 schema, backfill query shape, and lease semantics.
+
+### Milestone V4-A Recheck Results
+
+Status: Passed
+
+- Stage 1 recheck:
+  - Confirmed V4 tables/indexes and schema version exist in `schema_ensure.py` and `001_init.sql`.
+  - Confirmed the schema path is repeatable via targeted test rerun.
+  - Confirmed V3 scheduler tables were left intact.
+- Stage 2 recheck:
+  - Confirmed V4 backfill statements are idempotent by `ON CONFLICT` design and targeted tests.
+  - Confirmed profile/family mapping sources are the intended V3 tables.
+- Stage 3 recheck:
+  - Confirmed profile and family claims use single-statement `UPDATE ... RETURNING` with `FOR UPDATE SKIP LOCKED`.
+  - Confirmed token-matched heartbeat/release behavior and `available_after` reuse blocking in targeted tests.
+- Stage 4 recheck:
+  - Confirmed env defaults, architecture, roadmap, and dev-log updates align to the implemented phase-1 scope.
+  - Confirmed targeted verification passed: `python3 -m unittest server.tests.test_worker_runtime server.tests.test_v4_schema_foundation server.tests.test_v4_leases`
+  - Confirmed clean patch formatting via `git diff --check`.
+
+### Milestone V4-B: V4 Phase 2 Warm Runtime
+
+Status: Completed on **2026-03-11**
+
+- Added `ENABLE_V4_WARM_RUNTIME` to the feature-flag registry with default disabled state.
+- Added reusable scraper warm-session helpers:
+  - `open_profile_session`
+  - `execute_session_queries`
+  - `close_profile_session`
+- Added V4 warm-session runtime helpers in `server/services/worker/v4_runtime.py`:
+  - warm-session config normalization
+  - idle/query-budget/session-age evaluation
+  - humanized pause selection
+  - orphaned Chromium lock cleanup
+- Added flag-gated V4 worker loop support in `server/services/worker/worker.py`:
+  - claim one V4 profile
+  - open one warm browser session
+  - claim one due V4 family at a time
+  - heartbeat profile/family leases
+  - release family/profile/browser locks in `finally`
+  - graceful SIGTERM/SIGINT drain request handling
+  - healthy idle close writes `available_after`
+- Added V4 warm runtime env defaults to `server/.env.example`:
+  - `WORKER_SESSION_MAX_QUERIES=60`
+  - `WORKER_SESSION_MAX_AGE_SECONDS=1800`
+  - `WORKER_SESSION_IDLE_CLOSE_SECONDS=120`
+  - `WARM_LOOP_MIN_PAUSE_SECONDS=2.0`
+  - `WARM_LOOP_MAX_PAUSE_SECONDS=5.0`
+- Added targeted tests:
+  - `server/tests/test_v4_runtime.py`
+  - `server/tests/test_worker_v4_runtime.py`
+
+### Milestone V4-B Recheck Results
+
+Status: Passed
+
+- Recheck 1:
+  - Confirmed reusable scraper session helpers compile and preserve the existing `scrape_marketplace()` wrapper path.
+  - Confirmed the V4 runtime remains additive and feature-flagged off by default.
+- Recheck 2:
+  - Confirmed warm-session policy helpers correctly detect query-budget, age, and idle-close boundaries.
+  - Confirmed orphaned Chromium singleton artifacts are scrubbed before warm-session launch.
+- Recheck 3:
+  - Confirmed warm-session cleanup releases browser/profile leases even when browser close raises.
+  - Confirmed idle-close path stamps `available_after` on profile release.
+- Recheck 4:
+  - Confirmed targeted verification passed:
+    `python3 -m unittest server.tests.test_feature_flags server.tests.test_v4_runtime server.tests.test_worker_v4_runtime server.tests.test_v4_schema_foundation server.tests.test_v4_leases server.tests.test_worker_runtime`
+
+### Milestone V4-C: V4 Phase 3 Scrape Classification
+
+Status: Completed on **2026-03-11**
+
+- Added a dedicated V4 family-claim scraper primitive in `scraper/core.py`:
+  - `execute_family_claim`
+  - one fresh page per family claim inside the warm BrowserContext
+  - page close in `finally`
+  - query diagnostics carrying `final_url`, `feed_present`, and `empty_state_detected`
+- Expanded `server/services/worker/v4_runtime.py` with phase-3 decision rules:
+  - claim outcome classification (`MATCHES`, `EMPTY_FEED`, `DOM_CHANGED`, `CHECKPOINT`, `INFRASTRUCTURE_ERROR`)
+  - family success/abort helpers
+  - adaptive `next_due_at` and variant-cursor helpers
+- Updated the V4 warm loop in `server/services/worker/worker.py`:
+  - family claims now execute through `execute_family_claim`
+  - profile state changes are driven by classified scrape outcomes rather than scheduler waits
+  - `MATCHES` resets profile health to `READY`
+  - `EMPTY_FEED` increments `consecutive_empty_claims` and can move a profile to `THROTTLED`/`COOLDOWN`
+  - `CHECKPOINT` marks the V4 profile `NEEDS_LOGIN` with stored evidence and manual-login alerting
+  - `DOM_CHANGED` widens family backoff without poisoning profile health
+  - family completion now updates `next_due_at`, `variant_cursor`, `consecutive_hits`, `consecutive_empty`, and `last_discovery_at`
+- Added phase-3 env default to `server/.env.example`:
+  - `PROFILE_SHADOW_BAN_EMPTY_THRESHOLD=3`
+- Expanded targeted phase-3 unit coverage in `server/tests/test_v4_runtime.py`.
+
+### Milestone V4-C Recheck Results
+
+Status: Passed
+
+- Recheck 1:
+  - Confirmed the scraper refactor compiles and preserves the existing `execute_session_queries()` path for V3.
+  - Confirmed the new family-claim primitive opens a fresh page per claim and closes it additively through the shared session layer.
+- Recheck 2:
+  - Confirmed V4 worker/scraper/runtime modules compile after integrating outcome classification and profile/family state updates.
+  - Confirmed existing V4 runtime cleanup tests still pass after worker integration.
+- Recheck 3:
+  - Confirmed focused phase-3 decision tests pass for classification, adaptive `next_due_at`, variant rotation, and session-abort rules:
+    `python3 -m unittest server.tests.test_v4_runtime`
+  - Confirmed clean patch formatting via `git diff --check`.
+
+### Milestone V4-D: V4 Phase 4 Notifications and Dedupe
+
+Status: Completed on **2026-03-12**
+
+- Added schema version `13` and additive `listings` fields for V4 discovery tracking:
+  - `discovery_ts`
+  - `first_seen_at`
+  - `last_seen_at`
+  - `current_price`
+  - `last_price_hash`
+  - `persisted_at`
+  - `last_event_kind`
+- Added V4-first discovery timestamp capture in `scraper/core.py` so `discovery_ts` is stamped when a listing ID is first extracted from GraphQL or the DOM, not when the worker later persists it.
+- Added V4 first-seen Redis dedupe in `server/services/worker/worker.py`:
+  - `ENABLE_V4_FIRST_SEEN_DEDUPE`
+  - `REDIS_FIRST_SEEN_TTL_SECONDS`
+  - suppress duplicate V4 candidates before DB upsert and publish
+- Added optional V4 price-change/update dedupe:
+  - `ENABLE_V4_UPDATE_EVENTS`
+  - `PRICE_DROP_UPDATE_MODE=price_change|off`
+  - separate Redis keyspace for update events (`seen_v4_update:*`)
+- Added additive stream/pubsub metadata:
+  - `discovery_ts`
+  - `dedupe_kind`
+  - `mutable_hash`
+- Added V4 telemetry counters and latencies for first-seen gates, update gates, and fail-open fallback.
+- Added throttled operator alerting when V4 dedupe gates fail open so rollout issues surface immediately without breaking the stable downstream pipeline.
+- Updated notification-worker logging so delegated delivery now records `discovery_ts` and true discovery-to-notification latency.
+
+### Milestone V4-D Recheck Results
+
+Status: Passed
+
+- Recheck 1:
+  - Confirmed schema/bootstrap changes are mirrored in both `schema_ensure.py` and `001_init.sql`.
+  - Confirmed focused schema/stream/feature-flag verification passed:
+    `python3 -m unittest server.tests.test_feature_flags server.tests.test_stream_events server.tests.test_v4_schema_foundation`
+- Recheck 2:
+  - Confirmed V4 worker dedupe path suppresses first-seen duplicates before DB write, emits optional price-change updates, and fails open on Redis gate errors while preserving publish flow.
+  - Confirmed focused worker/telemetry verification passed in the runnable local suites:
+    `python3 -m unittest server.tests.test_feature_flags server.tests.test_stream_events server.tests.test_v4_schema_foundation server.tests.test_worker_observability server.tests.test_telemetry`
+- Recheck 3:
+  - Confirmed `test_notification_worker` could not be executed in this local Python environment because the `redis` package is absent; `notification_worker.py` itself was syntax-checked with `python3 -m py_compile`.
+  - Confirmed downstream behavior remains additive because V4 phase-4 logic only engages on V4 metadata and feature flags, leaving the live V3 runtime path untouched.
 
 ### Milestone A: Core Automation Foundation
 

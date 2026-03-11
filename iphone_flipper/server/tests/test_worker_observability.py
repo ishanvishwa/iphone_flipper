@@ -102,6 +102,32 @@ class _FakePool:
         return _Acquire(conn)
 
 
+def _base_cycle_metrics() -> dict[str, int]:
+    return {
+        "postgres_upsert_latency_ms_sum": 0,
+        "postgres_upsert_latency_ms_count": 0,
+        "redis_publish_latency_ms_sum": 0,
+        "redis_publish_latency_ms_count": 0,
+        "redis_stream_publish_latency_ms_sum": 0,
+        "redis_stream_publish_latency_ms_count": 0,
+        "redis_stream_publish_failure_count": 0,
+        "v4_first_seen_gate_latency_ms_sum": 0,
+        "v4_first_seen_gate_latency_ms_count": 0,
+        "v4_first_seen_claim_count": 0,
+        "v4_first_seen_duplicate_count": 0,
+        "v4_update_gate_latency_ms_sum": 0,
+        "v4_update_gate_latency_ms_count": 0,
+        "v4_update_event_claim_count": 0,
+        "v4_update_event_duplicate_count": 0,
+        "v4_dedupe_fallback_count": 0,
+        "notification_delivery_latency_ms_sum": 0,
+        "notification_delivery_latency_ms_count": 0,
+        "end_to_end_alert_latency_ms_sum": 0,
+        "end_to_end_alert_latency_ms_count": 0,
+        "duplicate_listing_count": 0,
+    }
+
+
 @unittest.skipIf(worker is None, "Worker dependencies are not installed.")
 class WorkerObservabilityTests(unittest.IsolatedAsyncioTestCase):
     async def test_publish_listing_stream_event_uses_capped_xadd(self) -> None:
@@ -620,6 +646,158 @@ class WorkerObservabilityTests(unittest.IsolatedAsyncioTestCase):
             )
 
         stream_mock.assert_awaited_once()
+
+    async def test_process_listing_event_v4_first_seen_duplicate_suppresses_before_upsert(self) -> None:
+        cycle_metrics = _base_cycle_metrics()
+        redis_client = AsyncMock()
+        redis_client.set = AsyncMock(return_value=None)
+        feature_flags = MagicMock()
+
+        async def _flag_enabled(flag_name: str) -> bool:
+            return flag_name == "ENABLE_V4_FIRST_SEEN_DEDUPE"
+
+        feature_flags.is_enabled = AsyncMock(side_effect=_flag_enabled)
+        metadata = {
+            "route_name": "iphone_broad",
+            "query_shard_key": "v4-family:1",
+            "source": "v4",
+            "discovery_ts": "2026-03-11T00:00:00+00:00",
+        }
+        listing = {"id": "listing-v4-dup", "model": "iPhone 15 Pro", "price": 900, "potential_profit": 100}
+
+        with (
+            patch.object(worker, "_upsert_listing", AsyncMock()) as upsert_mock,
+            patch.object(worker, "_publish_listing_event", AsyncMock()) as publish_mock,
+            patch.object(worker, "emit_json_log") as emit_mock,
+        ):
+            await worker._process_listing_event(object(), redis_client, feature_flags, listing, metadata, cycle_metrics)
+
+        upsert_mock.assert_not_awaited()
+        publish_mock.assert_not_awaited()
+        self.assertEqual(cycle_metrics["duplicate_listing_count"], 1)
+        self.assertEqual(cycle_metrics["v4_first_seen_duplicate_count"], 1)
+        self.assertEqual(emit_mock.call_args.kwargs["first_seen_status"], "duplicate")
+
+    async def test_process_listing_event_v4_first_seen_claim_forces_created_stream_publish(self) -> None:
+        cycle_metrics = _base_cycle_metrics()
+        redis_client = AsyncMock()
+        redis_client.set = AsyncMock(return_value=True)
+        feature_flags = MagicMock()
+
+        async def _flag_enabled(flag_name: str) -> bool:
+            return flag_name in {"ENABLE_V4_FIRST_SEEN_DEDUPE", "ENABLE_REDIS_STREAM_EVENTS"}
+
+        feature_flags.is_enabled = AsyncMock(side_effect=_flag_enabled)
+        metadata = {
+            "route_name": "iphone_broad",
+            "query_shard_key": "v4-family:1",
+            "source": "v4",
+            "discovery_ts": "2026-03-11T00:01:00+00:00",
+        }
+        listing = {"id": "listing-v4-first", "model": "iPhone 15 Pro", "price": 875, "potential_profit": 125}
+
+        with (
+            patch.object(
+                worker,
+                "_upsert_listing",
+                AsyncMock(return_value=worker.ListingUpsertResult(created=False, stream_state_changed=False)),
+            ) as upsert_mock,
+            patch.object(worker, "_publish_listing_stream_event", AsyncMock(return_value=("1741699260000-0", "2026-03-11T00:01:00.250000+00:00", 4))) as stream_mock,
+            patch.object(worker, "_publish_listing_event", AsyncMock(return_value=("2026-03-11T00:01:00.300000+00:00", 5))) as publish_mock,
+            patch.object(worker, "_should_notify_telegram", return_value=False),
+            patch.object(worker, "monotonic_duration_ms", return_value=7),
+            patch.object(worker, "utc_now_iso", return_value="2026-03-11T00:01:00.100000+00:00"),
+            patch.object(worker, "emit_json_log"),
+        ):
+            await worker._process_listing_event(object(), redis_client, feature_flags, listing, metadata, cycle_metrics)
+
+        self.assertEqual(upsert_mock.await_args.kwargs["event_name"], "listing_created")
+        self.assertEqual(upsert_mock.await_args.kwargs["discovery_ts"], "2026-03-11T00:01:00+00:00")
+        self.assertEqual(publish_mock.await_args.kwargs["event_name"], "listing_created")
+        stream_mock.assert_awaited_once()
+        self.assertEqual(cycle_metrics["v4_first_seen_claim_count"], 1)
+        self.assertEqual(cycle_metrics["duplicate_listing_count"], 0)
+
+    async def test_process_listing_event_v4_price_change_claim_publishes_update(self) -> None:
+        cycle_metrics = _base_cycle_metrics()
+        redis_client = AsyncMock()
+        redis_client.set = AsyncMock(side_effect=[None, True])
+        feature_flags = MagicMock()
+
+        async def _flag_enabled(flag_name: str) -> bool:
+            return flag_name in {"ENABLE_V4_FIRST_SEEN_DEDUPE", "ENABLE_V4_UPDATE_EVENTS"}
+
+        feature_flags.is_enabled = AsyncMock(side_effect=_flag_enabled)
+        metadata = {
+            "route_name": "iphone_broad",
+            "query_shard_key": "v4-family:1",
+            "source": "v4",
+            "discovery_ts": "2026-03-11T00:02:00+00:00",
+        }
+        listing = {"id": "listing-v4-update", "model": "iPhone 15", "price": 810, "potential_profit": 80}
+
+        with (
+            patch.object(worker, "PRICE_DROP_UPDATE_MODE", "price_change"),
+            patch.object(
+                worker,
+                "_upsert_listing",
+                AsyncMock(return_value=worker.ListingUpsertResult(created=False, stream_state_changed=False)),
+            ) as upsert_mock,
+            patch.object(worker, "_publish_listing_event", AsyncMock(return_value=("2026-03-11T00:02:00.300000+00:00", 5))) as publish_mock,
+            patch.object(worker, "_publish_listing_stream_event", AsyncMock(return_value=("1741699320000-0", "2026-03-11T00:02:00.250000+00:00", 4))),
+            patch.object(worker, "_should_notify_telegram", return_value=False),
+            patch.object(worker, "monotonic_duration_ms", return_value=6),
+            patch.object(worker, "utc_now_iso", return_value="2026-03-11T00:02:00.100000+00:00"),
+            patch.object(worker, "emit_json_log"),
+        ):
+            await worker._process_listing_event(object(), redis_client, feature_flags, listing, metadata, cycle_metrics)
+
+        self.assertEqual(upsert_mock.await_args.kwargs["event_name"], "listing_updated")
+        self.assertEqual(publish_mock.await_args.kwargs["event_name"], "listing_updated")
+        self.assertEqual(
+            publish_mock.await_args.kwargs["metadata"]["dedupe_kind"],
+            "price_change",
+        )
+        self.assertEqual(cycle_metrics["v4_update_event_claim_count"], 1)
+        self.assertEqual(cycle_metrics["duplicate_listing_count"], 0)
+
+    async def test_process_listing_event_v4_dedupe_fail_open_preserves_publish_path(self) -> None:
+        cycle_metrics = _base_cycle_metrics()
+        redis_client = AsyncMock()
+        redis_client.set = AsyncMock(side_effect=RuntimeError("redis unavailable"))
+        feature_flags = MagicMock()
+
+        async def _flag_enabled(flag_name: str) -> bool:
+            return flag_name == "ENABLE_V4_FIRST_SEEN_DEDUPE"
+
+        feature_flags.is_enabled = AsyncMock(side_effect=_flag_enabled)
+        metadata = {
+            "route_name": "iphone_broad",
+            "query_shard_key": "v4-family:1",
+            "source": "v4",
+            "discovery_ts": "2026-03-11T00:03:00+00:00",
+        }
+        listing = {"id": "listing-v4-fallback", "model": "iPhone 14 Pro", "price": 700, "potential_profit": 60}
+
+        with (
+            patch.object(
+                worker,
+                "_upsert_listing",
+                AsyncMock(return_value=worker.ListingUpsertResult(created=True, stream_state_changed=True)),
+            ) as upsert_mock,
+            patch.object(worker, "_publish_listing_event", AsyncMock(return_value=("2026-03-11T00:03:00.300000+00:00", 5))) as publish_mock,
+            patch.object(worker, "_should_notify_telegram", return_value=False),
+            patch.object(worker, "_should_send_v4_pipeline_alert", return_value=False),
+            patch.object(worker, "monotonic_duration_ms", return_value=8),
+            patch.object(worker, "utc_now_iso", return_value="2026-03-11T00:03:00.100000+00:00"),
+            patch.object(worker, "emit_json_log") as emit_mock,
+        ):
+            await worker._process_listing_event(object(), redis_client, feature_flags, listing, metadata, cycle_metrics)
+
+        self.assertIsNone(upsert_mock.await_args.kwargs["event_name"])
+        self.assertEqual(publish_mock.await_args.kwargs["event_name"], "listing_created")
+        self.assertEqual(cycle_metrics["v4_dedupe_fallback_count"], 1)
+        self.assertEqual(emit_mock.call_args_list[0].args[0], "v4_dedupe_fail_open")
 
     async def test_try_acquire_priority_query_lock_skips_locked_candidate(self) -> None:
         redis_client = AsyncMock()

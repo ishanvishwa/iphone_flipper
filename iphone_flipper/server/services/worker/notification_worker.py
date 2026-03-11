@@ -154,8 +154,11 @@ def _build_telegram_card(event: ListingStreamEvent) -> str:
     title = escape(str(event.title or "Untitled listing"))
     price = _fmt_money(event.price)
     profit = _fmt_money(event.potential_profit)
+    heading = "📱 <b>New Listing</b>"
+    if str(event.event_name or "").strip() == "listing_updated":
+        heading = "📱 <b>Listing Update</b>"
     lines = [
-        "📱 <b>New Listing</b>",
+        heading,
         f"<b>{title}</b>",
         f"Price: {price}",
         f"Potential Profit: {profit}",
@@ -245,6 +248,7 @@ async def _send_fcm_push(event: ListingStreamEvent) -> bool:
             "profit": str(event.potential_profit or ""),
             "url": str(event.url or ""),
             "source": str(event.source or ""),
+            "discovery_ts": str(event.discovery_ts or ""),
             "persisted_at": str(event.persisted_at or ""),
         },
         topic=FCM_TOPIC,
@@ -688,9 +692,14 @@ class NotificationConsumer:
                     stream_event_id=stream_event_id,
                     notification_channel="telegram",
                     notification_status="sent",
+                    discovery_ts=str(event.discovery_ts or "") or None,
                     persisted_at=str(event.persisted_at or "") or None,
                     notification_sent_ts=notification_sent_ts,
                     notification_delivery_latency_ms=monotonic_duration_ms(delivery_started),
+                    discovery_to_notification_latency_ms=timestamp_delta_ms(
+                        event.discovery_ts or event.persisted_at,
+                        notification_sent_ts,
+                    ),
                     persist_to_notification_latency_ms=timestamp_delta_ms(event.persisted_at, notification_sent_ts),
                     attempt=attempt,
                 )
@@ -726,6 +735,7 @@ class NotificationConsumer:
                 dead_letter_stream_name=NOTIFICATION_DEAD_LETTER_STREAM_NAME,
                 notification_channel="telegram",
                 notification_status="retry_pending",
+                discovery_ts=str(event.discovery_ts or "") or None,
                 persisted_at=str(event.persisted_at or "") or None,
                 last_error=last_error,
                 attempt=self._retry_attempts,
@@ -748,6 +758,7 @@ class NotificationConsumer:
             dead_lettered_at=dead_lettered_at,
             notification_channel="telegram",
             notification_status="failed_terminal",
+            discovery_ts=str(event.discovery_ts or "") or None,
             persisted_at=str(event.persisted_at or "") or None,
             notification_sent_ts=None,
             last_error=last_error,
@@ -780,6 +791,7 @@ class NotificationConsumer:
                 stream_event_id=stream_event_id,
                 notification_channel="telegram",
                 notification_status="duplicate_already_sent",
+                discovery_ts=str(event.discovery_ts or "") or None,
                 persisted_at=str(event.persisted_at or "") or None,
             )
             return action
@@ -799,6 +811,7 @@ class NotificationConsumer:
                 notification_channel="telegram",
                 notification_status="suppressed",
                 suppression_reason=reason,
+                discovery_ts=str(event.discovery_ts or "") or None,
                 persisted_at=str(event.persisted_at or "") or None,
             )
             return action

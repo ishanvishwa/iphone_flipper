@@ -9,6 +9,7 @@ import logging
 import os
 import random
 import re
+import signal
 import sys
 import time
 import uuid
@@ -30,7 +31,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scraper import (  # noqa: E402
+    close_profile_session,
+    execute_family_claim,
+    execute_session_queries,
     is_accessory_only_listing,
+    open_profile_session,
     scrape_marketplace,
 )
 from notifications import notify_telegram_listing_card, send_telegram  # noqa: E402
@@ -64,8 +69,14 @@ from server.services.common.stream_events import (  # noqa: E402
 )
 from server.services.worker.proxy_monitor import get_proxy_health, start_monitor as start_proxy_monitor  # noqa: E402
 from server.services.worker.lease_manager import (  # noqa: E402
+    claim_next_due_family as claim_next_due_family_from_module,
+    claim_next_profile as claim_next_profile_from_module,
     canonical_proxy_key as canonical_proxy_key_from_module,
+    heartbeat_family_lease as heartbeat_family_lease_from_module,
+    heartbeat_profile_lease as heartbeat_profile_lease_from_module,
     proxy_identity as proxy_identity_from_module,
+    release_family_lease as release_family_lease_from_module,
+    release_profile_lease as release_profile_lease_from_module,
     release_query_lock as release_query_lock_from_module,
     refresh_proxy_lease as refresh_proxy_lease_from_module,
     try_acquire_query_lock as try_acquire_query_lock_from_module,
@@ -110,6 +121,19 @@ from server.services.worker.scheduler import (  # noqa: E402
 )
 from server.services.worker.signal_detector import analyze_cycle_signals  # noqa: E402
 from server.services.worker.telemetry import build_cycle_telemetry_payload  # noqa: E402
+from server.services.worker.v4_runtime import (  # noqa: E402
+    FamilyClaimOutcome,
+    WarmSessionConfig,
+    classify_family_claim,
+    evaluate_warm_session_state,
+    family_claim_succeeded,
+    next_family_due_seconds,
+    next_variant_cursor,
+    next_pause_seconds as next_v4_pause_seconds,
+    normalize_warm_session_config,
+    should_abort_warm_session,
+    scrub_orphaned_chromium_locks,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -155,6 +179,19 @@ class ListingUpsertResult:
     enrichment_source_hash: str | None = None
 
 
+@dataclass(frozen=True)
+class V4ListingDedupeDecision:
+    should_process: bool
+    event_name: str | None = None
+    dedupe_kind: str = "legacy"
+    discovery_ts: str | None = None
+    mutable_hash: str | None = None
+    first_seen_status: str = "disabled"
+    update_status: str = "disabled"
+    fallback_status: str = "not_needed"
+    force_stream_publish: bool = False
+
+
 async def _acquire_listing_advisory_lock(
     conn: asyncpg.Connection,
     listing_id: str,
@@ -182,6 +219,13 @@ def _parse_optional_int(raw: str | None, minimum: int = 1) -> int | None:
         return max(minimum, int(value))
     except (TypeError, ValueError):
         return None
+
+
+def _normalize_price_drop_update_mode(raw: str | None) -> str:
+    value = str(raw or "").strip().lower()
+    if value in {"price", "price_change", "price-drop", "price_drop", "update", "updates"}:
+        return "price_change"
+    return "off"
 
 
 def _parse_int(raw: str | None, default: int, minimum: int = 1) -> int:
@@ -267,6 +311,49 @@ try:
     )
 except ValueError:
     WORKER_PROXY_LEASE_SECONDS = 600
+PROFILE_LEASE_SECONDS = _parse_int(os.getenv("PROFILE_LEASE_SECONDS"), default=120, minimum=30)
+FAMILY_LEASE_SECONDS = _parse_int(os.getenv("FAMILY_LEASE_SECONDS"), default=120, minimum=30)
+LEASE_HEARTBEAT_SECONDS = _parse_int(os.getenv("LEASE_HEARTBEAT_SECONDS"), default=15, minimum=5)
+PROFILE_MIN_REUSE_SECONDS = _parse_int(os.getenv("PROFILE_MIN_REUSE_SECONDS"), default=180, minimum=0)
+WORKER_NO_PROFILE_BACKOFF_SECONDS = _parse_int(
+    os.getenv("WORKER_NO_PROFILE_BACKOFF_SECONDS"),
+    default=30,
+    minimum=1,
+)
+V4_SESSION_MAX_QUERIES = _parse_int(os.getenv("WORKER_SESSION_MAX_QUERIES"), default=60, minimum=1)
+V4_SESSION_MAX_AGE_SECONDS = _parse_int(
+    os.getenv("WORKER_SESSION_MAX_AGE_SECONDS"),
+    default=1800,
+    minimum=60,
+)
+V4_SESSION_IDLE_CLOSE_SECONDS = _parse_int(
+    os.getenv("WORKER_SESSION_IDLE_CLOSE_SECONDS"),
+    default=120,
+    minimum=1,
+)
+V4_WARM_LOOP_MIN_PAUSE_SECONDS = _parse_float(
+    os.getenv("WARM_LOOP_MIN_PAUSE_SECONDS"),
+    default=2.0,
+    minimum=0.0,
+)
+V4_WARM_LOOP_MAX_PAUSE_SECONDS = _parse_float(
+    os.getenv("WARM_LOOP_MAX_PAUSE_SECONDS"),
+    default=5.0,
+    minimum=V4_WARM_LOOP_MIN_PAUSE_SECONDS,
+)
+PROFILE_SHADOW_BAN_EMPTY_THRESHOLD = _parse_int(
+    os.getenv("PROFILE_SHADOW_BAN_EMPTY_THRESHOLD"),
+    default=3,
+    minimum=1,
+)
+REDIS_FIRST_SEEN_TTL_SECONDS = _parse_int(
+    os.getenv("REDIS_FIRST_SEEN_TTL_SECONDS"),
+    default=604800,
+    minimum=60,
+)
+PRICE_DROP_UPDATE_MODE = _normalize_price_drop_update_mode(os.getenv("PRICE_DROP_UPDATE_MODE", "off"))
+V4_DOM_INVESTIGATION_BACKOFF_SECONDS = 300
+V4_INFRA_FAMILY_BACKOFF_SECONDS = 60
 PROXY_HEALTH_FAILURE_BAN_AFTER = _parse_int(os.getenv("PROXY_HEALTH_FAILURE_BAN_AFTER"), default=3, minimum=1)
 PROXY_HEALTH_BASE_BAN_SECONDS = _parse_int(os.getenv("PROXY_HEALTH_BASE_BAN_SECONDS"), default=300, minimum=30)
 PROXY_HEALTH_MAX_BAN_SECONDS = _parse_int(os.getenv("PROXY_HEALTH_MAX_BAN_SECONDS"), default=7200, minimum=60)
@@ -350,6 +437,11 @@ WORKER_QUIET_HOURS_MULTIPLIER = _parse_float(
 WORKER_SESSION_MAX_QUERIES = _parse_optional_int(
     os.getenv("WORKER_SESSION_MAX_QUERIES"), minimum=5
 )
+V4_PIPELINE_ALERT_COOLDOWN_SECONDS = _parse_int(
+    os.getenv("V4_PIPELINE_ALERT_COOLDOWN_SECONDS"),
+    default=900,
+    minimum=60,
+)
 
 MANUAL_LOGIN_REQUIRED_MARKERS = (
     "manual_login_required",
@@ -367,14 +459,39 @@ MANUAL_LOGIN_REQUIRED_MARKERS = (
 
 _PROFILE_FAILURE_ALERT_LAST_SENT_AT: dict[str, datetime] = {}
 _MANUAL_LOGIN_ALERT_LAST_SENT_AT: dict[str, datetime] = {}
+_V4_PIPELINE_ALERT_LAST_SENT_AT: dict[str, datetime] = {}
 _ROUTE_CONSECUTIVE_BAD_CYCLES: dict[str, int] = {}
 _ROUTE_SESSION_QUERY_COUNTS: dict[str, int] = {}
 _SINGLE_ROUTE_ENFORCEMENT_ACTIVE = False
 _CENTRAL_ROUTE_DISPATCH_COUNT = 0
+_WORKER_SHUTDOWN_EVENT: asyncio.Event | None = None
 
 # Dolphin Profile failures tracking is now backed by `proxy_stats` in PostgreSQL
 DOLPHIN_PROFILE_BLACKLIST_AFTER = 2   # blacklist after N consecutive failures
 DOLPHIN_PROFILE_BLACKLIST_SECONDS = 1800  # 30-min cooldown
+
+
+@dataclass
+class V4WarmSessionState:
+    profile: dict[str, Any]
+    profile_lease_token: str
+    browser_profile_id: str
+    browser_profile_lock_id: str | None
+    session: Any
+    started_at: datetime
+    last_activity_at: datetime
+    executed_claims: int = 0
+
+
+@dataclass
+class V4FamilyClaimResult:
+    metrics: dict[str, int]
+    outcome: FamilyClaimOutcome
+    error_text: str | None
+    error_category: ErrorCategory
+    final_url: str | None = None
+    feed_present: bool = False
+    empty_state_detected: bool = False
 
 
 def _parse_quiet_hours(raw: str) -> tuple[tuple[int, int], tuple[int, int]] | None:
@@ -858,6 +975,233 @@ def _increment_counter_metric(metrics: dict[str, int], key: str, increment: int 
     metrics[key] = metrics.get(key, 0) + max(0, int(increment))
 
 
+def _is_v4_listing_event(metadata: Mapping[str, Any]) -> bool:
+    source = _normalize_optional_text(metadata.get("source")).lower()
+    if source == "v4":
+        return True
+    query_shard_key = _normalize_optional_text(metadata.get("query_shard_key")).lower()
+    return query_shard_key.startswith("v4-family:")
+
+
+def _v4_first_seen_key(listing_id: str) -> str:
+    return f"seen_v4:{listing_id}"
+
+
+def _v4_update_key(listing_id: str, mutable_hash: str) -> str:
+    return f"seen_v4_update:{listing_id}:{mutable_hash}"
+
+
+def _v4_listing_mutable_hash(listing: Mapping[str, Any]) -> str | None:
+    price_value = _normalize_optional_text(extract_listing_stream_state(listing).get("price"))
+    if not price_value:
+        return None
+    return hashlib.sha1(price_value.encode("utf-8")).hexdigest()
+
+
+def _v4_pipeline_alert_key(reason: str) -> str:
+    reason_text = _normalize_optional_text(reason).lower()
+    reason_hash = hashlib.sha1(reason_text.encode("utf-8")).hexdigest()[:12] if reason_text else "unknown"
+    return f"{WORKER_NAME}::v4_pipeline::{reason_hash}"
+
+
+def _should_send_v4_pipeline_alert(reason: str, now: datetime | None = None) -> bool:
+    now_dt = now or datetime.now(timezone.utc)
+    alert_key = _v4_pipeline_alert_key(reason)
+    last_sent_at = _V4_PIPELINE_ALERT_LAST_SENT_AT.get(alert_key)
+    if last_sent_at:
+        age_seconds = (now_dt - last_sent_at).total_seconds()
+        if age_seconds < V4_PIPELINE_ALERT_COOLDOWN_SECONDS:
+            return False
+    _V4_PIPELINE_ALERT_LAST_SENT_AT[alert_key] = now_dt
+    return True
+
+
+def _send_telegram_v4_pipeline_alert(
+    *,
+    reason: str,
+    listing_id: str | None,
+    route_name: str | None,
+    error: str,
+) -> None:
+    if not TELEGRAM_NOTIFICATIONS_ENABLED:
+        return
+
+    message = (
+        "⚠️ V4 dedupe fallback active\n"
+        f"Worker: {WORKER_NAME}\n"
+        f"Route: {route_name or 'unknown'}\n"
+        f"Listing: {listing_id or 'unknown'}\n"
+        f"Reason: {reason}\n"
+        f"Error: {str(error or '').strip()[:500]}"
+    )
+    send_telegram(message, parse_mode=None, disable_web_page_preview=True)
+
+
+async def _resolve_v4_listing_dedupe(
+    *,
+    redis_client: Redis,
+    feature_flags: RedisFeatureFlags | None,
+    listing: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+    cycle_metrics: dict[str, int],
+) -> V4ListingDedupeDecision | None:
+    if feature_flags is None or not _is_v4_listing_event(metadata):
+        return None
+    if not await feature_flags.is_enabled("ENABLE_V4_FIRST_SEEN_DEDUPE"):
+        return None
+
+    listing_id = _normalize_optional_text(listing.get("id"))
+    discovery_ts = _normalize_optional_text(metadata.get("discovery_ts") or metadata.get("listing_seen_ts")) or utc_now_iso()
+    mutable_hash = _v4_listing_mutable_hash(listing)
+    route_name = _normalize_optional_text(metadata.get("route_name")) or None
+    if not listing_id:
+        return V4ListingDedupeDecision(should_process=True, discovery_ts=discovery_ts)
+
+    update_events_enabled = (
+        PRICE_DROP_UPDATE_MODE != "off"
+        and await feature_flags.is_enabled("ENABLE_V4_UPDATE_EVENTS")
+    )
+
+    async def _alert_fail_open(*, reason: str, error: Exception) -> None:
+        error_text = str(error)[:500]
+        _increment_counter_metric(cycle_metrics, "v4_dedupe_fallback_count")
+        emit_json_log(
+            "v4_dedupe_fail_open",
+            listing_id=listing_id,
+            worker_name=WORKER_NAME,
+            route_name=route_name,
+            reason=reason,
+            error=error_text,
+        )
+        if _should_send_v4_pipeline_alert(reason):
+            await asyncio.to_thread(
+                _send_telegram_v4_pipeline_alert,
+                reason=reason,
+                listing_id=listing_id,
+                route_name=route_name,
+                error=error_text,
+            )
+
+    first_seen_started = time.monotonic()
+    try:
+        first_seen_claimed = await redis_client.set(
+            _v4_first_seen_key(listing_id),
+            discovery_ts,
+            ex=REDIS_FIRST_SEEN_TTL_SECONDS,
+            nx=True,
+        )
+    except Exception as exc:
+        _increment_latency_metric(
+            cycle_metrics,
+            "v4_first_seen_gate_latency_ms",
+            monotonic_duration_ms(first_seen_started),
+        )
+        await _alert_fail_open(reason="first_seen_gate_error", error=exc)
+        return V4ListingDedupeDecision(
+            should_process=True,
+            discovery_ts=discovery_ts,
+            mutable_hash=mutable_hash,
+            fallback_status="fail_open",
+            first_seen_status="error",
+        )
+
+    _increment_latency_metric(
+        cycle_metrics,
+        "v4_first_seen_gate_latency_ms",
+        monotonic_duration_ms(first_seen_started),
+    )
+
+    if first_seen_claimed:
+        _increment_counter_metric(cycle_metrics, "v4_first_seen_claim_count")
+        update_status = "disabled"
+        if update_events_enabled and mutable_hash:
+            try:
+                await redis_client.set(
+                    _v4_update_key(listing_id, mutable_hash),
+                    discovery_ts,
+                    ex=REDIS_FIRST_SEEN_TTL_SECONDS,
+                    nx=True,
+                )
+                update_status = "seeded"
+            except Exception:
+                update_status = "seed_failed"
+        return V4ListingDedupeDecision(
+            should_process=True,
+            event_name="listing_created",
+            dedupe_kind="first_seen",
+            discovery_ts=discovery_ts,
+            mutable_hash=mutable_hash,
+            first_seen_status="claimed",
+            update_status=update_status,
+            force_stream_publish=True,
+        )
+
+    _increment_counter_metric(cycle_metrics, "v4_first_seen_duplicate_count")
+    if not update_events_enabled or not mutable_hash:
+        _increment_counter_metric(cycle_metrics, "duplicate_listing_count")
+        return V4ListingDedupeDecision(
+            should_process=False,
+            dedupe_kind="first_seen",
+            discovery_ts=discovery_ts,
+            mutable_hash=mutable_hash,
+            first_seen_status="duplicate",
+            update_status="disabled" if not update_events_enabled else "skipped_no_hash",
+        )
+
+    update_started = time.monotonic()
+    try:
+        update_claimed = await redis_client.set(
+            _v4_update_key(listing_id, mutable_hash),
+            discovery_ts,
+            ex=REDIS_FIRST_SEEN_TTL_SECONDS,
+            nx=True,
+        )
+    except Exception as exc:
+        _increment_latency_metric(
+            cycle_metrics,
+            "v4_update_gate_latency_ms",
+            monotonic_duration_ms(update_started),
+        )
+        await _alert_fail_open(reason="update_gate_error", error=exc)
+        return V4ListingDedupeDecision(
+            should_process=True,
+            discovery_ts=discovery_ts,
+            mutable_hash=mutable_hash,
+            first_seen_status="duplicate",
+            update_status="error",
+            fallback_status="fail_open",
+        )
+
+    _increment_latency_metric(
+        cycle_metrics,
+        "v4_update_gate_latency_ms",
+        monotonic_duration_ms(update_started),
+    )
+    if update_claimed:
+        _increment_counter_metric(cycle_metrics, "v4_update_event_claim_count")
+        return V4ListingDedupeDecision(
+            should_process=True,
+            event_name="listing_updated",
+            dedupe_kind="price_change",
+            discovery_ts=discovery_ts,
+            mutable_hash=mutable_hash,
+            first_seen_status="duplicate",
+            update_status="claimed",
+            force_stream_publish=True,
+        )
+
+    _increment_counter_metric(cycle_metrics, "v4_update_event_duplicate_count")
+    _increment_counter_metric(cycle_metrics, "duplicate_listing_count")
+    return V4ListingDedupeDecision(
+        should_process=False,
+        dedupe_kind="price_change",
+        discovery_ts=discovery_ts,
+        mutable_hash=mutable_hash,
+        first_seen_status="duplicate",
+        update_status="duplicate",
+    )
+
+
 def _normalize_upsert_result(raw_result: ListingUpsertResult | bool) -> ListingUpsertResult:
     if isinstance(raw_result, ListingUpsertResult):
         return raw_result
@@ -869,6 +1213,17 @@ def _normalize_optional_text(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def _parse_optional_timestamp(value: Any) -> datetime | None:
+    text = _normalize_optional_text(value)
+    if not text:
+        return None
+    normalized = text.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
 
 
 def _listing_max_buy_price(listing: dict[str, Any]) -> Any:
@@ -1595,6 +1950,996 @@ async def _release_expired_execution_profile_cooldowns(pool: asyncpg.Pool) -> in
         return int(str(status or "").split()[-1])
     except (TypeError, ValueError, IndexError):
         return 0
+
+
+def _worker_shutdown_event() -> asyncio.Event:
+    global _WORKER_SHUTDOWN_EVENT
+    if _WORKER_SHUTDOWN_EVENT is None:
+        _WORKER_SHUTDOWN_EVENT = asyncio.Event()
+    return _WORKER_SHUTDOWN_EVENT
+
+
+def _worker_shutdown_requested() -> bool:
+    return _worker_shutdown_event().is_set()
+
+
+def _request_worker_shutdown() -> None:
+    shutdown_event = _worker_shutdown_event()
+    if not shutdown_event.is_set():
+        logging.info("[%s] shutdown requested; draining active work.", WORKER_NAME)
+        shutdown_event.set()
+
+
+def _v4_warm_session_config() -> WarmSessionConfig:
+    return normalize_warm_session_config(
+        max_queries=V4_SESSION_MAX_QUERIES,
+        max_age_seconds=V4_SESSION_MAX_AGE_SECONDS,
+        idle_close_seconds=V4_SESSION_IDLE_CLOSE_SECONDS,
+        min_pause_seconds=V4_WARM_LOOP_MIN_PAUSE_SECONDS,
+        max_pause_seconds=V4_WARM_LOOP_MAX_PAUSE_SECONDS,
+    )
+
+
+def _build_v4_family_route(profile: dict[str, Any], family: dict[str, Any] | None = None) -> dict[str, Any]:
+    route_name = str((family or {}).get("name") or "v4_warm_session").strip() or "v4_warm_session"
+    return {
+        "route_name": route_name,
+        "worker_name": WORKER_NAME,
+        "user_data_dir": str(profile.get("user_data_dir") or "").strip() or None,
+        "source": "v4",
+    }
+
+
+async def _claim_v4_profile(pool: asyncpg.Pool) -> dict[str, Any] | None:
+    return await claim_next_profile_from_module(
+        pool,
+        worker_name=WORKER_NAME,
+        lease_token=uuid.uuid4().hex,
+        lease_seconds=PROFILE_LEASE_SECONDS,
+    )
+
+
+async def _claim_v4_family(pool: asyncpg.Pool) -> dict[str, Any] | None:
+    return await claim_next_due_family_from_module(
+        pool,
+        lease_token=uuid.uuid4().hex,
+        lease_seconds=FAMILY_LEASE_SECONDS,
+    )
+
+
+async def _load_v4_family_variant(pool: asyncpg.Pool, family: dict[str, Any]) -> dict[str, Any] | None:
+    family_id = family.get("family_id")
+    if family_id is None:
+        return None
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                variant_id,
+                family_id,
+                query_text,
+                url_template,
+                validation_state,
+                weight,
+                variant_order,
+                is_enabled,
+                last_selected_at,
+                last_success_at,
+                notes
+            FROM query_variants
+            WHERE family_id = $1
+              AND COALESCE(is_enabled, TRUE) = TRUE
+            ORDER BY variant_order ASC, variant_id ASC
+            """,
+            int(family_id),
+        )
+    if not rows:
+        return None
+    variants = [dict(row) for row in rows]
+    cursor = int(family.get("variant_cursor") or 0)
+    if cursor < 0:
+        cursor = 0
+    return variants[min(cursor, len(variants) - 1)]
+
+
+def _v4_variant_queries(variant: dict[str, Any] | None) -> list[str]:
+    query_text = str((variant or {}).get("query_text") or "").strip()
+    if not query_text:
+        return []
+    if query_text.upper() == "BUCKETS":
+        return _get_bucket_queries(num_queries=1)
+    return [query_text]
+
+
+def _default_v4_claim_error_text(outcome: FamilyClaimOutcome, error_text: str | None) -> str | None:
+    text = str(error_text or "").strip()
+    if text:
+        return text[:2000]
+    if outcome == FamilyClaimOutcome.DOM_CHANGED:
+        return "Marketplace feed surface missing or DOM changed."
+    if outcome == FamilyClaimOutcome.CHECKPOINT:
+        return "Manual login required."
+    if outcome == FamilyClaimOutcome.INFRASTRUCTURE_ERROR:
+        return "Family claim ended with infrastructure failure."
+    return None
+
+
+async def _record_v4_profile_success(
+    pool: asyncpg.Pool,
+    profile: dict[str, Any],
+) -> dict[str, Any] | None:
+    profile_id = profile.get("profile_id")
+    if profile_id is None:
+        return None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE profiles
+            SET
+                status = 'READY',
+                status_reason = NULL,
+                status_since = NOW(),
+                cooldown_until = NULL,
+                failure_count = 0,
+                consecutive_empty_claims = 0,
+                last_success_at = NOW(),
+                last_error = NULL
+            WHERE profile_id = $1
+            RETURNING *
+            """,
+            int(profile_id),
+        )
+    if row is None:
+        return None
+    updated = dict(row)
+    profile.update(updated)
+    return updated
+
+
+async def _record_v4_profile_empty_feed(
+    pool: asyncpg.Pool,
+    profile: dict[str, Any],
+    *,
+    reason: str,
+) -> dict[str, Any] | None:
+    profile_id = profile.get("profile_id")
+    if profile_id is None:
+        return None
+    throttle_threshold = max(1, int(PROFILE_SHADOW_BAN_EMPTY_THRESHOLD))
+    cooldown_threshold = throttle_threshold + 1
+    reason_text = (reason or "").strip()[:2000] or "Marketplace feed returned zero listings."
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE profiles
+            SET
+                consecutive_empty_claims = GREATEST(0, COALESCE(consecutive_empty_claims, 0)) + 1,
+                failure_count = 0,
+                last_failure_at = NOW(),
+                last_error = $2,
+                status = CASE
+                    WHEN GREATEST(0, COALESCE(consecutive_empty_claims, 0)) + 1 >= $4::INT THEN 'COOLDOWN'
+                    WHEN GREATEST(0, COALESCE(consecutive_empty_claims, 0)) + 1 >= $3::INT THEN 'THROTTLED'
+                    ELSE profiles.status
+                END,
+                status_reason = CASE
+                    WHEN GREATEST(0, COALESCE(consecutive_empty_claims, 0)) + 1 >= $4::INT THEN $2
+                    WHEN GREATEST(0, COALESCE(consecutive_empty_claims, 0)) + 1 >= $3::INT THEN $2
+                    ELSE profiles.status_reason
+                END,
+                status_since = CASE
+                    WHEN GREATEST(0, COALESCE(consecutive_empty_claims, 0)) + 1 >= $3::INT THEN NOW()
+                    ELSE profiles.status_since
+                END,
+                cooldown_until = CASE
+                    WHEN GREATEST(0, COALESCE(consecutive_empty_claims, 0)) + 1 >= $4::INT
+                        THEN NOW() + ($5::INT * INTERVAL '1 second')
+                    ELSE NULL
+                END
+            WHERE profile_id = $1
+            RETURNING *
+            """,
+            int(profile_id),
+            reason_text,
+            throttle_threshold,
+            cooldown_threshold,
+            WORKER_ROUTE_COOLDOWN_SECONDS,
+        )
+    if row is None:
+        return None
+    updated = dict(row)
+    profile.update(updated)
+    return updated
+
+
+async def _record_v4_profile_transient_failure(
+    pool: asyncpg.Pool,
+    profile: dict[str, Any],
+    *,
+    reason: str,
+) -> dict[str, Any] | None:
+    profile_id = profile.get("profile_id")
+    if profile_id is None:
+        return None
+    reason_text = (reason or "").strip()[:2000] or "Transient infrastructure failure."
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE profiles
+            SET
+                failure_count = GREATEST(0, COALESCE(failure_count, 0)) + 1,
+                last_failure_at = NOW(),
+                last_error = $2,
+                status = CASE
+                    WHEN GREATEST(0, COALESCE(failure_count, 0)) + 1 >= $5::INT THEN 'COOLDOWN'
+                    WHEN GREATEST(0, COALESCE(failure_count, 0)) + 1 >= $4::INT THEN 'THROTTLED'
+                    WHEN GREATEST(0, COALESCE(failure_count, 0)) + 1 >= $3::INT THEN 'DEGRADED'
+                    ELSE profiles.status
+                END,
+                status_reason = CASE
+                    WHEN GREATEST(0, COALESCE(failure_count, 0)) + 1 >= $3::INT THEN $2
+                    ELSE profiles.status_reason
+                END,
+                status_since = CASE
+                    WHEN GREATEST(0, COALESCE(failure_count, 0)) + 1 >= $3::INT THEN NOW()
+                    ELSE profiles.status_since
+                END,
+                cooldown_until = CASE
+                    WHEN GREATEST(0, COALESCE(failure_count, 0)) + 1 >= $5::INT
+                        THEN NOW() + ($6::INT * INTERVAL '1 second')
+                    ELSE NULL
+                END
+            WHERE profile_id = $1
+            RETURNING *
+            """,
+            int(profile_id),
+            reason_text,
+            WORKER_DEGRADED_CONSECUTIVE_CYCLES,
+            WORKER_THROTTLED_CONSECUTIVE_CYCLES,
+            WORKER_ROUTE_COOLDOWN_BAD_CYCLES,
+            WORKER_ROUTE_COOLDOWN_SECONDS,
+        )
+    if row is None:
+        return None
+    updated = dict(row)
+    profile.update(updated)
+    return updated
+
+
+async def _mark_v4_profile_manual_login_required(
+    pool: asyncpg.Pool,
+    profile: dict[str, Any],
+    *,
+    reason: str,
+    evidence: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    profile_id = profile.get("profile_id")
+    if profile_id is None:
+        return None
+    reason_text = (reason or "").strip()[:2000] or "Manual login required."
+    evidence_payload: str | None = None
+    if evidence:
+        try:
+            evidence_payload = json.dumps(evidence, default=str)
+        except Exception:
+            evidence_payload = None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE profiles
+            SET
+                status = 'NEEDS_LOGIN',
+                status_reason = $2,
+                status_since = NOW(),
+                manual_login_required = TRUE,
+                manual_login_reason = $2,
+                manual_login_required_at = COALESCE(manual_login_required_at, NOW()),
+                quarantined_at = COALESCE(quarantined_at, NOW()),
+                quarantine_reason = $2,
+                quarantine_evidence = COALESCE($3::JSONB, quarantine_evidence),
+                cooldown_until = NULL,
+                failure_count = 0,
+                consecutive_empty_claims = 0,
+                last_failure_at = NOW(),
+                last_error = $2
+            WHERE profile_id = $1
+            RETURNING *
+            """,
+            int(profile_id),
+            reason_text,
+            evidence_payload,
+        )
+    if row is None:
+        return None
+    updated = dict(row)
+    profile.update(updated)
+    return updated
+
+
+async def _complete_v4_family_claim(
+    pool: asyncpg.Pool,
+    family: dict[str, Any],
+    *,
+    variant: dict[str, Any] | None,
+    outcome: FamilyClaimOutcome,
+    metrics: dict[str, int] | None = None,
+    error: str | None = None,
+) -> dict[str, Any] | None:
+    family_id = family.get("family_id")
+    family_token = str(family.get("family_lease_token") or "").strip()
+    if family_id is None or not family_token:
+        return None
+    metrics_payload = metrics or {}
+    listings_saved = max(0, int(metrics_payload.get("listings_saved", 0) or 0))
+    listings_scraped = max(0, int(metrics_payload.get("listings_scraped", 0) or 0))
+    next_hits = max(0, int(family.get("consecutive_hits") or 0)) + 1 if outcome == FamilyClaimOutcome.MATCHES else 0
+    next_empty = max(0, int(family.get("consecutive_empty") or 0)) + 1 if outcome == FamilyClaimOutcome.EMPTY_FEED else 0
+    next_cursor = next_variant_cursor(
+        variant_count=int(family.get("variant_count") or 0),
+        current_cursor=int(family.get("variant_cursor") or 0),
+        outcome=outcome,
+    )
+    next_due_seconds = next_family_due_seconds(
+        family=family,
+        outcome=outcome,
+        listings_saved=listings_saved,
+        consecutive_hits=next_hits,
+        consecutive_empty=next_empty,
+        consecutive_failures=max(0, int(family.get("failure_count") or 0)),
+        dom_backoff_seconds=V4_DOM_INVESTIGATION_BACKOFF_SECONDS,
+        infra_backoff_seconds=V4_INFRA_FAMILY_BACKOFF_SECONDS,
+    )
+    extracted_success = family_claim_succeeded(outcome)
+    error_text = _default_v4_claim_error_text(outcome, error)
+    async with pool.acquire() as conn:
+        variant_id = (variant or {}).get("variant_id")
+        if variant_id is not None:
+            await conn.execute(
+                """
+                UPDATE query_variants
+                SET
+                    last_selected_at = NOW(),
+                    last_success_at = CASE
+                        WHEN $2::BOOLEAN THEN NOW()
+                        ELSE query_variants.last_success_at
+                    END
+                WHERE variant_id = $1
+                """,
+                int(variant_id),
+                extracted_success,
+            )
+        row = await conn.fetchrow(
+            """
+            UPDATE query_families
+            SET
+                family_lease_token = NULL,
+                family_lease_expires_at = NULL,
+                next_due_at = NOW() + ($3::INT * INTERVAL '1 second'),
+                variant_cursor = $4::INT,
+                consecutive_hits = $5::INT,
+                consecutive_empty = $6::INT,
+                last_discovery_at = CASE
+                    WHEN $7::BOOLEAN THEN NOW()
+                    ELSE query_families.last_discovery_at
+                END,
+                last_success_at = CASE
+                    WHEN $8::BOOLEAN THEN NOW()
+                    ELSE query_families.last_success_at
+                END,
+                last_error = CASE
+                    WHEN $8::BOOLEAN THEN NULL
+                    ELSE COALESCE($9::TEXT, query_families.last_error)
+                END
+            WHERE family_id = $1
+              AND family_lease_token = $2
+            RETURNING *
+            """,
+            int(family_id),
+            family_token,
+            int(next_due_seconds),
+            int(next_cursor),
+            int(next_hits),
+            int(next_empty),
+            bool(outcome == FamilyClaimOutcome.MATCHES and max(listings_saved, listings_scraped) > 0),
+            extracted_success,
+            error_text,
+        )
+    return dict(row) if row is not None else None
+
+
+async def _apply_v4_profile_claim_outcome(
+    pool: asyncpg.Pool,
+    profile: dict[str, Any],
+    family: dict[str, Any],
+    claim_result: V4FamilyClaimResult,
+) -> bool:
+    route = _build_v4_family_route(profile, family)
+    reason_text = _default_v4_claim_error_text(claim_result.outcome, claim_result.error_text) or ""
+
+    if claim_result.outcome == FamilyClaimOutcome.MATCHES:
+        await _record_v4_profile_success(pool, profile)
+        return False
+
+    if claim_result.outcome == FamilyClaimOutcome.EMPTY_FEED:
+        updated = await _record_v4_profile_empty_feed(pool, profile, reason=reason_text or "Marketplace feed returned zero listings.")
+        status_value = str((updated or profile).get("status") or "").strip().upper()
+        if status_value == "COOLDOWN" and _should_send_profile_failure_alert(_profile_failure_alert_key(route)):
+            await asyncio.to_thread(
+                _send_telegram_profile_failure_alert,
+                route,
+                reason_text or "Repeated empty-feed results pushed the profile into cooldown.",
+                claim_result.metrics,
+                PROFILE_SHADOW_BAN_EMPTY_THRESHOLD + 1,
+                WORKER_ROUTE_COOLDOWN_SECONDS,
+            )
+        return status_value in {"THROTTLED", "COOLDOWN"}
+
+    if claim_result.outcome == FamilyClaimOutcome.CHECKPOINT:
+        manual_reason = _manual_login_required_reason(claim_result.error_text or claim_result.final_url)
+        evidence = {
+            "family_id": family.get("family_id"),
+            "family_name": family.get("name"),
+            "final_url": claim_result.final_url,
+            "failure_class": claim_result.error_category.value,
+            "outcome": claim_result.outcome.value,
+        }
+        await _mark_v4_profile_manual_login_required(pool, profile, reason=manual_reason, evidence=evidence)
+        if _should_send_manual_login_alert(route, manual_reason):
+            await asyncio.to_thread(_send_telegram_manual_login_required_alert, route, manual_reason)
+        return True
+
+    if claim_result.outcome == FamilyClaimOutcome.DOM_CHANGED:
+        if _should_send_profile_failure_alert(_profile_failure_alert_key(route)):
+            await asyncio.to_thread(
+                _send_telegram_profile_failure_alert,
+                route,
+                reason_text or "Marketplace DOM changed or the feed surface disappeared.",
+                claim_result.metrics,
+                1,
+                V4_DOM_INVESTIGATION_BACKOFF_SECONDS,
+            )
+        return True
+
+    if claim_result.error_category in {ErrorCategory.NAV_TIMEOUT, ErrorCategory.HTTP_5XX, ErrorCategory.UNKNOWN}:
+        await _record_v4_profile_transient_failure(pool, profile, reason=reason_text or "Transient infrastructure failure.")
+    return should_abort_warm_session(claim_result.outcome)
+
+
+async def _release_v4_profile(
+    pool: asyncpg.Pool,
+    profile: dict[str, Any],
+    *,
+    available_after_seconds: int | None = None,
+) -> dict[str, Any] | None:
+    profile_id = profile.get("profile_id")
+    profile_token = str(profile.get("profile_lease_token") or "").strip()
+    if profile_id is None or not profile_token:
+        return None
+    return await release_profile_lease_from_module(
+        pool,
+        profile_id=int(profile_id),
+        lease_token=profile_token,
+        available_after_seconds=available_after_seconds,
+    )
+
+
+async def _start_v4_lease_heartbeat_task(
+    *,
+    label: str,
+    heartbeat_coro: Any,
+    stop_event: asyncio.Event,
+    failure: dict[str, str],
+) -> asyncio.Task:
+    async def _runner() -> None:
+        while not stop_event.is_set() and not _worker_shutdown_requested():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=float(LEASE_HEARTBEAT_SECONDS))
+                continue
+            except asyncio.TimeoutError:
+                pass
+            try:
+                row = await heartbeat_coro()
+            except Exception as exc:
+                row = None
+                error_text = f"{label} lease heartbeat failed: {exc}"
+            else:
+                error_text = f"{label} lease heartbeat lost."
+            if row:
+                continue
+            if "error" not in failure:
+                failure["error"] = error_text
+            stop_event.set()
+            return
+
+    return asyncio.create_task(_runner())
+
+
+async def _claim_dolphin_profile_for_session(
+    pool: asyncpg.Pool,
+    profile: dict[str, Any],
+) -> tuple[str, str | None]:
+    route = _build_v4_family_route(profile)
+    dolphin_profile_id = (os.getenv("DOLPHIN_PROFILE_ID") or "").strip()
+    if dolphin_profile_id:
+        dolphin_lock_id = await _try_acquire_profile_lock(pool, route, dolphin_profile_id)
+        if not dolphin_lock_id:
+            raise ProfileLockUnavailableError(f"Dolphin profile lock unavailable for {dolphin_profile_id}")
+        return dolphin_profile_id, dolphin_lock_id
+
+    from scraper.browser import list_dolphin_profiles
+
+    available_profiles = await list_dolphin_profiles()
+    if not available_profiles:
+        raise NoProxyAvailableError("No Dolphin Anty profiles are available for warm-session execution.")
+    random.shuffle(available_profiles)
+    blacklisted_profiles = await _fetch_dolphin_profile_blacklist(
+        pool,
+        [str(item.get("id") or "").strip() for item in available_profiles],
+    )
+    for item in available_profiles:
+        profile_id = str(item.get("id") or "").strip()
+        if not profile_id or blacklisted_profiles.get(profile_id):
+            continue
+        dolphin_lock_id = await _try_acquire_profile_lock(pool, route, profile_id)
+        if dolphin_lock_id:
+            return profile_id, dolphin_lock_id
+    raise NoProxyAvailableError("No unlocked Dolphin Anty profile is available for warm-session execution.")
+
+
+async def _open_v4_warm_session(pool: asyncpg.Pool, profile: dict[str, Any]) -> V4WarmSessionState:
+    removed_lock_files = scrub_orphaned_chromium_locks(str(profile.get("user_data_dir") or "").strip() or None)
+    if removed_lock_files:
+        logging.info(
+            "[%s] scrubbed orphaned Chromium lock files for %s: %s",
+            WORKER_NAME,
+            profile.get("user_data_dir"),
+            ", ".join(removed_lock_files),
+        )
+    browser_profile_id, browser_profile_lock_id = await _claim_dolphin_profile_for_session(pool, profile)
+    try:
+        session = await open_profile_session(browser_profile_id, headless=WORKER_HEADLESS)
+    except Exception:
+        await _release_profile_lock(pool, _build_v4_family_route(profile), browser_profile_lock_id)
+        raise
+    now_dt = datetime.now(timezone.utc)
+    return V4WarmSessionState(
+        profile=profile,
+        profile_lease_token=str(profile.get("profile_lease_token") or ""),
+        browser_profile_id=browser_profile_id,
+        browser_profile_lock_id=browser_profile_lock_id,
+        session=session,
+        started_at=now_dt,
+        last_activity_at=now_dt,
+    )
+
+
+async def _close_v4_warm_session(
+    pool: asyncpg.Pool,
+    warm_session: V4WarmSessionState | None,
+    *,
+    available_after_seconds: int | None = None,
+) -> None:
+    if warm_session is None:
+        return
+    route = _build_v4_family_route(warm_session.profile)
+    try:
+        await close_profile_session(warm_session.session)
+    finally:
+        try:
+            await _release_profile_lock(pool, route, warm_session.browser_profile_lock_id)
+        finally:
+            await _release_v4_profile(
+                pool,
+                warm_session.profile,
+                available_after_seconds=available_after_seconds,
+            )
+
+
+async def _run_v4_family_claim(
+    pool: asyncpg.Pool,
+    redis_client: Redis,
+    feature_flags: RedisFeatureFlags | None,
+    warm_session: V4WarmSessionState,
+    family: dict[str, Any],
+    variant: dict[str, Any],
+) -> V4FamilyClaimResult:
+    route = _build_v4_family_route(warm_session.profile, family)
+    query_error_text_samples: list[str] = []
+    ingest_tasks: set[asyncio.Task] = set()
+    scrape_event_tasks: set[asyncio.Task] = set()
+    final_url: str | None = None
+    feed_present = False
+    empty_state_detected = False
+    metrics: dict[str, int] = {
+        "listings_saved": 0,
+        "listings_scraped": 0,
+        "listings_parsed": 0,
+        "query_count": 0,
+        "query_result_count": 0,
+        "zero_page_queries": 0,
+        "max_page_cards": 0,
+        "query_error_count": 0,
+        "redirect_count": 0,
+        "profitable_listing_count": 0,
+        "duplicate_listing_count": 0,
+        "postgres_upsert_latency_ms_sum": 0,
+        "postgres_upsert_latency_ms_count": 0,
+        "redis_publish_latency_ms_sum": 0,
+        "redis_publish_latency_ms_count": 0,
+        "redis_stream_publish_latency_ms_sum": 0,
+        "redis_stream_publish_latency_ms_count": 0,
+        "redis_stream_publish_failure_count": 0,
+        "v4_first_seen_gate_latency_ms_sum": 0,
+        "v4_first_seen_gate_latency_ms_count": 0,
+        "v4_first_seen_claim_count": 0,
+        "v4_first_seen_duplicate_count": 0,
+        "v4_update_gate_latency_ms_sum": 0,
+        "v4_update_gate_latency_ms_count": 0,
+        "v4_update_event_claim_count": 0,
+        "v4_update_event_duplicate_count": 0,
+        "v4_dedupe_fallback_count": 0,
+        "notification_delivery_latency_ms_sum": 0,
+        "notification_delivery_latency_ms_count": 0,
+        "end_to_end_alert_latency_ms_sum": 0,
+        "end_to_end_alert_latency_ms_count": 0,
+    }
+    query_override = _v4_variant_queries(variant)
+    selected_query = query_override[0] if query_override else None
+
+    def _on_progress(payload: dict[str, Any]) -> None:
+        nonlocal final_url, feed_present, empty_state_detected
+        event = payload.get("event")
+        if event == "query_start":
+            metrics["query_count"] += 1
+            return
+        if event == "query_result":
+            found_count = int(payload.get("found", 0) or 0)
+            page_cards = int(payload.get("page_cards", 0) or 0)
+            metrics["listings_scraped"] += max(0, found_count)
+            metrics["listings_parsed"] += max(0, found_count)
+            metrics["query_result_count"] += 1
+            metrics["max_page_cards"] = max(metrics["max_page_cards"], page_cards)
+            if page_cards <= 0:
+                metrics["zero_page_queries"] += 1
+            if found_count > 0:
+                task = asyncio.create_task(
+                    _record_scrape_events(
+                        pool=pool,
+                        route_name=str(family.get("name") or ""),
+                        scrape_events=[(datetime.now(timezone.utc), found_count)],
+                    )
+                )
+                scrape_event_tasks.add(task)
+                task.add_done_callback(lambda done_task: scrape_event_tasks.discard(done_task))
+            final_url = str(payload.get("final_url") or final_url or "").strip() or final_url
+            feed_present = feed_present or bool(payload.get("feed_present"))
+            empty_state_detected = empty_state_detected or bool(payload.get("empty_state_detected"))
+            return
+        if event == "query_error":
+            metrics["query_error_count"] += 1
+            error_text = str(payload.get("error") or "").strip()
+            if error_text:
+                query_error_text_samples.append(error_text[:300])
+                if len(query_error_text_samples) > 5:
+                    query_error_text_samples.pop(0)
+            final_url = str(payload.get("final_url") or final_url or "").strip() or final_url
+            feed_present = feed_present or bool(payload.get("feed_present"))
+            empty_state_detected = empty_state_detected or bool(payload.get("empty_state_detected"))
+            return
+        if event != "listing_saved":
+            return
+
+        listing = payload.get("listing")
+        if not isinstance(listing, dict):
+            return
+        metrics["listings_saved"] += 1
+        if _is_profitable_listing_signal(listing):
+            metrics["profitable_listing_count"] += 1
+        metadata = {
+            "route_name": family.get("name"),
+            "query": payload.get("query"),
+            "query_index": payload.get("query_index"),
+            "query_total": payload.get("query_total"),
+            "query_shard_key": f"v4-family:{family.get('family_id')}",
+            "listing_seen_ts": payload.get("discovery_ts") or utc_now_iso(),
+            "discovery_ts": payload.get("discovery_ts") or utc_now_iso(),
+            "source": "v4",
+        }
+        task = asyncio.create_task(_process_listing_event(pool, redis_client, feature_flags, listing, metadata, metrics))
+        ingest_tasks.add(task)
+        task.add_done_callback(lambda done_task: ingest_tasks.discard(done_task))
+
+    error_text: str | None = None
+    await _upsert_worker_heartbeat(
+        pool=pool,
+        route_name=str(family.get("name") or ""),
+        status="running",
+        listings_saved=0,
+        query_count=0,
+        last_error=None,
+        started_at=datetime.now(timezone.utc),
+        route=route,
+    )
+    try:
+        execution = await execute_family_claim(
+            warm_session.session,
+            progress_callback=_on_progress,
+            stop_event=_worker_shutdown_event(),
+            search_queries=query_override,
+            scroll_target_cards_override=WORKER_SCROLL_TARGET_CARDS,
+            scroll_max_rounds_override=WORKER_SCROLL_MAX_ROUNDS,
+            apply_inter_query_delay=False,
+        )
+        for diagnostic in execution.query_diagnostics:
+            diagnostic_url = str(diagnostic.get("final_url") or "").strip()
+            if diagnostic_url:
+                final_url = diagnostic_url
+            feed_present = feed_present or bool(diagnostic.get("feed_present"))
+            empty_state_detected = empty_state_detected or bool(diagnostic.get("empty_state_detected"))
+    except Exception as exc:
+        error_text = str(exc) or "unknown v4 family error"
+    finally:
+        if ingest_tasks:
+            results = await asyncio.gather(*list(ingest_tasks), return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    logging.error("[%s] v4 listing ingest error: %s", WORKER_NAME, result)
+        if scrape_event_tasks:
+            results = await asyncio.gather(*list(scrape_event_tasks), return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    logging.warning("[%s] failed to record v4 scrape event: %s", WORKER_NAME, result)
+        await _cleanup_old_scrape_events(pool)
+
+    heartbeat_status = "idle" if not error_text else "error"
+    await _upsert_worker_heartbeat(
+        pool=pool,
+        route_name=str(family.get("name") or ""),
+        status=heartbeat_status,
+        listings_saved=metrics["listings_saved"],
+        query_count=metrics["query_count"],
+        last_error=error_text or ("; ".join(query_error_text_samples) if query_error_text_samples else None),
+        started_at=datetime.now(timezone.utc),
+        finished_at=datetime.now(timezone.utc),
+        route=route,
+    )
+    if selected_query:
+        family["selected_query"] = selected_query
+    error_category = classify_error(error_text)
+    outcome = classify_family_claim(
+        listings_saved=metrics["listings_saved"],
+        listings_scraped=metrics["listings_scraped"],
+        error_text=error_text,
+        final_url=final_url,
+        feed_present=feed_present,
+        empty_state_detected=empty_state_detected,
+        error_category=error_category,
+    )
+    return V4FamilyClaimResult(
+        metrics=metrics,
+        outcome=outcome,
+        error_text=_default_v4_claim_error_text(outcome, error_text),
+        error_category=error_category,
+        final_url=final_url,
+        feed_present=feed_present,
+        empty_state_detected=empty_state_detected,
+    )
+
+
+async def _run_v4_worker_loop(
+    pool: asyncpg.Pool,
+    redis_client: Redis,
+    feature_flags: RedisFeatureFlags | None,
+    runtime_config: RedisRuntimeConfig | None,
+) -> None:
+    _ = runtime_config
+    logging.info("[%s] V4 warm-session worker loop online", WORKER_NAME)
+    config = _v4_warm_session_config()
+
+    while not _worker_shutdown_requested():
+        if feature_flags is not None and not await feature_flags.is_enabled("ENABLE_V4_WARM_RUNTIME"):
+            logging.info("[%s] V4 warm runtime flag disabled; returning to V3 loop.", WORKER_NAME)
+            return
+
+        profile = await _claim_v4_profile(pool)
+        if profile is None:
+            await _upsert_worker_heartbeat(
+                pool=pool,
+                route_name="",
+                status="wait_profile_lock",
+                listings_saved=0,
+                query_count=0,
+                last_error="No claimable V4 profile is currently available.",
+                started_at=datetime.now(timezone.utc),
+                finished_at=datetime.now(timezone.utc),
+                route=None,
+            )
+            await asyncio.sleep(float(WORKER_NO_PROFILE_BACKOFF_SECONDS))
+            continue
+
+        warm_session: V4WarmSessionState | None = None
+        profile_heartbeat_stop = asyncio.Event()
+        profile_heartbeat_failure: dict[str, str] = {}
+        idle_close = False
+        try:
+            warm_session = await _open_v4_warm_session(pool, profile)
+            profile_heartbeat_task = await _start_v4_lease_heartbeat_task(
+                label="profile",
+                heartbeat_coro=functools.partial(
+                    heartbeat_profile_lease_from_module,
+                    pool,
+                    profile_id=int(profile["profile_id"]),
+                    lease_token=str(profile.get("profile_lease_token") or ""),
+                    lease_seconds=PROFILE_LEASE_SECONDS,
+                ),
+                stop_event=profile_heartbeat_stop,
+                failure=profile_heartbeat_failure,
+            )
+
+            try:
+                while not _worker_shutdown_requested():
+                    recycle_reason = evaluate_warm_session_state(
+                        started_at=warm_session.started_at,
+                        last_activity_at=warm_session.last_activity_at,
+                        executed_claims=warm_session.executed_claims,
+                        config=config,
+                    )
+                    if recycle_reason is not None:
+                        idle_close = recycle_reason == "idle_close"
+                        break
+
+                    family = await _claim_v4_family(pool)
+                    if family is None:
+                        await _upsert_worker_heartbeat(
+                            pool=pool,
+                            route_name="",
+                            status="scheduled_wait",
+                            listings_saved=0,
+                            query_count=0,
+                            last_error="No due V4 family is currently available.",
+                            started_at=datetime.now(timezone.utc),
+                            finished_at=datetime.now(timezone.utc),
+                            route=_build_v4_family_route(warm_session.profile),
+                        )
+                        await asyncio.sleep(min(5.0, float(LEASE_HEARTBEAT_SECONDS)))
+                        continue
+
+                    variant = await _load_v4_family_variant(pool, family)
+                    if variant is None:
+                        await _complete_v4_family_claim(
+                            pool,
+                            family,
+                            variant=None,
+                            outcome=FamilyClaimOutcome.INFRASTRUCTURE_ERROR,
+                            metrics={"listings_saved": 0, "listings_scraped": 0},
+                            error="No enabled query variant is available for this family.",
+                        )
+                        continue
+
+                    family_heartbeat_stop = asyncio.Event()
+                    family_heartbeat_failure: dict[str, str] = {}
+                    family_heartbeat_task = await _start_v4_lease_heartbeat_task(
+                        label="family",
+                        heartbeat_coro=functools.partial(
+                            heartbeat_family_lease_from_module,
+                            pool,
+                            family_id=int(family["family_id"]),
+                            lease_token=str(family.get("family_lease_token") or ""),
+                            lease_seconds=FAMILY_LEASE_SECONDS,
+                        ),
+                        stop_event=family_heartbeat_stop,
+                        failure=family_heartbeat_failure,
+                    )
+                    claim_result: V4FamilyClaimResult | None = None
+                    abort_session = False
+                    try:
+                        claim_result = await _run_v4_family_claim(
+                            pool=pool,
+                            redis_client=redis_client,
+                            feature_flags=feature_flags,
+                            warm_session=warm_session,
+                            family=family,
+                            variant=variant,
+                        )
+                    finally:
+                        family_heartbeat_stop.set()
+                        await asyncio.gather(family_heartbeat_task, return_exceptions=True)
+                        if claim_result is None:
+                            claim_result = V4FamilyClaimResult(
+                                metrics={"listings_saved": 0, "listings_scraped": 0},
+                                outcome=FamilyClaimOutcome.INFRASTRUCTURE_ERROR,
+                                error_text=family_heartbeat_failure.get("error") or "family claim did not produce a result",
+                                error_category=classify_error(family_heartbeat_failure.get("error")),
+                            )
+                        elif family_heartbeat_failure.get("error") and not claim_result.error_text:
+                            claim_result = V4FamilyClaimResult(
+                                metrics=claim_result.metrics,
+                                outcome=FamilyClaimOutcome.INFRASTRUCTURE_ERROR,
+                                error_text=family_heartbeat_failure["error"],
+                                error_category=classify_error(family_heartbeat_failure["error"]),
+                                final_url=claim_result.final_url,
+                                feed_present=claim_result.feed_present,
+                                empty_state_detected=claim_result.empty_state_detected,
+                            )
+                        await _complete_v4_family_claim(
+                            pool,
+                            family,
+                            variant=variant,
+                            outcome=claim_result.outcome,
+                            metrics=claim_result.metrics,
+                            error=claim_result.error_text,
+                        )
+                        abort_session = await _apply_v4_profile_claim_outcome(
+                            pool,
+                            warm_session.profile,
+                            family,
+                            claim_result,
+                        )
+
+                    warm_session.executed_claims += 1
+                    warm_session.last_activity_at = datetime.now(timezone.utc)
+                    if claim_result.outcome == FamilyClaimOutcome.MATCHES:
+                        metrics = claim_result.metrics
+                        logging.info(
+                            "[%s] V4 family claim complete family=%s query=%s saved=%s scraped=%s",
+                            WORKER_NAME,
+                            family.get("name"),
+                            family.get("selected_query"),
+                            metrics.get("listings_saved", 0),
+                            metrics.get("listings_scraped", 0),
+                        )
+                    elif claim_result.outcome == FamilyClaimOutcome.EMPTY_FEED:
+                        logging.info(
+                            "[%s] V4 family claim empty_feed family=%s query=%s final_url=%s",
+                            WORKER_NAME,
+                            family.get("name"),
+                            family.get("selected_query"),
+                            claim_result.final_url or "",
+                        )
+                    else:
+                        logging.warning(
+                            "[%s] V4 family claim %s ended with outcome=%s error=%s",
+                            WORKER_NAME,
+                            family.get("name"),
+                            claim_result.outcome.value,
+                            claim_result.error_text,
+                        )
+                        break
+                    if abort_session:
+                        logging.info(
+                            "[%s] V4 warm session recycling after family outcome=%s profile_status=%s",
+                            WORKER_NAME,
+                            claim_result.outcome.value,
+                            warm_session.profile.get("status"),
+                        )
+                        break
+                    pause_seconds = next_v4_pause_seconds(
+                        min_pause_seconds=config.min_pause_seconds,
+                        max_pause_seconds=config.max_pause_seconds,
+                        rng=random,
+                    )
+                    if pause_seconds > 0 and not _worker_shutdown_requested():
+                        await asyncio.sleep(pause_seconds)
+            finally:
+                profile_heartbeat_stop.set()
+                await asyncio.gather(profile_heartbeat_task, return_exceptions=True)
+                if profile_heartbeat_failure.get("error"):
+                    logging.warning("[%s] %s", WORKER_NAME, profile_heartbeat_failure["error"])
+        finally:
+            if warm_session is not None:
+                await _close_v4_warm_session(
+                    pool,
+                    warm_session,
+                    available_after_seconds=PROFILE_MIN_REUSE_SECONDS if idle_close else None,
+                )
+            else:
+                await _release_v4_profile(
+                    pool,
+                    profile,
+                    available_after_seconds=PROFILE_MIN_REUSE_SECONDS if idle_close else None,
+                )
+
+    logging.info("[%s] V4 warm-session worker loop drained.", WORKER_NAME)
 
 
 def _select_execution_profile(profiles: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -3067,17 +4412,23 @@ async def _upsert_listing(
     listing: dict[str, Any],
     *,
     background_enrichment_enabled: bool = False,
+    discovery_ts: str | None = None,
+    event_name: str | None = None,
+    mutable_hash: str | None = None,
 ) -> ListingUpsertResult:
     listing_id = str(listing.get("id") or "").strip()
     if not listing_id:
         return ListingUpsertResult(created=False, stream_state_changed=False)
 
     source_seen_at = datetime.now(timezone.utc)
+    discovery_at = _parse_optional_timestamp(discovery_ts) or source_seen_at
     next_stream_state = extract_listing_stream_state(listing)
     hot_listing, cold_fields, enrichment_source_hash = split_listing_for_fast_path(listing)
     hot_thumbnail_url = hot_listing.get("thumbnail_url")
     max_buy_price_value = _listing_max_buy_price(hot_listing if background_enrichment_enabled else listing)
     should_enqueue_enrichment = False
+    created = False
+    stream_state_changed = False
 
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -3223,9 +4574,34 @@ async def _upsert_listing(
                     source_seen_at if has_cold_enrichment_payload(cold_fields) else None,
                     source_seen_at,
                 )
-    created = existing_row is None
-    previous_stream_state = extract_row_stream_state(existing_row)
-    stream_state_changed = created or previous_stream_state != next_stream_state
+            created = existing_row is None
+            previous_stream_state = extract_row_stream_state(existing_row)
+            stream_state_changed = created or previous_stream_state != next_stream_state
+            effective_event_name = str(event_name or ("listing_created" if created else "listing_updated")).strip() or (
+                "listing_created" if created else "listing_updated"
+            )
+            persisted_at = datetime.now(timezone.utc)
+            await conn.execute(
+                """
+                UPDATE listings
+                SET
+                    discovery_ts = COALESCE(listings.discovery_ts, $2),
+                    first_seen_at = COALESCE(listings.first_seen_at, $2, $3, listings.created_at),
+                    last_seen_at = $3,
+                    current_price = $4,
+                    last_price_hash = COALESCE($5, listings.last_price_hash),
+                    persisted_at = $6,
+                    last_event_kind = $7
+                WHERE id = $1
+                """,
+                listing_id,
+                discovery_at,
+                source_seen_at,
+                listing.get("price"),
+                str(mutable_hash or "").strip() or None,
+                persisted_at,
+                effective_event_name,
+            )
     return ListingUpsertResult(
         created=created,
         stream_state_changed=stream_state_changed,
@@ -3248,6 +4624,9 @@ async def _publish_listing_event(
         "query": metadata.get("query"),
         "query_index": metadata.get("query_index"),
         "query_total": metadata.get("query_total"),
+        "discovery_ts": metadata.get("discovery_ts"),
+        "dedupe_kind": metadata.get("dedupe_kind"),
+        "mutable_hash": metadata.get("mutable_hash"),
         "listing": listing,
     }
     publish_started = time.monotonic()
@@ -3291,10 +4670,42 @@ async def _process_listing_event(
     metadata: dict[str, Any],
     cycle_metrics: dict[str, int],
 ) -> None:
+    metadata = dict(metadata or {})
     listing_id = str(listing.get("id") or "").strip() or None
-    listing_seen_ts = str(metadata.get("listing_seen_ts") or "").strip() or utc_now_iso()
+    listing_seen_ts = str(metadata.get("discovery_ts") or metadata.get("listing_seen_ts") or "").strip() or utc_now_iso()
+    metadata["discovery_ts"] = listing_seen_ts
+    metadata["listing_seen_ts"] = listing_seen_ts
     route_name = str(metadata.get("route_name") or "").strip() or None
     metadata_event_id = str(metadata.get("event_id") or "").strip() or None
+    dedupe_decision = await _resolve_v4_listing_dedupe(
+        redis_client=redis_client,
+        feature_flags=feature_flags,
+        listing=listing,
+        metadata=metadata,
+        cycle_metrics=cycle_metrics,
+    )
+    if dedupe_decision is not None:
+        if dedupe_decision.discovery_ts:
+            listing_seen_ts = dedupe_decision.discovery_ts
+            metadata["discovery_ts"] = dedupe_decision.discovery_ts
+            metadata["listing_seen_ts"] = dedupe_decision.discovery_ts
+        if dedupe_decision.dedupe_kind and dedupe_decision.dedupe_kind != "legacy":
+            metadata["dedupe_kind"] = dedupe_decision.dedupe_kind
+        if dedupe_decision.mutable_hash:
+            metadata["mutable_hash"] = dedupe_decision.mutable_hash
+        if not dedupe_decision.should_process:
+            emit_json_log(
+                "v4_listing_dedupe_suppressed",
+                listing_id=listing_id,
+                worker_name=WORKER_NAME,
+                route_name=route_name,
+                listing_seen_ts=listing_seen_ts,
+                dedupe_kind=dedupe_decision.dedupe_kind,
+                first_seen_status=dedupe_decision.first_seen_status,
+                update_status=dedupe_decision.update_status,
+            )
+            return
+
     background_enrichment_enabled = False
     if feature_flags is not None:
         background_enrichment_enabled = await feature_flags.is_enabled("ENABLE_BACKGROUND_ENRICHMENT")
@@ -3305,16 +4716,26 @@ async def _process_listing_event(
             pool,
             listing,
             background_enrichment_enabled=background_enrichment_enabled,
+            discovery_ts=listing_seen_ts,
+            event_name=(dedupe_decision.event_name if dedupe_decision is not None else None),
+            mutable_hash=(dedupe_decision.mutable_hash if dedupe_decision is not None else None),
         )
     )
-    created = upsert_result.created
-    if not created:
+    database_created = upsert_result.created
+    event_name = (
+        dedupe_decision.event_name
+        if dedupe_decision is not None and dedupe_decision.event_name
+        else ("listing_created" if database_created else "listing_updated")
+    )
+    created = event_name == "listing_created"
+    if not database_created and not (
+        dedupe_decision is not None and dedupe_decision.dedupe_kind in {"first_seen", "price_change"}
+    ):
         _increment_counter_metric(cycle_metrics, "duplicate_listing_count")
     listing_persisted_ts = utc_now_iso()
     postgres_upsert_latency_ms = monotonic_duration_ms(upsert_started)
     _increment_latency_metric(cycle_metrics, "postgres_upsert_latency_ms", postgres_upsert_latency_ms)
 
-    event_name = "listing_created" if created else "listing_updated"
     stream_event_id: str | None = None
     stream_event_published_ts: str | None = None
     stream_publish_latency_ms: int | None = None
@@ -3322,7 +4743,10 @@ async def _process_listing_event(
     event_id = metadata_event_id
     notification_consumer_enabled = False
     if feature_flags is not None and await feature_flags.is_enabled("ENABLE_REDIS_STREAM_EVENTS"):
-        if upsert_result.stream_state_changed:
+        should_publish_stream = upsert_result.stream_state_changed or bool(
+            dedupe_decision is not None and dedupe_decision.force_stream_publish
+        )
+        if should_publish_stream:
             stream_publish_status = "published"
             stream_event = build_listing_stream_event(
                 event_name=event_name,
@@ -3475,6 +4899,11 @@ async def _process_listing_event(
         stream_event_published_ts=stream_event_published_ts,
         stream_publish_status=stream_publish_status,
         redis_stream_publish_latency_ms=stream_publish_latency_ms,
+        dedupe_kind=metadata.get("dedupe_kind"),
+        first_seen_status=(dedupe_decision.first_seen_status if dedupe_decision is not None else "disabled"),
+        update_status=(dedupe_decision.update_status if dedupe_decision is not None else "disabled"),
+        fallback_status=(dedupe_decision.fallback_status if dedupe_decision is not None else "not_needed"),
+        mutable_hash=metadata.get("mutable_hash"),
         listing_seen_ts=listing_seen_ts,
         listing_persisted_ts=listing_persisted_ts,
         listing_event_published_ts=listing_event_published_ts,
@@ -3648,6 +5077,15 @@ async def _run_scrape_cycle(
         "redis_stream_publish_latency_ms_sum": 0,
         "redis_stream_publish_latency_ms_count": 0,
         "redis_stream_publish_failure_count": 0,
+        "v4_first_seen_gate_latency_ms_sum": 0,
+        "v4_first_seen_gate_latency_ms_count": 0,
+        "v4_first_seen_claim_count": 0,
+        "v4_first_seen_duplicate_count": 0,
+        "v4_update_gate_latency_ms_sum": 0,
+        "v4_update_gate_latency_ms_count": 0,
+        "v4_update_event_claim_count": 0,
+        "v4_update_event_duplicate_count": 0,
+        "v4_dedupe_fallback_count": 0,
         "notification_delivery_latency_ms_sum": 0,
         "notification_delivery_latency_ms_count": 0,
         "end_to_end_alert_latency_ms_sum": 0,
@@ -3850,7 +5288,9 @@ async def _run_scrape_cycle(
             "query_index": payload.get("query_index"),
             "query_total": payload.get("query_total"),
             "query_shard_key": query_shard_key,
-            "listing_seen_ts": utc_now_iso(),
+            "listing_seen_ts": payload.get("discovery_ts") or utc_now_iso(),
+            "discovery_ts": payload.get("discovery_ts") or utc_now_iso(),
+            "source": route.get("source"),
         }
 
         task = asyncio.create_task(_process_listing_event(pool, redis_client, feature_flags, listing, metadata, metrics))
@@ -4098,6 +5538,15 @@ async def _run_scrape_cycle_with_retry(
         "redis_stream_publish_latency_ms_sum": 0,
         "redis_stream_publish_latency_ms_count": 0,
         "redis_stream_publish_failure_count": 0,
+        "v4_first_seen_gate_latency_ms_sum": 0,
+        "v4_first_seen_gate_latency_ms_count": 0,
+        "v4_first_seen_claim_count": 0,
+        "v4_first_seen_duplicate_count": 0,
+        "v4_update_gate_latency_ms_sum": 0,
+        "v4_update_gate_latency_ms_count": 0,
+        "v4_update_event_claim_count": 0,
+        "v4_update_event_duplicate_count": 0,
+        "v4_dedupe_fallback_count": 0,
         "notification_delivery_latency_ms_sum": 0,
         "notification_delivery_latency_ms_count": 0,
         "end_to_end_alert_latency_ms_sum": 0,
@@ -4290,6 +5739,14 @@ async def _run_scrape_cycle_with_retry(
 
 
 async def _main() -> None:
+    shutdown_event = _worker_shutdown_event()
+    shutdown_event.clear()
+    loop = asyncio.get_running_loop()
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(signum, _request_worker_shutdown)
+        except (NotImplementedError, RuntimeError, ValueError):
+            signal.signal(signum, lambda *_args: _request_worker_shutdown())
 
     pool = await asyncpg.create_pool(
         host=PGHOST,
@@ -4357,7 +5814,10 @@ async def _run_worker_loop(
     logging.info("[%s] worker loop online", WORKER_NAME)
     global _SINGLE_ROUTE_ENFORCEMENT_ACTIVE, _CENTRAL_ROUTE_DISPATCH_COUNT
     try:
-        while True:
+        while not _worker_shutdown_requested():
+            if feature_flags is not None and await feature_flags.is_enabled("ENABLE_V4_WARM_RUNTIME"):
+                await _run_v4_worker_loop(pool=pool, redis_client=redis_client, feature_flags=feature_flags, runtime_config=runtime_config)
+                continue
             cycle_started_monotonic = time.monotonic()
             route = None
             selected_profile: dict[str, Any] | None = None
@@ -4597,15 +6057,15 @@ async def _run_worker_loop(
                 if route is None:
                     # No route found, wait and try again
                     sleep_target_seconds = sleep_target_seconds if has_configured_routes else effective_interval_seconds
-                    await asyncio.sleep(
-                        compute_sleep_seconds(
-                            base_interval=sleep_target_seconds,
-                            elapsed=0,
-                            jitter_pct=SCRAPE_INTERVAL_JITTER_PCT,
-                            rng=random,
-                            min_sleep_seconds=0.1,
-                        )
+                    sleep_seconds = compute_sleep_seconds(
+                        base_interval=sleep_target_seconds,
+                        elapsed=0,
+                        jitter_pct=SCRAPE_INTERVAL_JITTER_PCT,
+                        rng=random,
+                        min_sleep_seconds=0.1,
                     )
+                    if sleep_seconds > 0 and not _worker_shutdown_requested():
+                        await asyncio.sleep(sleep_seconds)
                     continue
 
                 route_name = str(route.get("route_name") or "unknown")
@@ -5138,7 +6598,7 @@ async def _run_worker_loop(
                         rng=random,
                         min_sleep_seconds=0.1,
                     )
-                    if sleep_seconds > 0:
+                    if sleep_seconds > 0 and not _worker_shutdown_requested():
                         await asyncio.sleep(sleep_seconds)
             except Exception as exc:
                 logging.exception("[%s] scrape cycle failed: %s", WORKER_NAME, exc)
@@ -5184,7 +6644,7 @@ async def _run_worker_loop(
                     rng=random,
                     min_sleep_seconds=0.1,
                 )
-                if sleep_seconds > 0:
+                if sleep_seconds > 0 and not _worker_shutdown_requested():
                     await asyncio.sleep(sleep_seconds)
     except asyncio.CancelledError:
         logging.info("[%s] worker loop cancelled", WORKER_NAME)
