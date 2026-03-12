@@ -68,6 +68,24 @@ class MarketplaceClaimExecution:
     accessory_removed: int = 0
 
 
+MARKETPLACE_FEED_SELECTORS: tuple[str, ...] = (
+    '[data-testid="marketplace_feed_item"]',
+    '[role="feed"]',
+    '[data-pagelet*="BrowseFeed"]',
+    'a[href*="/marketplace/item/"]',
+)
+
+MARKETPLACE_EMPTY_STATE_MARKERS: tuple[str, ...] = (
+    "no listings found",
+    "no results found",
+    "try a different search",
+    "we couldn't find anything",
+    "no matches found",
+    "there are no products matching your search",
+    "sorry, this content isn't available right now",
+)
+
+
 def _resolve_active_queries(
     runtime_settings: Dict[str, Any],
     search_queries: Optional[List[str]] = None,
@@ -189,6 +207,69 @@ async def _inspect_marketplace_results_surface(page) -> Dict[str, Any]:
         "marketplace_shell_detected": bool(payload.get("marketplace_shell_detected")),
         "feed_present": bool(payload.get("feed_present")),
         "empty_state_detected": bool(payload.get("empty_state_detected")),
+    }
+
+
+async def _wait_for_marketplace_results_surface(
+    page: Any,
+    *,
+    timeout_ms: int = 20000,
+) -> Dict[str, Any]:
+    safe_timeout_ms = max(1000, int(timeout_ms or 0))
+    networkidle_reached = False
+    wait_error: str | None = None
+
+    try:
+        await page.wait_for_load_state("networkidle", timeout=min(safe_timeout_ms, 15000))
+        networkidle_reached = True
+    except Exception as exc:
+        wait_error = str(exc) or exc.__class__.__name__
+
+    try:
+        await page.wait_for_function(
+            """
+            ({ feedSelectors, emptyMarkers }) => {
+                const href = String(window.location.href || "").toLowerCase();
+                if (href.includes("checkpoint")) {
+                    return true;
+                }
+                if (href.includes("/login") && !href.includes("/marketplace")) {
+                    return true;
+                }
+
+                const text = String(document.body?.innerText || "").toLowerCase();
+                const hasEmptyState = emptyMarkers.some((marker) => text.includes(marker));
+                if (hasEmptyState) {
+                    return true;
+                }
+
+                return feedSelectors.some((selector) => {
+                    try {
+                        return Boolean(document.querySelector(selector));
+                    } catch (error) {
+                        return false;
+                    }
+                });
+            }
+            """,
+            {
+                "feedSelectors": list(MARKETPLACE_FEED_SELECTORS),
+                "emptyMarkers": list(MARKETPLACE_EMPTY_STATE_MARKERS),
+            },
+            timeout=safe_timeout_ms,
+        )
+    except Exception as exc:
+        if wait_error is None:
+            wait_error = str(exc) or exc.__class__.__name__
+
+    from scraper.legacy_utils import _detect_manual_login_required_state
+
+    surface = await _inspect_marketplace_results_surface(page)
+    return {
+        "networkidle_reached": networkidle_reached,
+        "wait_error": wait_error,
+        "manual_login": await _detect_manual_login_required_state(page),
+        **surface,
     }
 
 
@@ -389,7 +470,8 @@ async def _execute_queries_on_page(
 
         try:
             await page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
-            await random_delay(3, 6)
+            page_wait = await _wait_for_marketplace_results_surface(page)
+            await random_delay(0.8, 1.8)
 
             checkpoint_reason = await _detect_manual_login_required_state(page)
             if checkpoint_reason:
@@ -494,6 +576,8 @@ async def _execute_queries_on_page(
             graphql_count = len(graphql_candidates)
             dom_count = len(normalized_dom_listings)
             page_state = await _inspect_marketplace_results_surface(page)
+            page_state["networkidle_reached"] = bool(page_wait.get("networkidle_reached"))
+            page_state["surface_wait_error"] = page_wait.get("wait_error")
             emit_progress(
                 "query_result",
                 query=query,
@@ -528,6 +612,8 @@ async def _execute_queries_on_page(
             error_text = str(e)
             print(f"  Error scraping query '{query}': {error_text}")
             page_state = await _inspect_marketplace_results_surface(page)
+            page_state["networkidle_reached"] = bool(page_wait.get("networkidle_reached")) if "page_wait" in locals() else False
+            page_state["surface_wait_error"] = page_wait.get("wait_error") if "page_wait" in locals() else None
             emit_progress(
                 "query_error",
                 query=query,
