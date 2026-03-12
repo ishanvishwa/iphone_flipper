@@ -226,6 +226,8 @@ async def _backfill_central_scheduler_tables(conn: asyncpg.Connection) -> None:
                 INSERT INTO execution_profiles (
                     user_data_dir,
                     worker_name,
+                    dolphin_profile_id,
+                    dolphin_profile_name,
                     is_enabled,
                     status,
                     status_reason,
@@ -242,7 +244,7 @@ async def _backfill_central_scheduler_tables(conn: asyncpg.Connection) -> None:
                     consecutive_failures,
                     last_error
                 ) VALUES (
-                    $1, $2, $3,
+                    $1, $2, NULL, NULL, $3,
                     CASE
                         WHEN NOT $3::BOOLEAN THEN 'DISABLED'
                         WHEN COALESCE($7::BOOLEAN, FALSE) THEN 'NEEDS_LOGIN'
@@ -253,6 +255,8 @@ async def _backfill_central_scheduler_tables(conn: asyncpg.Connection) -> None:
                 )
                 ON CONFLICT (user_data_dir) DO UPDATE SET
                     worker_name = EXCLUDED.worker_name,
+                    dolphin_profile_id = COALESCE(execution_profiles.dolphin_profile_id, EXCLUDED.dolphin_profile_id),
+                    dolphin_profile_name = COALESCE(execution_profiles.dolphin_profile_name, EXCLUDED.dolphin_profile_name),
                     is_enabled = EXCLUDED.is_enabled,
                     status = CASE
                         WHEN EXCLUDED.is_enabled = FALSE THEN 'DISABLED'
@@ -300,6 +304,8 @@ async def _backfill_central_scheduler_tables(conn: asyncpg.Connection) -> None:
         SELECT
             worker_name,
             route_user_data_dir,
+            route_profile_id,
+            route_profile_name,
             last_run_started_at,
             last_run_finished_at,
             last_error
@@ -316,6 +322,8 @@ async def _backfill_central_scheduler_tables(conn: asyncpg.Connection) -> None:
             INSERT INTO execution_profiles (
                 user_data_dir,
                 worker_name,
+                dolphin_profile_id,
+                dolphin_profile_name,
                 is_enabled,
                 status,
                 status_since,
@@ -323,16 +331,20 @@ async def _backfill_central_scheduler_tables(conn: asyncpg.Connection) -> None:
                 last_success_at,
                 last_error
             ) VALUES (
-                $1, $2, TRUE, 'READY', NOW(), $3, $4, $5
+                $1, $2, NULL, NULL, TRUE, 'READY', NOW(), $3, $4, $5
             )
             ON CONFLICT (user_data_dir) DO UPDATE SET
                 worker_name = EXCLUDED.worker_name,
+                dolphin_profile_id = COALESCE(execution_profiles.dolphin_profile_id, EXCLUDED.dolphin_profile_id),
+                dolphin_profile_name = COALESCE(execution_profiles.dolphin_profile_name, EXCLUDED.dolphin_profile_name),
                 last_selected_at = COALESCE(execution_profiles.last_selected_at, EXCLUDED.last_selected_at),
                 last_success_at = COALESCE(execution_profiles.last_success_at, EXCLUDED.last_success_at),
                 last_error = COALESCE(execution_profiles.last_error, EXCLUDED.last_error)
             """,
             profile_dir,
             worker_name,
+            str(row["route_profile_id"] or "").strip() or None,
+            str(row["route_profile_name"] or "").strip() or None,
             row["last_run_started_at"],
             row["last_run_finished_at"],
             str(row["last_error"] or "").strip() or None,
@@ -345,6 +357,8 @@ async def _backfill_v4_scheduler_tables(conn: asyncpg.Connection) -> None:
         INSERT INTO profiles (
             worker_name,
             user_data_dir,
+            dolphin_profile_id,
+            dolphin_profile_name,
             is_enabled,
             status,
             status_reason,
@@ -366,6 +380,8 @@ async def _backfill_v4_scheduler_tables(conn: asyncpg.Connection) -> None:
         SELECT
             ep.worker_name,
             ep.user_data_dir,
+            ep.dolphin_profile_id,
+            ep.dolphin_profile_name,
             ep.is_enabled,
             CASE
                 WHEN ep.is_enabled = FALSE THEN 'DISABLED'
@@ -398,6 +414,8 @@ async def _backfill_v4_scheduler_tables(conn: asyncpg.Connection) -> None:
         WHERE NULLIF(BTRIM(COALESCE(ep.user_data_dir, '')), '') IS NOT NULL
         ON CONFLICT (user_data_dir) DO UPDATE SET
             worker_name = EXCLUDED.worker_name,
+            dolphin_profile_id = COALESCE(profiles.dolphin_profile_id, EXCLUDED.dolphin_profile_id),
+            dolphin_profile_name = COALESCE(profiles.dolphin_profile_name, EXCLUDED.dolphin_profile_name),
             is_enabled = EXCLUDED.is_enabled,
             status = CASE
                 WHEN EXCLUDED.is_enabled = FALSE THEN 'DISABLED'
@@ -429,6 +447,8 @@ async def _backfill_v4_scheduler_tables(conn: asyncpg.Connection) -> None:
         INSERT INTO profiles (
             worker_name,
             user_data_dir,
+            dolphin_profile_id,
+            dolphin_profile_name,
             is_enabled,
             status,
             status_since,
@@ -440,6 +460,8 @@ async def _backfill_v4_scheduler_tables(conn: asyncpg.Connection) -> None:
         SELECT
             wh.worker_name,
             wh.route_user_data_dir,
+            wh.route_profile_id,
+            wh.route_profile_name,
             TRUE,
             'READY',
             NOW(),
@@ -464,6 +486,8 @@ async def _backfill_v4_scheduler_tables(conn: asyncpg.Connection) -> None:
           )
         ON CONFLICT (user_data_dir) DO UPDATE SET
             worker_name = EXCLUDED.worker_name,
+            dolphin_profile_id = COALESCE(profiles.dolphin_profile_id, EXCLUDED.dolphin_profile_id),
+            dolphin_profile_name = COALESCE(profiles.dolphin_profile_name, EXCLUDED.dolphin_profile_name),
             last_started_at = COALESCE(profiles.last_started_at, EXCLUDED.last_started_at),
             last_success_at = COALESCE(profiles.last_success_at, EXCLUDED.last_success_at),
             last_failure_at = COALESCE(profiles.last_failure_at, EXCLUDED.last_failure_at),
@@ -1083,6 +1107,8 @@ async def ensure_worker_tables(pool: asyncpg.Pool, include_triggers: bool = Fals
             CREATE TABLE IF NOT EXISTS execution_profiles (
                 user_data_dir TEXT PRIMARY KEY,
                 worker_name TEXT NOT NULL,
+                dolphin_profile_id TEXT,
+                dolphin_profile_name TEXT,
                 is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
                 status TEXT NOT NULL DEFAULT 'READY',
                 status_reason TEXT,
@@ -1126,6 +1152,8 @@ async def ensure_worker_tables(pool: asyncpg.Pool, include_triggers: bool = Fals
                 profile_id BIGSERIAL PRIMARY KEY,
                 worker_name TEXT NOT NULL,
                 user_data_dir TEXT NOT NULL UNIQUE,
+                dolphin_profile_id TEXT,
+                dolphin_profile_name TEXT,
                 is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
                 status TEXT NOT NULL DEFAULT 'READY',
                 status_reason TEXT,
@@ -1284,6 +1312,8 @@ async def ensure_worker_tables(pool: asyncpg.Pool, include_triggers: bool = Fals
                 last_stream_event_id TEXT,
                 route_source TEXT,
                 route_user_data_dir TEXT,
+                route_profile_id TEXT,
+                route_profile_name TEXT,
                 route_search_queries TEXT,
                 route_proxy_mode TEXT,
                 route_proxy_server TEXT,
@@ -1309,12 +1339,18 @@ async def ensure_worker_tables(pool: asyncpg.Pool, include_triggers: bool = Fals
         )
         await conn.execute("ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS route_source TEXT;")
         await conn.execute("ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS route_user_data_dir TEXT;")
+        await conn.execute("ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS route_profile_id TEXT;")
+        await conn.execute("ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS route_profile_name TEXT;")
         await conn.execute("ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS route_search_queries TEXT;")
         await conn.execute("ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS route_proxy_mode TEXT;")
         await conn.execute("ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS route_proxy_server TEXT;")
         await conn.execute("ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS route_proxy_username TEXT;")
         await conn.execute("ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS route_proxy_password TEXT;")
         await conn.execute("ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS route_proxy_pool TEXT;")
+        await conn.execute("ALTER TABLE execution_profiles ADD COLUMN IF NOT EXISTS dolphin_profile_id TEXT;")
+        await conn.execute("ALTER TABLE execution_profiles ADD COLUMN IF NOT EXISTS dolphin_profile_name TEXT;")
+        await conn.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS dolphin_profile_id TEXT;")
+        await conn.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS dolphin_profile_name TEXT;")
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS worker_scrape_events (

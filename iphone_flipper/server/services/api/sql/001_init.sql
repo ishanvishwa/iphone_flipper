@@ -305,6 +305,8 @@ EXECUTE FUNCTION set_updated_at_timestamp();
 CREATE TABLE IF NOT EXISTS execution_profiles (
     user_data_dir TEXT PRIMARY KEY,
     worker_name TEXT NOT NULL,
+    dolphin_profile_id TEXT,
+    dolphin_profile_name TEXT,
     is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
     status TEXT NOT NULL DEFAULT 'READY',
     status_reason TEXT,
@@ -337,6 +339,8 @@ CREATE TABLE IF NOT EXISTS profiles (
     profile_id BIGSERIAL PRIMARY KEY,
     worker_name TEXT NOT NULL,
     user_data_dir TEXT NOT NULL UNIQUE,
+    dolphin_profile_id TEXT,
+    dolphin_profile_name TEXT,
     is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
     status TEXT NOT NULL DEFAULT 'READY',
     status_reason TEXT,
@@ -462,6 +466,8 @@ CREATE TABLE IF NOT EXISTS worker_heartbeats (
     last_stream_event_id TEXT,
     route_source TEXT,
     route_user_data_dir TEXT,
+    route_profile_id TEXT,
+    route_profile_name TEXT,
     route_search_queries TEXT,
     route_proxy_mode TEXT,
     route_proxy_server TEXT,
@@ -478,12 +484,18 @@ ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS last_event_publish_error 
 ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS last_stream_event_id TEXT;
 ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS route_source TEXT;
 ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS route_user_data_dir TEXT;
+ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS route_profile_id TEXT;
+ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS route_profile_name TEXT;
 ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS route_search_queries TEXT;
 ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS route_proxy_mode TEXT;
 ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS route_proxy_server TEXT;
 ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS route_proxy_username TEXT;
 ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS route_proxy_password TEXT;
 ALTER TABLE worker_heartbeats ADD COLUMN IF NOT EXISTS route_proxy_pool TEXT;
+ALTER TABLE execution_profiles ADD COLUMN IF NOT EXISTS dolphin_profile_id TEXT;
+ALTER TABLE execution_profiles ADD COLUMN IF NOT EXISTS dolphin_profile_name TEXT;
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS dolphin_profile_id TEXT;
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS dolphin_profile_name TEXT;
 
 CREATE TABLE IF NOT EXISTS worker_scrape_events (
     id BIGSERIAL PRIMARY KEY,
@@ -564,6 +576,8 @@ ON listing_enrichment_ledger (status, updated_at DESC);
 INSERT INTO profiles (
     worker_name,
     user_data_dir,
+    dolphin_profile_id,
+    dolphin_profile_name,
     is_enabled,
     status,
     status_reason,
@@ -585,6 +599,8 @@ INSERT INTO profiles (
 SELECT
     ep.worker_name,
     ep.user_data_dir,
+    ep.dolphin_profile_id,
+    ep.dolphin_profile_name,
     ep.is_enabled,
     CASE
         WHEN ep.is_enabled = FALSE THEN 'DISABLED'
@@ -617,6 +633,8 @@ FROM execution_profiles ep
 WHERE NULLIF(BTRIM(COALESCE(ep.user_data_dir, '')), '') IS NOT NULL
 ON CONFLICT (user_data_dir) DO UPDATE SET
     worker_name = EXCLUDED.worker_name,
+    dolphin_profile_id = COALESCE(profiles.dolphin_profile_id, EXCLUDED.dolphin_profile_id),
+    dolphin_profile_name = COALESCE(profiles.dolphin_profile_name, EXCLUDED.dolphin_profile_name),
     is_enabled = EXCLUDED.is_enabled,
     status = CASE
         WHEN EXCLUDED.is_enabled = FALSE THEN 'DISABLED'
@@ -645,6 +663,8 @@ ON CONFLICT (user_data_dir) DO UPDATE SET
 INSERT INTO profiles (
     worker_name,
     user_data_dir,
+    dolphin_profile_id,
+    dolphin_profile_name,
     is_enabled,
     status,
     status_since,
@@ -656,6 +676,8 @@ INSERT INTO profiles (
 SELECT
     wh.worker_name,
     wh.route_user_data_dir,
+    wh.route_profile_id,
+    wh.route_profile_name,
     TRUE,
     'READY',
     NOW(),
@@ -680,6 +702,8 @@ WHERE NULLIF(BTRIM(COALESCE(wh.worker_name, '')), '') IS NOT NULL
   )
 ON CONFLICT (user_data_dir) DO UPDATE SET
     worker_name = EXCLUDED.worker_name,
+    dolphin_profile_id = COALESCE(profiles.dolphin_profile_id, EXCLUDED.dolphin_profile_id),
+    dolphin_profile_name = COALESCE(profiles.dolphin_profile_name, EXCLUDED.dolphin_profile_name),
     last_started_at = COALESCE(profiles.last_started_at, EXCLUDED.last_started_at),
     last_success_at = COALESCE(profiles.last_success_at, EXCLUDED.last_success_at),
     last_failure_at = COALESCE(profiles.last_failure_at, EXCLUDED.last_failure_at),

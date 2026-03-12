@@ -174,8 +174,15 @@ class ExecutionProfileManualLoginClearRequest(BaseModel):
     reason: str | None = None
 
 
+class ExecutionProfilePoolSyncItem(BaseModel):
+    slot: int = Field(ge=1)
+    dolphin_profile_id: str | None = Field(default=None, max_length=255)
+    dolphin_profile_name: str | None = Field(default=None, max_length=255)
+
+
 class ExecutionProfilePoolSyncRequest(BaseModel):
     slots: list[int] = Field(default_factory=list)
+    profiles: list[ExecutionProfilePoolSyncItem] = Field(default_factory=list)
 
 
 class ProxyStatsResetRequest(BaseModel):
@@ -259,6 +266,38 @@ def _normalize_execution_profile_slots(raw_slots: list[int] | tuple[int, ...] | 
         seen.add(slot)
         normalized.append(slot)
     return sorted(normalized)
+
+
+def _normalize_execution_profile_sync_items(payload: ExecutionProfilePoolSyncRequest) -> list[dict[str, Any]]:
+    normalized_by_slot: dict[int, dict[str, Any]] = {}
+    for slot in _normalize_execution_profile_slots(payload.slots):
+        normalized_by_slot[slot] = {
+            "slot": slot,
+            "dolphin_profile_id": None,
+            "dolphin_profile_name": None,
+        }
+
+    for item in payload.profiles or []:
+        try:
+            slot = int(item.slot)
+        except (TypeError, ValueError):
+            continue
+        if slot <= 0:
+            continue
+        existing = normalized_by_slot.get(slot) or {
+            "slot": slot,
+            "dolphin_profile_id": None,
+            "dolphin_profile_name": None,
+        }
+        profile_id = str(item.dolphin_profile_id or "").strip() or None
+        profile_name = str(item.dolphin_profile_name or "").strip() or None
+        if profile_id:
+            existing["dolphin_profile_id"] = profile_id
+        if profile_name:
+            existing["dolphin_profile_name"] = profile_name
+        normalized_by_slot[slot] = existing
+
+    return [normalized_by_slot[slot] for slot in sorted(normalized_by_slot)]
 
 
 def _execution_profile_user_data_dir_for_slot(slot: int) -> str:
@@ -1845,6 +1884,7 @@ async def get_query_families(
                     hb.worker_name AS active_worker_name,
                     hb.route_search_queries AS active_query_text,
                     hb.route_user_data_dir AS active_user_data_dir,
+                    hb.route_profile_name AS active_profile_name,
                     hb.status AS active_worker_status
                 FROM query_families qf
                 LEFT JOIN worker_heartbeats hb
@@ -1885,6 +1925,7 @@ async def get_query_families(
                     hb.worker_name AS active_worker_name,
                     hb.route_search_queries AS active_query_text,
                     hb.route_user_data_dir AS active_user_data_dir,
+                    hb.route_profile_name AS active_profile_name,
                     hb.status AS active_worker_status
                 FROM query_families qf
                 LEFT JOIN worker_heartbeats hb
@@ -2110,6 +2151,7 @@ async def upsert_query_family(
                     hb.worker_name AS active_worker_name,
                     hb.route_search_queries AS active_query_text,
                     hb.route_user_data_dir AS active_user_data_dir,
+                    hb.route_profile_name AS active_profile_name,
                     hb.status AS active_worker_status
                 FROM query_families qf
                 LEFT JOIN worker_heartbeats hb
@@ -2203,6 +2245,7 @@ async def bootstrap_query_family_presets(
                 hb.worker_name AS active_worker_name,
                 hb.route_search_queries AS active_query_text,
                 hb.route_user_data_dir AS active_user_data_dir,
+                hb.route_profile_name AS active_profile_name,
                 hb.status AS active_worker_status
             FROM query_families qf
             LEFT JOIN worker_heartbeats hb
@@ -2244,6 +2287,8 @@ async def get_execution_profiles(
                 SELECT
                     user_data_dir,
                     worker_name,
+                    dolphin_profile_id,
+                    dolphin_profile_name,
                     is_enabled,
                     status,
                     status_reason,
@@ -2273,6 +2318,8 @@ async def get_execution_profiles(
                 SELECT
                     user_data_dir,
                     worker_name,
+                    dolphin_profile_id,
+                    dolphin_profile_name,
                     is_enabled,
                     status,
                     status_reason,
@@ -2319,21 +2366,27 @@ async def sync_execution_profile_pool(
     x_api_token: str | None = Header(default=None),
 ) -> dict[str, Any]:
     await _auth_rest(x_api_token)
-    slots = _normalize_execution_profile_slots(payload.slots)
-    if not slots:
+    sync_items = _normalize_execution_profile_sync_items(payload)
+    slots = [int(item["slot"]) for item in sync_items]
+    if not sync_items:
         raise HTTPException(status_code=400, detail="At least one positive profile slot is required.")
 
     execution_profile_rows: list[dict[str, Any]] = []
     async with app.state.db_pool.acquire() as conn:
         async with conn.transaction():
-            for slot in slots:
+            for sync_item in sync_items:
+                slot = int(sync_item["slot"])
                 worker_name = _execution_profile_worker_name_for_slot(slot)
                 user_data_dir = _execution_profile_user_data_dir_for_slot(slot)
+                dolphin_profile_id = str(sync_item.get("dolphin_profile_id") or "").strip() or None
+                dolphin_profile_name = str(sync_item.get("dolphin_profile_name") or "").strip() or None
                 execution_profile = await conn.fetchrow(
                     """
                     INSERT INTO execution_profiles (
                         user_data_dir,
                         worker_name,
+                        dolphin_profile_id,
+                        dolphin_profile_name,
                         is_enabled,
                         status,
                         status_reason,
@@ -2348,11 +2401,13 @@ async def sync_execution_profile_pool(
                         consecutive_failures,
                         last_error
                     ) VALUES (
-                        $1, $2, TRUE, 'READY', NULL, NOW(),
+                        $1, $2, $3, $4, TRUE, 'READY', NULL, NOW(),
                         NULL, FALSE, NULL, NULL, NULL, NULL, NULL, 0, NULL
                     )
                     ON CONFLICT (user_data_dir) DO UPDATE SET
                         worker_name = EXCLUDED.worker_name,
+                        dolphin_profile_id = COALESCE(NULLIF(EXCLUDED.dolphin_profile_id, ''), execution_profiles.dolphin_profile_id),
+                        dolphin_profile_name = COALESCE(NULLIF(EXCLUDED.dolphin_profile_name, ''), execution_profiles.dolphin_profile_name),
                         is_enabled = TRUE,
                         status = CASE
                             WHEN COALESCE(execution_profiles.manual_login_required, FALSE) = TRUE THEN 'NEEDS_LOGIN'
@@ -2387,6 +2442,8 @@ async def sync_execution_profile_pool(
                     RETURNING
                         user_data_dir,
                         worker_name,
+                        dolphin_profile_id,
+                        dolphin_profile_name,
                         is_enabled,
                         status,
                         status_reason,
@@ -2407,12 +2464,16 @@ async def sync_execution_profile_pool(
                     """,
                     user_data_dir,
                     worker_name,
+                    dolphin_profile_id,
+                    dolphin_profile_name,
                 )
                 await conn.fetchrow(
                     """
                     INSERT INTO profiles (
                         worker_name,
                         user_data_dir,
+                        dolphin_profile_id,
+                        dolphin_profile_name,
                         is_enabled,
                         status,
                         status_reason,
@@ -2429,11 +2490,13 @@ async def sync_execution_profile_pool(
                         consecutive_empty_claims,
                         last_error
                     ) VALUES (
-                        $1, $2, TRUE, 'READY', NULL, NOW(),
+                        $1, $2, $3, $4, TRUE, 'READY', NULL, NOW(),
                         NULL, NULL, FALSE, NULL, NULL, NULL, NULL, NULL, 0, 0, NULL
                     )
                     ON CONFLICT (user_data_dir) DO UPDATE SET
                         worker_name = EXCLUDED.worker_name,
+                        dolphin_profile_id = COALESCE(NULLIF(EXCLUDED.dolphin_profile_id, ''), profiles.dolphin_profile_id),
+                        dolphin_profile_name = COALESCE(NULLIF(EXCLUDED.dolphin_profile_name, ''), profiles.dolphin_profile_name),
                         is_enabled = TRUE,
                         status = CASE
                             WHEN COALESCE(profiles.manual_login_required, FALSE) = TRUE THEN 'NEEDS_LOGIN'
@@ -2475,6 +2538,8 @@ async def sync_execution_profile_pool(
                     """,
                     worker_name,
                     user_data_dir,
+                    dolphin_profile_id,
+                    dolphin_profile_name,
                 )
                 if execution_profile is not None:
                     execution_profile_rows.append(
@@ -2541,6 +2606,8 @@ async def clear_execution_profile_manual_login(
             RETURNING
                 user_data_dir,
                 worker_name,
+                dolphin_profile_id,
+                dolphin_profile_name,
                 is_enabled,
                 status,
                 status_reason,
@@ -2593,6 +2660,8 @@ async def clear_execution_profile_manual_login(
                 profile_id,
                 worker_name,
                 user_data_dir,
+                dolphin_profile_id,
+                dolphin_profile_name,
                 is_enabled,
                 status,
                 status_reason,
@@ -3397,6 +3466,8 @@ async def get_worker_health(
             hb.last_run_finished_at,
             hb.route_source,
             hb.route_user_data_dir,
+            hb.route_profile_id,
+            hb.route_profile_name,
             hb.route_search_queries,
             hb.route_proxy_mode,
             hb.route_proxy_server,

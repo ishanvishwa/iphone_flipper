@@ -648,6 +648,7 @@ class GuiVpsScraperFallbackTests(unittest.TestCase):
                 {
                     "worker_name": "worker_3",
                     "user_data_dir": "/app/runtime/browser_profile_3",
+                    "dolphin_profile_name": "Profile 3",
                     "status": "NEEDS_LOGIN",
                     "status_reason": "checkpoint",
                     "manual_login_required": True,
@@ -684,11 +685,35 @@ class GuiVpsScraperFallbackTests(unittest.TestCase):
 
         row = app.dolphin_tree.rows["746386753"]
         self.assertEqual(row[2], "worker_3")
-        self.assertEqual(row[3], "browser_profile_3")
+        self.assertEqual(row[3], "Profile 3")
         self.assertEqual(row[4], "v4")
         self.assertEqual(row[6], "Required")
         self.assertIn("NEEDS_LOGIN", row[5])
         self.assertEqual(row[7], "Ready")
+
+    def test_refresh_vps_worker_summary_prefers_live_profile_name(self) -> None:
+        app = self._build_gui()
+
+        app._refresh_vps_worker_summary_tree(
+            routes=[],
+            health_by_worker={
+                "worker_3": {
+                    "worker_name": "worker_3",
+                    "route_source": "v4",
+                    "route_name": "iphone_broad",
+                    "route_user_data_dir": "/app/runtime/browser_profile_3",
+                    "route_profile_name": "Profile 3",
+                    "route_search_queries": "iPhone",
+                    "status": "running",
+                    "listings_scraped_last_minute": 12,
+                    "updated_at": "2026-03-13T10:20:30+00:00",
+                }
+            },
+        )
+
+        row = app.vps_worker_summary_tree.rows["worker_3"]
+        self.assertEqual(row[2], "Profile 3")
+        self.assertEqual(row[3], "iphone_broad")
 
     def test_clear_selected_dolphin_manual_login_calls_execution_profile_endpoint(self) -> None:
         app = self._build_gui()
@@ -701,9 +726,11 @@ class GuiVpsScraperFallbackTests(unittest.TestCase):
         app.dolphin_tree.selection_set("746386753")
         app.dolphin_profile_records_by_id = {
             "746386753": {
+                "cloud_profile": {"name": "Profile 3"},
                 "execution_profile": {
                     "worker_name": "worker_3",
                     "user_data_dir": "/app/runtime/browser_profile_3",
+                    "dolphin_profile_name": "Profile 3",
                 }
             }
         }
@@ -802,6 +829,18 @@ class GuiVpsScraperFallbackTests(unittest.TestCase):
             post_mock.call_args.kwargs["json"],
             {
                 "slots": [4, 5],
+                "profiles": [
+                    {
+                        "slot": 4,
+                        "dolphin_profile_id": "100",
+                        "dolphin_profile_name": "browser_profile_4",
+                    },
+                    {
+                        "slot": 5,
+                        "dolphin_profile_id": "101",
+                        "dolphin_profile_name": "Seller Browser",
+                    },
+                ],
             },
         )
         self.assertEqual(refresh_calls, ["dolphin", "vps"])

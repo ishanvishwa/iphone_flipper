@@ -2615,7 +2615,10 @@ PY
         return f"/app/runtime/browser_profile_{candidate}"
 
     @staticmethod
-    def _profile_display_name(profile_dir: str) -> str:
+    def _profile_display_name(profile_dir: str, profile_name: str = "") -> str:
+        profile_name_clean = str(profile_name or "").strip()
+        if profile_name_clean:
+            return profile_name_clean
         profile_text = str(profile_dir or "").strip()
         if not profile_text:
             return "-"
@@ -2803,6 +2806,7 @@ PY
             mode = str(health.get("route_source") or "").strip().lower()
             if not mode:
                 mode = "central" if worker_routes else "env"
+            live_profile_name = str(health.get("route_profile_name") or "").strip()
             profile_dir = str(
                 health.get("route_user_data_dir")
                 or (active_route or {}).get("user_data_dir")
@@ -2823,7 +2827,7 @@ PY
             values = (
                 worker_name,
                 mode,
-                self._profile_display_name(profile_dir) if profile_dir else "-",
+                self._profile_display_name(profile_dir, live_profile_name) if profile_dir or live_profile_name else "-",
                 active_route_name or "env-backed",
                 active_query or "-",
                 status,
@@ -2835,6 +2839,7 @@ PY
                 "worker_name": worker_name,
                 "mode": mode,
                 "live_profile": profile_dir,
+                "live_profile_name": live_profile_name or None,
                 "active_route_name": active_route_name,
                 "active_query": active_query or None,
                 "health": health,
@@ -2906,10 +2911,11 @@ PY
         )
         last_run_display = last_run.replace("T", " ")[:19] if last_run else ""
         route_user_data_dir = str(health.get("route_user_data_dir") or "").strip()
+        route_profile_name = str(health.get("route_profile_name") or "").strip()
         values = (
             worker_name_clean,
             route_name or "env_default",
-            self._profile_display_name(route_user_data_dir) if route_user_data_dir else "env-backed",
+            self._profile_display_name(route_user_data_dir, route_profile_name) if route_user_data_dir or route_profile_name else "env-backed",
             "env",
             "-",
             status,
@@ -2931,6 +2937,7 @@ PY
                 "is_synthetic_health_row": True,
                 "source": str(health.get("route_source") or "env").strip() or "env",
                 "user_data_dir": route_user_data_dir,
+                "dolphin_profile_name": route_profile_name or None,
                 "lane_override": "",
                 "computed_lane": "",
                 "effective_lane": "",
@@ -8175,7 +8182,10 @@ PY
                     dolphin_status = status_info.get("name", "Ready") if isinstance(status_info, dict) else "Ready"
                     execution_profile = self._match_dolphin_profile_to_execution_profile(p, execution_profiles_by_slot)
                     worker_name = str((execution_profile or {}).get("worker_name") or "").strip()
-                    runtime_profile = self._profile_display_name((execution_profile or {}).get("user_data_dir") or "")
+                    runtime_profile = self._profile_display_name(
+                        (execution_profile or {}).get("user_data_dir") or "",
+                        str((execution_profile or {}).get("dolphin_profile_name") or ""),
+                    )
                     worker_health = health_by_worker.get(worker_name) if worker_name else {}
                     worker_mode = str((worker_health or {}).get("route_source") or "").strip() or "-"
                     live_status = self._short_status_detail(
@@ -8254,7 +8264,9 @@ PY
         errors = []
         dolphin_status_index = self.dolphin_tree_column_index.get("Dolphin Status", 7)
         for item_id in selected:
-            profile_id = self.dolphin_tree.item(item_id, "values")[0]
+            row_values = self.dolphin_tree.item(item_id, "values")
+            profile_id = row_values[0]
+            profile_name = str(row_values[1] or "").strip() or f"Profile {profile_id}"
             try:
                 api_url = self._get_dolphin_api_url()
                 resp = requests.get(f"{api_url}/v1.0/browser_profiles/{profile_id}/start?automation=1", headers=self._dolphin_auth_headers(), timeout=15)
@@ -8267,11 +8279,11 @@ PY
                         current_values[dolphin_status_index] = f"Running (Port: {data.get('automation', {}).get('port', 'Unknown')})"
                         self.dolphin_tree.item(item_id, values=current_values)
                     else:
-                        errors.append(f"Profile {profile_id}: {data.get('msg', 'Unknown error')}")
+                        errors.append(f"{profile_name}: {data.get('msg', 'Unknown error')}")
                 else:
-                    errors.append(f"Profile {profile_id}: HTTP {resp.status_code}")
+                    errors.append(f"{profile_name}: HTTP {resp.status_code}")
             except Exception as e:
-                errors.append(f"Profile {profile_id}: {e}")
+                errors.append(f"{profile_name}: {e}")
                 
         if errors:
             error_msg = "\n".join(errors[:5])
@@ -8298,7 +8310,9 @@ PY
         errors = []
         dolphin_status_index = self.dolphin_tree_column_index.get("Dolphin Status", 7)
         for item_id in selected:
-            profile_id = self.dolphin_tree.item(item_id, "values")[0]
+            row_values = self.dolphin_tree.item(item_id, "values")
+            profile_id = row_values[0]
+            profile_name = str(row_values[1] or "").strip() or f"Profile {profile_id}"
             try:
                 api_url = self._get_dolphin_api_url()
                 resp = requests.get(f"{api_url}/v1.0/browser_profiles/{profile_id}/stop", headers=self._dolphin_auth_headers(), timeout=15)
@@ -8311,11 +8325,11 @@ PY
                         current_values[dolphin_status_index] = "Stopped"
                         self.dolphin_tree.item(item_id, values=current_values)
                     else:
-                        errors.append(f"Profile {profile_id}: {data.get('msg', 'Unknown error')}")
+                        errors.append(f"{profile_name}: {data.get('msg', 'Unknown error')}")
                 else:
-                    errors.append(f"Profile {profile_id}: HTTP {resp.status_code}")
+                    errors.append(f"{profile_name}: HTTP {resp.status_code}")
             except Exception as e:
-                errors.append(f"Profile {profile_id}: {e}")
+                errors.append(f"{profile_name}: {e}")
                 
         if errors:
             error_msg = "\n".join(errors[:5])
@@ -8374,8 +8388,13 @@ PY
             execution_profile = record.get("execution_profile") or {}
             worker_name = str(execution_profile.get("worker_name") or "").strip()
             user_data_dir = str(execution_profile.get("user_data_dir") or "").strip()
+            profile_name = str(
+                (record.get("cloud_profile") or {}).get("name")
+                or execution_profile.get("dolphin_profile_name")
+                or item_id
+            ).strip()
             if not worker_name or not user_data_dir:
-                errors.append(f"Profile {item_id}: missing execution-profile mapping.")
+                errors.append(f"{profile_name}: missing execution-profile mapping.")
                 continue
 
             try:
@@ -8393,7 +8412,7 @@ PY
                 response.raise_for_status()
                 cleared += 1
             except Exception as exc:
-                errors.append(f"Profile {item_id}: {exc}")
+                errors.append(f"{profile_name}: {exc}")
 
         self._refresh_dolphin_profiles()
         self._refresh_vps_scraper_tree(preserve_selection=True)
@@ -8428,11 +8447,19 @@ PY
             )
             return
 
+        sync_profiles: list[dict[str, object]] = []
         slot_set: set[int] = set()
         for profile_payload in cloud_profiles:
             for slot in self._extract_dolphin_profile_slots(profile_payload):
                 if slot > 0:
                     slot_set.add(int(slot))
+                    sync_profiles.append(
+                        {
+                            "slot": int(slot),
+                            "dolphin_profile_id": str(profile_payload.get("id") or "").strip() or None,
+                            "dolphin_profile_name": str(profile_payload.get("name") or "").strip() or None,
+                        }
+                    )
 
         slots = sorted(slot_set)
         if not slots:
@@ -8457,7 +8484,7 @@ PY
             response = requests.post(
                 f"{ctx['base_url']}/execution-profiles/sync-pool",
                 headers=ctx["headers"],
-                json={"slots": slots},
+                json={"slots": slots, "profiles": sync_profiles},
                 timeout=(8, 45),
             )
             if response.status_code == 401:

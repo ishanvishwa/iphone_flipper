@@ -110,6 +110,17 @@ class WorkerV4RuntimeTests(unittest.IsolatedAsyncioTestCase):
             tuple(preset.name for preset in V42_FAMILY_PRESETS),
         )
 
+    def test_profile_display_label_prefers_dolphin_profile_name(self) -> None:
+        self.assertEqual(
+            worker._profile_display_label(
+                {
+                    "dolphin_profile_name": "Profile 8",
+                    "user_data_dir": "/app/runtime/browser_profile_8",
+                }
+            ),
+            "Profile 8",
+        )
+
     async def test_interruptible_worker_sleep_wakes_when_v4_canary_turns_on(self) -> None:
         feature_flags = AsyncMock()
         feature_flags.is_enabled = AsyncMock(side_effect=[False, True])
@@ -186,7 +197,12 @@ class WorkerV4RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_run_v4_family_claim_reports_active_variant_query_in_heartbeat(self) -> None:
         warm_session = worker.V4WarmSessionState(
-            profile={"profile_id": 3, "user_data_dir": "/profiles/3"},
+            profile={
+                "profile_id": 3,
+                "user_data_dir": "/profiles/3",
+                "dolphin_profile_id": "746386753",
+                "dolphin_profile_name": "Profile 3",
+            },
             profile_lease_token="lease-3",
             runtime_identity="/profiles/3",
             session=object(),
@@ -215,6 +231,7 @@ class WorkerV4RuntimeTests(unittest.IsolatedAsyncioTestCase):
         first_route = heartbeat.await_args_list[0].kwargs["route"]
         self.assertEqual(first_route["source"], "v4")
         self.assertEqual(first_route["search_queries"], "iPhone")
+        self.assertEqual(first_route["dolphin_profile_name"], "Profile 3")
 
     async def test_dom_circuit_breaker_requires_distinct_profiles(self) -> None:
         class _FakeRedis:

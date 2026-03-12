@@ -115,6 +115,8 @@ class _RouteOpsConn:
                 {
                     "user_data_dir": "/app/runtime/browser_profile_3",
                     "worker_name": "worker_3",
+                    "dolphin_profile_id": "746386753",
+                    "dolphin_profile_name": "Profile 3",
                     "is_enabled": True,
                     "status": "READY",
                     "status_reason": None,
@@ -335,6 +337,8 @@ class _ExecutionProfilePoolSyncConn:
             return {
                 "user_data_dir": args[0],
                 "worker_name": args[1],
+                "dolphin_profile_id": args[2],
+                "dolphin_profile_name": args[3],
                 "is_enabled": True,
                 "status": "READY",
                 "status_reason": None,
@@ -756,7 +760,21 @@ class ApiOpsTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(api_main, "API_TOKEN", "test-token"):
             payload = await api_main.sync_execution_profile_pool(
-                payload=api_main.ExecutionProfilePoolSyncRequest(slots=[4, 5, 5, -1]),
+                payload=api_main.ExecutionProfilePoolSyncRequest(
+                    slots=[4, 5, 5, -1],
+                    profiles=[
+                        api_main.ExecutionProfilePoolSyncItem(
+                            slot=4,
+                            dolphin_profile_id="100",
+                            dolphin_profile_name="Profile 4",
+                        ),
+                        api_main.ExecutionProfilePoolSyncItem(
+                            slot=5,
+                            dolphin_profile_id="101",
+                            dolphin_profile_name="Seller Browser",
+                        ),
+                    ],
+                ),
                 x_api_token="test-token",
             )
 
@@ -766,15 +784,15 @@ class ApiOpsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             conn.execution_profile_upserts,
             [
-                ("/app/runtime/browser_profile_4", "worker"),
-                ("/app/runtime/browser_profile_5", "worker_2"),
+                ("/app/runtime/browser_profile_4", "worker", "100", "Profile 4"),
+                ("/app/runtime/browser_profile_5", "worker_2", "101", "Seller Browser"),
             ],
         )
         self.assertEqual(
             conn.v4_profile_upserts,
             [
-                ("worker", "/app/runtime/browser_profile_4"),
-                ("worker_2", "/app/runtime/browser_profile_5"),
+                ("worker", "/app/runtime/browser_profile_4", "100", "Profile 4"),
+                ("worker_2", "/app/runtime/browser_profile_5", "101", "Seller Browser"),
             ],
         )
 
@@ -787,6 +805,7 @@ class ApiOpsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["count"], 1)
         self.assertEqual(payload["items"][0]["worker_name"], "worker_3")
         self.assertEqual(payload["items"][0]["user_data_dir"], "/app/runtime/browser_profile_3")
+        self.assertEqual(payload["items"][0]["dolphin_profile_name"], "Profile 3")
 
     async def test_clear_execution_profile_manual_login_updates_execution_and_v4_profiles(self) -> None:
         class _ExecutionProfileClearConn:
@@ -801,6 +820,8 @@ class ApiOpsTests(unittest.IsolatedAsyncioTestCase):
                     return {
                         "user_data_dir": "/app/runtime/browser_profile_3",
                         "worker_name": "worker_3",
+                        "dolphin_profile_id": "746386753",
+                        "dolphin_profile_name": "Profile 3",
                         "is_enabled": True,
                         "status": "READY",
                         "status_reason": "manual login cleared by operator",
@@ -825,6 +846,8 @@ class ApiOpsTests(unittest.IsolatedAsyncioTestCase):
                         "profile_id": 7,
                         "worker_name": "worker_3",
                         "user_data_dir": "/app/runtime/browser_profile_3",
+                        "dolphin_profile_id": "746386753",
+                        "dolphin_profile_name": "Profile 3",
                         "is_enabled": True,
                         "status": "READY",
                         "status_reason": "manual login cleared by operator",

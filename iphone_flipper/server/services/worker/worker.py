@@ -985,6 +985,8 @@ def _build_quarantine_evidence(
             "query_shard_key",
             "persona_hash",
             "page_text_sample",
+            "dolphin_profile_id",
+            "dolphin_profile_name",
         ):
             value = details.get(key)
             if value is None:
@@ -1067,6 +1069,23 @@ def _extract_profile_number(route: dict[str, Any]) -> str:
         if profile_match:
             return profile_match.group(1)
     return "1" if WORKER_NAME == "worker" else "unknown"
+
+
+def _profile_display_label(payload: Mapping[str, Any] | None) -> str:
+    source = payload or {}
+    for key in ("dolphin_profile_name", "route_profile_name", "profile_name"):
+        value = str(source.get(key) or "").strip()
+        if value:
+            return value
+    user_data_dir = str(source.get("user_data_dir") or source.get("route_user_data_dir") or "").strip()
+    if user_data_dir:
+        name = Path(user_data_dir).name.strip()
+        if name:
+            return name
+    profile_number = _extract_profile_number(dict(source))
+    if profile_number != "unknown":
+        return f"Profile {profile_number}"
+    return "Unknown"
 
 
 def _profile_failure_alert_key(route: dict[str, Any]) -> str:
@@ -1584,12 +1603,12 @@ def _send_telegram_profile_failure_alert(
     if not TELEGRAM_NOTIFICATIONS_ENABLED:
         return
 
-    profile_number = _extract_profile_number(route)
+    profile_label = _profile_display_label(route)
     route_name = str(route.get("route_name") or "unknown").strip() or "unknown"
     message = (
         "⚠️ Scraper profile failure detected\n"
         f"Worker: {WORKER_NAME}\n"
-        f"Profile: {profile_number}\n"
+        f"Profile: {profile_label}\n"
         f"Route: {route_name}\n"
         f"Reason: {reason}\n"
         f"Consecutive bad cycles: {max(1, int(consecutive_bad_cycles))}\n"
@@ -1613,7 +1632,7 @@ def _send_telegram_profile_failure_alert(
 
             WORKER_NAME,
             route_name,
-            profile_number,
+            profile_label,
         )
 
 
@@ -1712,9 +1731,10 @@ async def _record_dolphin_profile_outcome(
 
     # Only fire Telegram alert exactly when the threshold is first crossed
     if failures == DOLPHIN_PROFILE_BLACKLIST_AFTER and until:
+        profile_label = profile_name or f"Dolphin profile {profile_id}"
         logging.warning(
-            "[%s] Dolphin profile %s (%s) BLACKLISTED until %s (%d consecutive failures)",
-            WORKER_NAME, profile_id, profile_name or "?", until.isoformat(), failures,
+            "[%s] %s BLACKLISTED until %s (%d consecutive failures)",
+            WORKER_NAME, profile_label, until.isoformat(), failures,
         )
         _send_telegram_profile_blacklisted_alert(
             profile_id=profile_id,
@@ -1724,14 +1744,16 @@ async def _record_dolphin_profile_outcome(
             until=until,
         )
     elif until:
+        profile_label = profile_name or f"Dolphin profile {profile_id}"
         logging.warning(
-            "[%s] Dolphin profile %s (%s) still blacklisted, failure #%d (until %s)",
-            WORKER_NAME, profile_id, profile_name or "?", failures, until.isoformat(),
+            "[%s] %s still blacklisted, failure #%d (until %s)",
+            WORKER_NAME, profile_label, failures, until.isoformat(),
         )
     else:
+        profile_label = profile_name or f"Dolphin profile {profile_id}"
         logging.warning(
-            "[%s] Dolphin profile %s (%s) consecutive failure #%d",
-            WORKER_NAME, profile_id, profile_name or "?", failures,
+            "[%s] %s consecutive failure #%d",
+            WORKER_NAME, profile_label, failures,
         )
 
 
@@ -1754,10 +1776,11 @@ def _send_telegram_profile_blacklisted_alert(
         diff_minutes = max(1, int((until - now_dt).total_seconds() / 60))
         cooldown_str = f"{diff_minutes} minutes"
 
+    profile_label = profile_name or f"Dolphin profile {profile_id}"
     message = (
         f"\U0001f6ab Dolphin profile blacklisted\n"
         f"Worker: {WORKER_NAME}\n"
-        f"Profile: {profile_name or 'Unknown'} (ID: {profile_id})\n"
+        f"Profile: {profile_label}\n"
         f"Consecutive failures: {failures}\n"
         f"Reason: {reason or 'unknown'}\n"
         f"Blacklisted for: {cooldown_str}\n"
@@ -1772,7 +1795,7 @@ def _send_telegram_profile_blacklisted_alert(
     if not sent:
         logging.warning(
             "[%s] telegram profile-blacklisted alert failed for profile=%s",
-            WORKER_NAME, profile_id,
+            WORKER_NAME, profile_label,
         )
 
 
@@ -1780,12 +1803,12 @@ def _send_telegram_manual_login_required_alert(route: dict[str, Any], reason: st
     if not TELEGRAM_NOTIFICATIONS_ENABLED:
         return
 
-    profile_number = _extract_profile_number(route)
+    profile_label = _profile_display_label(route)
     route_name = str(route.get("route_name") or "unknown").strip() or "unknown"
     message = (
         "🚫 Scraper profile quarantined (manual login required)\n"
         f"Worker: {WORKER_NAME}\n"
-        f"Profile: {profile_number}\n"
+        f"Profile: {profile_label}\n"
         f"Route: {route_name}\n"
         f"Reason: {reason}\n"
         "Action: Run VPS Manual Login for this profile, then set Manual Login Required to 0 to re-enable."
@@ -1800,7 +1823,7 @@ def _send_telegram_manual_login_required_alert(route: dict[str, Any], reason: st
             "[%s] telegram manual-login-required alert failed for route=%s profile=%s",
             WORKER_NAME,
             route_name,
-            profile_number,
+            profile_label,
         )
 
 
@@ -2120,6 +2143,8 @@ async def _load_execution_profiles(pool: asyncpg.Pool) -> list[dict[str, Any]]:
             SELECT
                 user_data_dir,
                 worker_name,
+                dolphin_profile_id,
+                dolphin_profile_name,
                 is_enabled,
                 status,
                 status_reason,
@@ -2149,6 +2174,8 @@ async def _load_execution_profiles(pool: asyncpg.Pool) -> list[dict[str, Any]]:
         {
             "user_data_dir": str(row["user_data_dir"] or "").strip(),
             "worker_name": str(row["worker_name"] or "").strip(),
+            "dolphin_profile_id": str(row["dolphin_profile_id"] or "").strip() or None,
+            "dolphin_profile_name": str(row["dolphin_profile_name"] or "").strip() or None,
             "is_enabled": bool(row["is_enabled"]),
             "status": _normalize_execution_profile_status(str(row["status"] or "READY")),
             "status_reason": str(row["status_reason"] or "").strip() or None,
@@ -2288,6 +2315,8 @@ def _build_v4_family_route(
         "route_name": route_name,
         "worker_name": WORKER_NAME,
         "user_data_dir": str(profile.get("user_data_dir") or "").strip() or None,
+        "dolphin_profile_id": str(profile.get("dolphin_profile_id") or "").strip() or None,
+        "dolphin_profile_name": str(profile.get("dolphin_profile_name") or "").strip() or None,
         "source": "v4",
         "search_queries": search_queries_value,
     }
@@ -2867,7 +2896,7 @@ async def _open_v4_warm_session(pool: asyncpg.Pool, profile: dict[str, Any]) -> 
         logging.info(
             "[%s] scrubbed orphaned Chromium lock files for %s: %s",
             WORKER_NAME,
-            profile.get("user_data_dir"),
+            _profile_display_label(profile),
             ", ".join(removed_lock_files),
         )
     session = await open_profile_session(user_data_dir=user_data_dir, headless=WORKER_HEADLESS)
@@ -4649,6 +4678,8 @@ async def _upsert_worker_heartbeat(
     ) -> None:
     route_source = str((route or {}).get("source") or "").strip() or None
     route_user_data_dir = str((route or {}).get("user_data_dir") or "").strip() or None
+    route_profile_id = str((route or {}).get("dolphin_profile_id") or "").strip() or None
+    route_profile_name = str((route or {}).get("dolphin_profile_name") or "").strip() or None
     route_search_queries = str((route or {}).get("search_queries") or "").strip() or None
     route_proxy_mode = str((route or {}).get("proxy_mode") or "").strip() or None
     route_proxy_server = str((route or {}).get("proxy_server") or "").strip() or None
@@ -4666,6 +4697,8 @@ async def _upsert_worker_heartbeat(
             last_run_finished_at,
             route_source,
             route_user_data_dir,
+            route_profile_id,
+            route_profile_name,
             route_search_queries,
             route_proxy_mode,
             route_proxy_server,
@@ -4675,7 +4708,7 @@ async def _upsert_worker_heartbeat(
             last_error,
             updated_at
         ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NOW()
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, NOW()
         )
         ON CONFLICT (worker_name) DO UPDATE SET
             route_name = EXCLUDED.route_name,
@@ -4686,6 +4719,8 @@ async def _upsert_worker_heartbeat(
             last_run_finished_at = COALESCE(EXCLUDED.last_run_finished_at, worker_heartbeats.last_run_finished_at),
             route_source = COALESCE(EXCLUDED.route_source, worker_heartbeats.route_source),
             route_user_data_dir = COALESCE(EXCLUDED.route_user_data_dir, worker_heartbeats.route_user_data_dir),
+            route_profile_id = COALESCE(EXCLUDED.route_profile_id, worker_heartbeats.route_profile_id),
+            route_profile_name = COALESCE(EXCLUDED.route_profile_name, worker_heartbeats.route_profile_name),
             route_search_queries = COALESCE(EXCLUDED.route_search_queries, worker_heartbeats.route_search_queries),
             route_proxy_mode = COALESCE(EXCLUDED.route_proxy_mode, worker_heartbeats.route_proxy_mode),
             route_proxy_server = COALESCE(EXCLUDED.route_proxy_server, worker_heartbeats.route_proxy_server),
@@ -4707,6 +4742,8 @@ async def _upsert_worker_heartbeat(
             finished_at,
             route_source,
             route_user_data_dir,
+            route_profile_id,
+            route_profile_name,
             route_search_queries,
             route_proxy_mode,
             route_proxy_server,
@@ -5778,9 +5815,10 @@ async def _run_scrape_cycle(
                         pid_str = str(p.get("id"))
                         until = blacklisted_profiles.get(pid_str)
                         if until:
+                            profile_label = str(p.get("name") or "").strip() or f"Dolphin profile {pid_str}"
                             logging.debug(
-                                "[%s] skipping blacklisted Dolphin profile %s (banned until %s)",
-                                WORKER_NAME, pid_str, until.isoformat()
+                                "[%s] skipping blacklisted %s (banned until %s)",
+                                WORKER_NAME, profile_label, until.isoformat()
                             )
                             continue
                         
@@ -5791,7 +5829,11 @@ async def _run_scrape_cycle(
                             dolphin_lock_id = locked_id
                             # Restart profile lease keepalive with the new lock ID
                             _start_lease_keepalive(dolphin_lock_id, f"dolphin_profile_{dolphin_profile_id}", WORKER_PROXY_LEASE_SECONDS)
-                            logging.info("[%s] Dynamically claimed Dolphin Anty profile %s (%s)", WORKER_NAME, dolphin_profile_id, p.get("name"))
+                            logging.info(
+                                "[%s] Dynamically claimed Dolphin Anty profile %s",
+                                WORKER_NAME,
+                                str(p.get("name") or "").strip() or f"Dolphin profile {dolphin_profile_id}",
+                            )
                             break
 
                 if not dolphin_profile_id:
@@ -6405,6 +6447,12 @@ async def _run_worker_loop(
                         route["user_data_dir"] = (
                             str((selected_profile or {}).get("user_data_dir") or "").strip() or None
                         )
+                        route["dolphin_profile_id"] = (
+                            str((selected_profile or {}).get("dolphin_profile_id") or "").strip() or None
+                        )
+                        route["dolphin_profile_name"] = (
+                            str((selected_profile or {}).get("dolphin_profile_name") or "").strip() or None
+                        )
                         route["exploration_dispatch"] = bool(
                             prefer_non_hot and str(route.get("effective_lane") or "").strip().lower() != "hot"
                         )
@@ -6595,7 +6643,7 @@ async def _run_worker_loop(
                     WORKER_NAME,
                     route_name,
                     route.get("source", "unknown"),
-                    route.get("user_data_dir") or WORKER_USER_DATA_DIR or "(default)",
+                    _profile_display_label(route),
                     _normalize_proxy_mode(route.get("proxy_mode")),
                     route.get("effective_lane") or "warm",
                     route.get("priority_score"),
