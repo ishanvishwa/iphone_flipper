@@ -199,7 +199,7 @@ class WorkerV4RuntimeTests(unittest.IsolatedAsyncioTestCase):
                 worker,
                 "execute_family_claim",
                 AsyncMock(return_value=SimpleNamespace(query_diagnostics=[])),
-            ),
+            ) as execute_family_claim,
             patch.object(worker, "_upsert_worker_heartbeat", AsyncMock()) as heartbeat,
             patch.object(worker, "_cleanup_old_scrape_events", AsyncMock()),
         ):
@@ -215,6 +215,7 @@ class WorkerV4RuntimeTests(unittest.IsolatedAsyncioTestCase):
         first_route = heartbeat.await_args_list[0].kwargs["route"]
         self.assertEqual(first_route["source"], "v4")
         self.assertEqual(first_route["search_queries"], "iPhone")
+        self.assertTrue(execute_family_claim.await_args.kwargs["prime_marketplace_home_before_query"])
 
     async def test_dom_circuit_breaker_requires_distinct_profiles(self) -> None:
         class _FakeRedis:

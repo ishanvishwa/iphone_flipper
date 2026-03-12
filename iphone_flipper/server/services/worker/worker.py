@@ -3040,6 +3040,7 @@ async def _run_v4_family_claim(
             scroll_target_cards_override=WORKER_SCROLL_TARGET_CARDS,
             scroll_max_rounds_override=WORKER_SCROLL_MAX_ROUNDS,
             apply_inter_query_delay=False,
+            prime_marketplace_home_before_query=warm_session.executed_claims <= 0,
         )
         for diagnostic in execution.query_diagnostics:
             diagnostic_url = str(diagnostic.get("final_url") or "").strip()
