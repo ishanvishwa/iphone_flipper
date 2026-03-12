@@ -37,9 +37,19 @@ REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
 
 
+def _default_snapshot_dir() -> Path:
+    override = str(os.getenv("IPHONE_FLIPPER_V41_SNAPSHOT_DIR", "")).strip()
+    if override:
+        return Path(override).expanduser()
+    runtime_mount = Path("/app/runtime")
+    if runtime_mount.exists():
+        return runtime_mount
+    return PROJECT_ROOT / "server" / "runtime"
+
+
 def _default_snapshot_path() -> Path:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return PROJECT_ROOT / "server" / "runtime" / f"v41-cutover-snapshot-{timestamp}.json"
+    return _default_snapshot_dir() / f"v41-cutover-snapshot-{timestamp}.json"
 
 
 async def _open_db_pool() -> Any:

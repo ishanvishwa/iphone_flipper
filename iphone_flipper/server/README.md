@@ -170,14 +170,14 @@ docker compose --env-file ../.env up -d --build
 
 Use the V4.1 cutover tool to seed the initial `iphone_broad` family, snapshot the current flag state, and keep central dispatch available for fast rollback.
 
-From the server project root:
+From the VPS server project root:
 
 ```bash
 cd /home/ubuntu/iphone-flipper-server/server
-python scripts/v41_cutover.py status
-python scripts/v41_cutover.py snapshot
-python scripts/v41_cutover.py prepare
-python scripts/v41_cutover.py activate
+docker compose --env-file ../.env exec -T worker python server/scripts/v41_cutover.py status
+docker compose --env-file ../.env exec -T worker python server/scripts/v41_cutover.py snapshot
+docker compose --env-file ../.env exec -T worker python server/scripts/v41_cutover.py prepare
+docker compose --env-file ../.env exec -T worker python server/scripts/v41_cutover.py activate
 ```
 
 Behavior notes:
@@ -188,8 +188,8 @@ Behavior notes:
 Examples:
 
 ```bash
-python scripts/v41_cutover.py activate --source-route worker_3__env_default
-python scripts/v41_cutover.py rollback --snapshot runtime/v41-cutover-snapshot-20260312T030000Z.json
+docker compose --env-file ../.env exec -T worker python server/scripts/v41_cutover.py activate --source-route worker_3__env_default
+docker compose --env-file ../.env exec -T worker python server/scripts/v41_cutover.py rollback --snapshot /app/runtime/v41-cutover-snapshot-20260312T030000Z.json
 ```
 
 ## 9.2) Hardening Baseline (Do this before long runs)
