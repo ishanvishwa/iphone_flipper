@@ -164,6 +164,11 @@ class WorkerRouteBulkClearRequest(BaseModel):
     reason: str | None = None
 
 
+class ExecutionProfileManualLoginClearRequest(BaseModel):
+    user_data_dir: str
+    reason: str | None = None
+
+
 class ProxyStatsResetRequest(BaseModel):
     proxy_key: str | None = None
     proxy_server: str | None = None
@@ -1601,6 +1606,168 @@ async def get_execution_profiles(
         for row in rows
     ]
     return {"count": len(items), "items": items}
+
+
+@app.post("/execution-profiles/{worker_name}/clear-manual-login")
+async def clear_execution_profile_manual_login(
+    worker_name: str,
+    payload: ExecutionProfileManualLoginClearRequest,
+    x_api_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    await _auth_rest(x_api_token)
+    worker_name_clean = worker_name.strip()
+    user_data_dir = str(payload.user_data_dir or "").strip()
+    if not worker_name_clean:
+        raise HTTPException(status_code=400, detail="worker_name is required.")
+    if not user_data_dir:
+        raise HTTPException(status_code=400, detail="user_data_dir is required.")
+
+    reason = (payload.reason or "").strip() or "manual login cleared by operator"
+    async with app.state.db_pool.acquire() as conn:
+        execution_profile = await conn.fetchrow(
+            """
+            UPDATE execution_profiles
+            SET
+                status = CASE
+                    WHEN is_enabled = FALSE THEN 'DISABLED'
+                    ELSE 'READY'
+                END,
+                status_reason = $3,
+                status_since = NOW(),
+                cooldown_until = NULL,
+                manual_login_required = FALSE,
+                manual_login_reason = NULL,
+                manual_login_required_at = NULL,
+                quarantined_at = NULL,
+                quarantine_reason = NULL,
+                quarantine_evidence = NULL,
+                consecutive_failures = 0,
+                last_error = NULL
+            WHERE worker_name = $1
+              AND user_data_dir = $2
+            RETURNING
+                user_data_dir,
+                worker_name,
+                is_enabled,
+                status,
+                status_reason,
+                status_since,
+                cooldown_until,
+                manual_login_required,
+                manual_login_reason,
+                manual_login_required_at,
+                quarantined_at,
+                quarantine_reason,
+                quarantine_evidence,
+                last_selected_at,
+                last_success_at,
+                consecutive_failures,
+                last_error,
+                created_at,
+                updated_at
+            """,
+            worker_name_clean,
+            user_data_dir,
+            reason,
+        )
+        if execution_profile is None:
+            raise HTTPException(status_code=404, detail="Execution profile not found.")
+
+        v4_profile = await conn.fetchrow(
+            """
+            UPDATE profiles
+            SET
+                status = CASE
+                    WHEN is_enabled = FALSE THEN 'DISABLED'
+                    ELSE 'READY'
+                END,
+                status_reason = $3,
+                status_since = NOW(),
+                available_after = NOW(),
+                cooldown_until = NULL,
+                manual_login_required = FALSE,
+                manual_login_reason = NULL,
+                manual_login_required_at = NULL,
+                quarantined_at = NULL,
+                quarantine_reason = NULL,
+                quarantine_evidence = NULL,
+                failure_count = 0,
+                consecutive_empty_claims = 0,
+                last_error = NULL
+            WHERE worker_name = $1
+              AND user_data_dir = $2
+            RETURNING
+                profile_id,
+                worker_name,
+                user_data_dir,
+                is_enabled,
+                status,
+                status_reason,
+                status_since,
+                available_after,
+                cooldown_until,
+                manual_login_required,
+                manual_login_reason,
+                manual_login_required_at,
+                quarantined_at,
+                quarantine_reason,
+                quarantine_evidence,
+                failure_count,
+                consecutive_empty_claims,
+                last_started_at,
+                last_success_at,
+                last_failure_at,
+                last_heartbeat_at,
+                last_error,
+                profile_lease_token,
+                profile_lease_expires_at,
+                created_at,
+                updated_at
+            """,
+            worker_name_clean,
+            user_data_dir,
+            reason,
+        )
+
+    return {
+        "ok": True,
+        "worker_name": worker_name_clean,
+        "user_data_dir": user_data_dir,
+        "execution_profile": _serialize_datetimes(
+            dict(execution_profile),
+            (
+                "status_since",
+                "cooldown_until",
+                "manual_login_required_at",
+                "quarantined_at",
+                "last_selected_at",
+                "last_success_at",
+                "created_at",
+                "updated_at",
+            ),
+        ),
+        "profile": (
+            _serialize_datetimes(
+                dict(v4_profile),
+                (
+                    "status_since",
+                    "available_after",
+                    "cooldown_until",
+                    "manual_login_required_at",
+                    "quarantined_at",
+                    "last_started_at",
+                    "last_success_at",
+                    "last_failure_at",
+                    "last_heartbeat_at",
+                    "profile_lease_expires_at",
+                    "created_at",
+                    "updated_at",
+                ),
+            )
+            if v4_profile
+            else None
+        ),
+    }
 
 
 @app.get("/worker-routes")

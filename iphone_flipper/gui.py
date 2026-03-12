@@ -91,6 +91,9 @@ class iPhoneFlipperGUI:
         self.query_manager_accessory_max_price_var = None
         self.account_tree = None
         self.proxy_tree = None
+        self.dolphin_tree = None
+        self.dolphin_tree_columns = ()
+        self.dolphin_tree_column_index = {}
         self.vps_scraper_tree = None
         self.vps_worker_summary_tree = None
         self.account_form_vars = {}
@@ -100,6 +103,7 @@ class iPhoneFlipperGUI:
         self.selected_account_id = None
         self.selected_proxy_id = None
         self.selected_vps_scraper_key = None
+        self.dolphin_profile_records_by_id = {}
         self.proxy_options_by_id = {}
         self.vps_scraper_records_by_key = {}
         self.vps_worker_summary_records_by_key = {}
@@ -6506,6 +6510,7 @@ PY
 
         self.selected_proxy_id = None
         self.selected_vps_scraper_key = None
+        self.dolphin_profile_records_by_id = {}
         self.vps_scraper_records_by_key = {}
         self.vps_worker_summary_records_by_key = {}
         self.vps_proxy_profile_options = {}
@@ -6724,17 +6729,37 @@ PY
         dolphin_table_frame.rowconfigure(0, weight=1)
         dolphin_table_frame.columnconfigure(0, weight=1)
 
+        self.dolphin_tree_columns = (
+            "ID",
+            "Name",
+            "Worker",
+            "Runtime Profile",
+            "Worker Mode",
+            "Live Status",
+            "Manual Login",
+            "Dolphin Status",
+            "Browser",
+            "Tags",
+            "Memory",
+        )
+        self.dolphin_tree_column_index = {
+            column_name: index for index, column_name in enumerate(self.dolphin_tree_columns)
+        }
         self.dolphin_tree = ttk.Treeview(
             dolphin_table_frame,
-            columns=("ID", "Name", "Intervention Req", "Status", "Browser", "Tags", "Memory"),
+            columns=self.dolphin_tree_columns,
             show="headings",
             selectmode="extended",
         )
         for col, width in [
             ("ID", 80),
             ("Name", 180),
-            ("Intervention Req", 120),
-            ("Status", 100),
+            ("Worker", 90),
+            ("Runtime Profile", 130),
+            ("Worker Mode", 90),
+            ("Live Status", 180),
+            ("Manual Login", 110),
+            ("Dolphin Status", 110),
             ("Browser", 120),
             ("Tags", 150),
             ("Memory", 80),
@@ -6779,6 +6804,13 @@ PY
         ttk.Button(dolphin_buttons, text="Fetch Profiles", command=self._refresh_dolphin_profiles).pack(side=tk.LEFT, padx=5)
         ttk.Button(dolphin_buttons, text="Start Selected", command=self._start_selected_dolphin_profiles).pack(side=tk.LEFT, padx=5)
         ttk.Button(dolphin_buttons, text="Stop Selected", command=self._stop_selected_dolphin_profiles).pack(side=tk.LEFT, padx=5)
+        ttk.Button(dolphin_buttons, text="Clear Manual Login", command=self._clear_selected_dolphin_manual_login).pack(
+            side=tk.LEFT, padx=5
+        )
+        ttk.Label(
+            dolphin_tab,
+            text="Live VPS status is matched from execution profiles using worker/browser_profile_N naming.",
+        ).grid(row=3, column=0, sticky="w", padx=12, pady=(0, 10))
 
         accessory_frame = ttk.LabelFrame(vps_inner, text="Accessory Filter (Auto Exclusion)")
         accessory_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
@@ -7475,6 +7507,128 @@ PY
             self.status_bar.config(text=f"SSH tunnel error: {e}")
             return False
 
+    def _fetch_execution_profile_payloads(self):
+        ctx, error = self._get_server_api_context()
+        if error:
+            return [], error
+
+        try:
+            response = requests.get(
+                f"{ctx['base_url']}/execution-profiles",
+                headers=ctx["headers"],
+                timeout=(8, 25),
+            )
+            if response.status_code == 401:
+                return [], "Unauthorized for execution profiles (check Server API Token)."
+            response.raise_for_status()
+            payload = response.json() if response.content else {}
+        except Exception as exc:
+            return [], f"Failed to fetch execution profiles: {exc}"
+
+        profiles = []
+        for item in (payload.get("items") or []):
+            user_data_dir = str(item.get("user_data_dir") or "").strip()
+            worker_name = str(item.get("worker_name") or "").strip()
+            if user_data_dir and worker_name:
+                profiles.append(item)
+        return profiles, None
+
+    @staticmethod
+    def _worker_name_to_profile_slot(worker_name: str) -> int | None:
+        worker_name_clean = str(worker_name or "").strip()
+        if not worker_name_clean:
+            return None
+        if worker_name_clean == "worker":
+            return 1
+        match = re.search(r"worker[_ -]?(\d+)$", worker_name_clean, flags=re.IGNORECASE)
+        if not match:
+            return None
+        try:
+            slot = int(match.group(1))
+        except (TypeError, ValueError):
+            return None
+        return slot if slot > 0 else None
+
+    @staticmethod
+    def _profile_dir_to_slot(user_data_dir: str) -> int | None:
+        profile_dir = str(user_data_dir or "").strip()
+        match = re.search(r"/browser_profile_(\d+)$", profile_dir)
+        if not match:
+            return None
+        try:
+            slot = int(match.group(1))
+        except (TypeError, ValueError):
+            return None
+        return slot if slot > 0 else None
+
+    def _extract_dolphin_profile_slots(self, profile_payload: dict) -> list[int]:
+        candidates: list[int] = []
+        texts = [
+            str(profile_payload.get("name") or ""),
+            ", ".join(str(tag or "") for tag in (profile_payload.get("tags") or [])),
+        ]
+
+        def _push(slot_value: int | None) -> None:
+            if slot_value is None or slot_value <= 0 or slot_value in candidates:
+                return
+            candidates.append(slot_value)
+
+        for text in texts:
+            if not text:
+                continue
+            for match in re.finditer(r"\bbrowser[_ -]?profile[_ -]?(\d+)\b", text, flags=re.IGNORECASE):
+                try:
+                    _push(int(match.group(1)))
+                except (TypeError, ValueError):
+                    continue
+            for match in re.finditer(r"\bprofile[_ -]?(\d+)\b", text, flags=re.IGNORECASE):
+                try:
+                    _push(int(match.group(1)))
+                except (TypeError, ValueError):
+                    continue
+            for match in re.finditer(r"\bworker(?:[_ -]?(\d+))?\b", text, flags=re.IGNORECASE):
+                group_value = match.group(1)
+                if group_value:
+                    try:
+                        _push(int(group_value))
+                    except (TypeError, ValueError):
+                        continue
+                else:
+                    _push(1)
+
+        return candidates
+
+    def _index_execution_profiles_by_slot(self, execution_profiles: list[dict]) -> dict[int, dict]:
+        indexed: dict[int, dict] = {}
+        for execution_profile in execution_profiles:
+            slot = self._profile_dir_to_slot(execution_profile.get("user_data_dir"))
+            if slot is None:
+                slot = self._worker_name_to_profile_slot(execution_profile.get("worker_name"))
+            if slot is not None and slot not in indexed:
+                indexed[slot] = execution_profile
+        return indexed
+
+    def _match_dolphin_profile_to_execution_profile(
+        self,
+        profile_payload: dict,
+        execution_profiles_by_slot: dict[int, dict],
+    ) -> dict | None:
+        for slot in self._extract_dolphin_profile_slots(profile_payload):
+            matched = execution_profiles_by_slot.get(slot)
+            if matched is not None:
+                return matched
+        return None
+
+    @staticmethod
+    def _short_status_detail(status: str, reason: str) -> str:
+        status_clean = str(status or "").strip() or "-"
+        reason_clean = str(reason or "").strip()
+        if not reason_clean:
+            return status_clean
+        if len(reason_clean) > 48:
+            reason_clean = reason_clean[:45].rstrip() + "..."
+        return f"{status_clean}: {reason_clean}"
+
     def _refresh_dolphin_profiles(self):
         """Fetch profiles from the Dolphin Anty Cloud API and populate the tree."""
         if not hasattr(self, "dolphin_tree") or not self.dolphin_tree:
@@ -7493,6 +7647,12 @@ PY
             if resp.status_code == 200:
                 data = resp.json()
                 profiles = data.get("data", [])
+                selected_profile_ids = set(self.dolphin_tree.selection())
+                focused_profile_id = self.dolphin_tree.focus()
+                self.dolphin_profile_records_by_id = {}
+                execution_profiles, execution_profiles_error = self._fetch_execution_profile_payloads()
+                execution_profiles_by_slot = self._index_execution_profiles_by_slot(execution_profiles)
+                health_by_worker, health_error = self._fetch_vps_worker_health()
                 
                 # Clear existing
                 for row_id in self.dolphin_tree.get_children():
@@ -7507,19 +7667,64 @@ PY
                     
                     # Extract status from profile data
                     status_info = p.get("status", {})
-                    status = status_info.get("name", "Ready") if isinstance(status_info, dict) else "Ready"
-                    
-                    intervention_req = "Yes" if "MANUAL" in name.upper() or "LOGIN" in name.upper() else "No"
+                    dolphin_status = status_info.get("name", "Ready") if isinstance(status_info, dict) else "Ready"
+                    execution_profile = self._match_dolphin_profile_to_execution_profile(p, execution_profiles_by_slot)
+                    worker_name = str((execution_profile or {}).get("worker_name") or "").strip()
+                    runtime_profile = self._profile_display_name((execution_profile or {}).get("user_data_dir") or "")
+                    worker_health = health_by_worker.get(worker_name) if worker_name else {}
+                    worker_mode = str((worker_health or {}).get("route_source") or "").strip() or "-"
+                    live_status = self._short_status_detail(
+                        (execution_profile or {}).get("status") or "-",
+                        (execution_profile or {}).get("status_reason")
+                        or (execution_profile or {}).get("manual_login_reason")
+                        or "",
+                    )
+                    manual_login = (
+                        "Required"
+                        if bool((execution_profile or {}).get("manual_login_required"))
+                        or str((execution_profile or {}).get("status") or "").strip().upper() == "NEEDS_LOGIN"
+                        else "Clear"
+                    ) if execution_profile else "-"
+                    pid_text = str(pid)
+                    self.dolphin_profile_records_by_id[pid_text] = {
+                        "cloud_profile": p,
+                        "execution_profile": execution_profile,
+                        "worker_health": worker_health,
+                    }
                     
                     self.dolphin_tree.insert(
                         "",
                         tk.END,
-                        iid=str(pid),
-                        text=str(pid),
-                        values=(pid, name, intervention_req, status, browser_type, tags, memory)
+                        iid=pid_text,
+                        text=pid_text,
+                        values=(
+                            pid,
+                            name,
+                            worker_name or "-",
+                            runtime_profile if runtime_profile != "-" else "-",
+                            worker_mode,
+                            live_status,
+                            manual_login,
+                            dolphin_status,
+                            browser_type,
+                            tags,
+                            memory,
+                        )
                     )
-                
-                self.status_bar.config(text=f"Fetched {len(profiles)} Dolphin profiles.")
+
+                matched_selection = [item_id for item_id in selected_profile_ids if item_id in self.dolphin_tree.get_children()]
+                if matched_selection:
+                    self.dolphin_tree.selection_set(matched_selection)
+                    if focused_profile_id in matched_selection:
+                        self.dolphin_tree.focus(focused_profile_id)
+                        self.dolphin_tree.see(focused_profile_id)
+
+                status_parts = [f"Fetched {len(profiles)} Dolphin profiles."]
+                if execution_profiles_error:
+                    status_parts.append(f"Live VPS status unavailable: {execution_profiles_error}")
+                elif health_error:
+                    status_parts.append(f"Worker mode unavailable: {health_error}")
+                self.status_bar.config(text=" ".join(status_parts))
             elif resp.status_code == 401:
                 messagebox.showerror("Error", "Invalid API Key. Go to Dolphin Anty → API section to get a valid token.")
             else:
@@ -7542,6 +7747,7 @@ PY
             
         started = 0
         errors = []
+        dolphin_status_index = self.dolphin_tree_column_index.get("Dolphin Status", 7)
         for item_id in selected:
             profile_id = self.dolphin_tree.item(item_id, "values")[0]
             try:
@@ -7553,7 +7759,7 @@ PY
                         started += 1
                         # Update status in tree if successful
                         current_values = list(self.dolphin_tree.item(item_id, "values"))
-                        current_values[2] = f"Running (Port: {data.get('automation', {}).get('port', 'Unknown')})"
+                        current_values[dolphin_status_index] = f"Running (Port: {data.get('automation', {}).get('port', 'Unknown')})"
                         self.dolphin_tree.item(item_id, values=current_values)
                     else:
                         errors.append(f"Profile {profile_id}: {data.get('msg', 'Unknown error')}")
@@ -7585,6 +7791,7 @@ PY
             
         stopped = 0
         errors = []
+        dolphin_status_index = self.dolphin_tree_column_index.get("Dolphin Status", 7)
         for item_id in selected:
             profile_id = self.dolphin_tree.item(item_id, "values")[0]
             try:
@@ -7596,7 +7803,7 @@ PY
                         stopped += 1
                         # Update status in tree
                         current_values = list(self.dolphin_tree.item(item_id, "values"))
-                        current_values[2] = "Stopped"
+                        current_values[dolphin_status_index] = "Stopped"
                         self.dolphin_tree.item(item_id, values=current_values)
                     else:
                         errors.append(f"Profile {profile_id}: {data.get('msg', 'Unknown error')}")
@@ -7612,6 +7819,90 @@ PY
             messagebox.showerror("Dolphin Stop Errors", f"Failed to stop some profiles:\n{error_msg}")
                 
         self.status_bar.config(text=f"Sent stop command to {stopped} profiles.")
+
+    def _clear_selected_dolphin_manual_login(self):
+        if not hasattr(self, "dolphin_tree") or not self.dolphin_tree:
+            return
+
+        selected = self.dolphin_tree.selection()
+        if not selected:
+            messagebox.showinfo("Dolphin Profiles", "Select at least one Dolphin profile.")
+            return
+
+        selected_profiles = []
+        unmapped_profiles = []
+        for item_id in selected:
+            record = self.dolphin_profile_records_by_id.get(str(item_id)) or {}
+            execution_profile = record.get("execution_profile") or {}
+            if execution_profile:
+                selected_profiles.append((str(item_id), record))
+            else:
+                unmapped_profiles.append(str(item_id))
+
+        if not selected_profiles:
+            messagebox.showinfo(
+                "Dolphin Profiles",
+                "The selected Dolphin profiles are not mapped to a live VPS execution profile yet.",
+            )
+            return
+
+        if not messagebox.askyesno(
+            "Clear Manual Login",
+            "Clear manual-login quarantine for the selected live execution profile(s)?",
+        ):
+            return
+
+        reason = simpledialog.askstring(
+            "Clear Manual Login Reason (Optional)",
+            "Reason to record for this profile recovery:",
+            parent=self.settings_window or self.root,
+        )
+
+        ctx, error = self._get_server_api_context()
+        if error:
+            messagebox.showwarning("Dolphin Profiles", error)
+            return
+
+        cleared = 0
+        errors = []
+        for item_id, record in selected_profiles:
+            execution_profile = record.get("execution_profile") or {}
+            worker_name = str(execution_profile.get("worker_name") or "").strip()
+            user_data_dir = str(execution_profile.get("user_data_dir") or "").strip()
+            if not worker_name or not user_data_dir:
+                errors.append(f"Profile {item_id}: missing execution-profile mapping.")
+                continue
+
+            try:
+                response = requests.post(
+                    f"{ctx['base_url']}/execution-profiles/{quote(worker_name)}/clear-manual-login",
+                    headers=ctx["headers"],
+                    json={
+                        "user_data_dir": user_data_dir,
+                        "reason": (reason or "").strip() or None,
+                    },
+                    timeout=(8, 30),
+                )
+                if response.status_code == 401:
+                    raise RuntimeError("Unauthorized (check Server API Token).")
+                response.raise_for_status()
+                cleared += 1
+            except Exception as exc:
+                errors.append(f"Profile {item_id}: {exc}")
+
+        self._refresh_dolphin_profiles()
+        self._refresh_vps_scraper_tree(preserve_selection=True)
+
+        if errors:
+            error_msg = "\n".join(errors[:5])
+            if len(errors) > 5:
+                error_msg += f"\n... and {len(errors) - 5} more."
+            messagebox.showerror("Clear Manual Login", f"Some profiles could not be cleared:\n{error_msg}")
+
+        status_text = f"Cleared manual login on {cleared} profile(s)."
+        if unmapped_profiles:
+            status_text += f" {len(unmapped_profiles)} selected profile(s) had no VPS mapping."
+        self.status_bar.config(text=status_text)
 
 
 def main():

@@ -357,6 +357,94 @@ class ApiOpsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["items"][0]["worker_name"], "worker_3")
         self.assertEqual(payload["items"][0]["user_data_dir"], "/app/runtime/browser_profile_3")
 
+    async def test_clear_execution_profile_manual_login_updates_execution_and_v4_profiles(self) -> None:
+        class _ExecutionProfileClearConn:
+            def __init__(self) -> None:
+                self.execution_profile_args: tuple | None = None
+                self.profile_args: tuple | None = None
+
+            async def fetchrow(self, query: str, *args):
+                normalized = " ".join(str(query).split())
+                if normalized.startswith("UPDATE execution_profiles SET"):
+                    self.execution_profile_args = args
+                    return {
+                        "user_data_dir": "/app/runtime/browser_profile_3",
+                        "worker_name": "worker_3",
+                        "is_enabled": True,
+                        "status": "READY",
+                        "status_reason": "manual login cleared by operator",
+                        "status_since": None,
+                        "cooldown_until": None,
+                        "manual_login_required": False,
+                        "manual_login_reason": None,
+                        "manual_login_required_at": None,
+                        "quarantined_at": None,
+                        "quarantine_reason": None,
+                        "quarantine_evidence": None,
+                        "last_selected_at": None,
+                        "last_success_at": None,
+                        "consecutive_failures": 0,
+                        "last_error": None,
+                        "created_at": None,
+                        "updated_at": None,
+                    }
+                if normalized.startswith("UPDATE profiles SET"):
+                    self.profile_args = args
+                    return {
+                        "profile_id": 7,
+                        "worker_name": "worker_3",
+                        "user_data_dir": "/app/runtime/browser_profile_3",
+                        "is_enabled": True,
+                        "status": "READY",
+                        "status_reason": "manual login cleared by operator",
+                        "status_since": None,
+                        "available_after": None,
+                        "cooldown_until": None,
+                        "manual_login_required": False,
+                        "manual_login_reason": None,
+                        "manual_login_required_at": None,
+                        "quarantined_at": None,
+                        "quarantine_reason": None,
+                        "quarantine_evidence": None,
+                        "failure_count": 0,
+                        "consecutive_empty_claims": 0,
+                        "last_started_at": None,
+                        "last_success_at": None,
+                        "last_failure_at": None,
+                        "last_heartbeat_at": None,
+                        "last_error": None,
+                        "profile_lease_token": None,
+                        "profile_lease_expires_at": None,
+                        "created_at": None,
+                        "updated_at": None,
+                    }
+                return None
+
+        conn = _ExecutionProfileClearConn()
+        api_main.app.state.db_pool = _FakePool(conn)
+
+        with patch.object(api_main, "API_TOKEN", "test-token"):
+            payload = await api_main.clear_execution_profile_manual_login(
+                worker_name="worker_3",
+                payload=api_main.ExecutionProfileManualLoginClearRequest(
+                    user_data_dir="/app/runtime/browser_profile_3"
+                ),
+                x_api_token="test-token",
+            )
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["worker_name"], "worker_3")
+        self.assertEqual(payload["execution_profile"]["status"], "READY")
+        self.assertEqual(payload["profile"]["profile_id"], 7)
+        self.assertEqual(
+            conn.execution_profile_args,
+            ("worker_3", "/app/runtime/browser_profile_3", "manual login cleared by operator"),
+        )
+        self.assertEqual(
+            conn.profile_args,
+            ("worker_3", "/app/runtime/browser_profile_3", "manual login cleared by operator"),
+        )
+
     async def test_bootstrap_worker_routes_from_health_creates_missing_live_routes(self) -> None:
         class _BootstrapConn:
             def __init__(self) -> None:

@@ -1,5 +1,45 @@
 import unittest
+import sys
+import types
 from unittest.mock import patch
+
+
+def _install_stub_module(name: str, **attrs) -> None:
+    module = types.ModuleType(name)
+    for key, value in attrs.items():
+        setattr(module, key, value)
+    sys.modules.setdefault(name, module)
+
+
+_install_stub_module("desktop_sync", DesktopSyncCoordinator=object)
+_install_stub_module(
+    "deal_tracker",
+    init_deal_tracking_tables=lambda: None,
+    update_listing_conversion_scores=lambda: None,
+)
+_install_stub_module(
+    "negotiation_agent",
+    generate_response=lambda *args, **kwargs: "",
+    generate_initial_message=lambda *args, **kwargs: "",
+    analyze_conversation=lambda *args, **kwargs: {},
+)
+_install_stub_module(
+    "scraper",
+    ACCESSORY_SIGNAL_KEYWORDS=set(),
+    SEARCH_QUERIES=[],
+    init_db=lambda: None,
+    purge_accessory_only_listings=lambda *args, **kwargs: 0,
+    scrape_marketplace=lambda *args, **kwargs: [],
+    recalculate_listing_financials=lambda *args, **kwargs: 0,
+    update_fb_account_runtime_status=lambda *args, **kwargs: None,
+)
+_install_stub_module("notifications", notify_new_listings=lambda *args, **kwargs: None)
+_install_stub_module(
+    "requests",
+    get=lambda *args, **kwargs: None,
+    post=lambda *args, **kwargs: None,
+    put=lambda *args, **kwargs: None,
+)
 
 import gui
 
@@ -18,6 +58,7 @@ class _FakeVar:
 class _FakeTreeview:
     def __init__(self) -> None:
         self.rows: dict[str, tuple[str, ...]] = {}
+        self.text: dict[str, str] = {}
         self.selected: tuple[str, ...] = ()
         self.focused: str = ""
         self.seen: str | None = None
@@ -46,11 +87,20 @@ class _FakeTreeview:
     def get_children(self) -> tuple[str, ...]:
         return tuple(self.rows)
 
-    def insert(self, _parent: str, _index: str, iid: str, values: tuple[str, ...]) -> None:
+    def insert(self, _parent: str, _index: str, iid: str, values: tuple[str, ...], text: str = "") -> None:
         self.rows[iid] = values
+        self.text[iid] = text
 
     def delete(self, item_id: str) -> None:
         self.rows.pop(item_id, None)
+        self.text.pop(item_id, None)
+
+    def item(self, item_id: str, option: str | None = None, **kwargs):
+        if "values" in kwargs:
+            self.rows[item_id] = tuple(kwargs["values"])
+        if option == "values":
+            return self.rows[item_id]
+        return {"values": self.rows[item_id], "text": self.text.get(item_id, "")}
 
 
 class _FakeStatusBar:
@@ -64,10 +114,29 @@ class _FakeStatusBar:
 class GuiVpsScraperFallbackTests(unittest.TestCase):
     def _build_gui(self) -> gui.iPhoneFlipperGUI:
         app = gui.iPhoneFlipperGUI.__new__(gui.iPhoneFlipperGUI)
+        app.root = object()
         app.vps_scraper_tree = _FakeTreeview()
         app.vps_worker_summary_tree = _FakeTreeview()
+        app.dolphin_tree = _FakeTreeview()
         app.vps_scraper_records_by_key = {}
         app.vps_worker_summary_records_by_key = {}
+        app.dolphin_profile_records_by_id = {}
+        app.dolphin_tree_columns = (
+            "ID",
+            "Name",
+            "Worker",
+            "Runtime Profile",
+            "Worker Mode",
+            "Live Status",
+            "Manual Login",
+            "Dolphin Status",
+            "Browser",
+            "Tags",
+            "Memory",
+        )
+        app.dolphin_tree_column_index = {
+            column_name: index for index, column_name in enumerate(app.dolphin_tree_columns)
+        }
         app.selected_vps_scraper_key = None
         app.settings_window = None
         app.status_bar = _FakeStatusBar()
@@ -401,6 +470,111 @@ class GuiVpsScraperFallbackTests(unittest.TestCase):
             put_mock.call_args.kwargs["json"],
             {"queries": ["iPhone 15", "iPhone 15 Pro"]},
         )
+
+    def test_refresh_dolphin_profiles_populates_live_vps_status_columns(self) -> None:
+        app = self._build_gui()
+        app._dolphin_auth_headers = lambda: {"Authorization": "Bearer test-token"}
+        app._fetch_execution_profile_payloads = lambda: (
+            [
+                {
+                    "worker_name": "worker_3",
+                    "user_data_dir": "/app/runtime/browser_profile_3",
+                    "status": "NEEDS_LOGIN",
+                    "status_reason": "checkpoint",
+                    "manual_login_required": True,
+                    "manual_login_reason": "checkpoint",
+                }
+            ],
+            None,
+        )
+        app._fetch_vps_worker_health = lambda: ({"worker_3": {"route_source": "v4"}}, None)
+
+        class _Response:
+            status_code = 200
+            content = b'{"data": []}'
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict:
+                return {
+                    "data": [
+                        {
+                            "id": 746386753,
+                            "name": "Profile 3",
+                            "tags": ["worker_3"],
+                            "browserType": "chromium",
+                            "memory": {"value": "2 GB"},
+                            "status": {"name": "Ready"},
+                        }
+                    ]
+                }
+
+        with patch.object(gui.requests, "get", return_value=_Response()):
+            app._refresh_dolphin_profiles()
+
+        row = app.dolphin_tree.rows["746386753"]
+        self.assertEqual(row[2], "worker_3")
+        self.assertEqual(row[3], "browser_profile_3")
+        self.assertEqual(row[4], "v4")
+        self.assertEqual(row[6], "Required")
+        self.assertIn("NEEDS_LOGIN", row[5])
+        self.assertEqual(row[7], "Ready")
+
+    def test_clear_selected_dolphin_manual_login_calls_execution_profile_endpoint(self) -> None:
+        app = self._build_gui()
+        app.dolphin_tree.insert(
+            "",
+            "end",
+            iid="746386753",
+            values=("746386753", "Profile 3", "worker_3", "browser_profile_3", "v4", "NEEDS_LOGIN", "Required", "Ready", "chromium", "", "2 GB"),
+        )
+        app.dolphin_tree.selection_set("746386753")
+        app.dolphin_profile_records_by_id = {
+            "746386753": {
+                "execution_profile": {
+                    "worker_name": "worker_3",
+                    "user_data_dir": "/app/runtime/browser_profile_3",
+                }
+            }
+        }
+        app._get_server_api_context = lambda: (
+            {"base_url": "https://example.com", "headers": {"x-api-token": "test", "Content-Type": "application/json"}},
+            None,
+        )
+        app._refresh_dolphin_profiles = lambda: None
+        app._refresh_vps_scraper_tree = lambda preserve_selection=True: None
+
+        class _Response:
+            status_code = 200
+            content = b'{"ok": true}'
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict:
+                return {"ok": True}
+
+        with (
+            patch.object(gui.messagebox, "askyesno", return_value=True),
+            patch.object(gui.simpledialog, "askstring", return_value="login fixed"),
+            patch.object(gui.messagebox, "showerror"),
+            patch.object(gui.requests, "post", return_value=_Response()) as post_mock,
+        ):
+            app._clear_selected_dolphin_manual_login()
+
+        self.assertEqual(
+            post_mock.call_args.args[0],
+            "https://example.com/execution-profiles/worker_3/clear-manual-login",
+        )
+        self.assertEqual(
+            post_mock.call_args.kwargs["json"],
+            {
+                "user_data_dir": "/app/runtime/browser_profile_3",
+                "reason": "login fixed",
+            },
+        )
+        self.assertIn("Cleared manual login on 1 profile", app.status_bar.text)
 
 
 if __name__ == "__main__":
