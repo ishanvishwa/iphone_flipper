@@ -2889,22 +2889,47 @@ async def _start_v4_lease_heartbeat_task(
 async def _open_v4_warm_session(pool: asyncpg.Pool, profile: dict[str, Any]) -> V4WarmSessionState:
     _ = pool
     user_data_dir = str(profile.get("user_data_dir") or "").strip()
-    if not user_data_dir:
-        raise NoProxyAvailableError("Claimed V4 profile is missing user_data_dir.")
-    removed_lock_files = scrub_orphaned_chromium_locks(user_data_dir or None)
-    if removed_lock_files:
+    dolphin_profile_id = str(profile.get("dolphin_profile_id") or "").strip() or None
+    profile_label = _profile_display_label(profile)
+    if not dolphin_profile_id and not user_data_dir:
+        raise NoProxyAvailableError("Claimed V4 profile is missing both dolphin_profile_id and user_data_dir.")
+
+    if dolphin_profile_id:
         logging.info(
-            "[%s] scrubbed orphaned Chromium lock files for %s: %s",
+            "[%s] opening V4 warm session for %s via Dolphin profile %s",
             WORKER_NAME,
-            _profile_display_label(profile),
-            ", ".join(removed_lock_files),
+            profile_label,
+            dolphin_profile_id,
         )
-    session = await open_profile_session(user_data_dir=user_data_dir, headless=WORKER_HEADLESS)
+        session = await open_profile_session(
+            profile_id=dolphin_profile_id,
+            user_data_dir=user_data_dir or None,
+            headless=WORKER_HEADLESS,
+        )
+        runtime_identity = dolphin_profile_id
+    else:
+        removed_lock_files = scrub_orphaned_chromium_locks(user_data_dir or None)
+        if removed_lock_files:
+            logging.info(
+                "[%s] scrubbed orphaned Chromium lock files for %s: %s",
+                WORKER_NAME,
+                profile_label,
+                ", ".join(removed_lock_files),
+            )
+        logging.warning(
+            "[%s] opening V4 warm session for %s via local fallback %s because no Dolphin profile id is mapped",
+            WORKER_NAME,
+            profile_label,
+            user_data_dir,
+        )
+        session = await open_profile_session(user_data_dir=user_data_dir, headless=WORKER_HEADLESS)
+        runtime_identity = user_data_dir
+
     now_dt = datetime.now(timezone.utc)
     return V4WarmSessionState(
         profile=profile,
         profile_lease_token=str(profile.get("profile_lease_token") or ""),
-        runtime_identity=user_data_dir,
+        runtime_identity=runtime_identity,
         session=session,
         started_at=now_dt,
         last_activity_at=now_dt,

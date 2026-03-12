@@ -83,7 +83,30 @@ class WorkerV4RuntimeTests(unittest.IsolatedAsyncioTestCase):
             worker.PROFILE_MIN_REUSE_SECONDS,
         )
 
-    async def test_open_v4_warm_session_uses_claimed_profile_user_data_dir(self) -> None:
+    async def test_open_v4_warm_session_uses_claimed_dolphin_profile_when_available(self) -> None:
+        profile = {
+            "profile_id": 11,
+            "profile_lease_token": "lease-11",
+            "user_data_dir": "/profiles/11",
+            "dolphin_profile_id": "746386753",
+            "dolphin_profile_name": "Profile 11",
+        }
+
+        with (
+            patch.object(worker, "scrub_orphaned_chromium_locks", return_value=[]) as scrub_locks,
+            patch.object(worker, "open_profile_session", AsyncMock(return_value=object())) as open_session,
+        ):
+            warm_session = await worker._open_v4_warm_session(pool=object(), profile=profile)
+
+        scrub_locks.assert_not_called()
+        open_session.assert_awaited_once_with(
+            profile_id="746386753",
+            user_data_dir="/profiles/11",
+            headless=worker.WORKER_HEADLESS,
+        )
+        self.assertEqual(warm_session.runtime_identity, "746386753")
+
+    async def test_open_v4_warm_session_falls_back_to_claimed_profile_user_data_dir(self) -> None:
         profile = {"profile_id": 11, "profile_lease_token": "lease-11", "user_data_dir": "/profiles/11"}
 
         with (
