@@ -224,6 +224,12 @@ class V4RuntimeTests(unittest.TestCase):
         self.assertTrue(worker_rollout_enabled("worker_3", ("worker_3",)))
         self.assertFalse(worker_rollout_enabled("worker", ("worker_3",)))
 
+    def test_worker_rollout_enabled_accepts_all_v42_workers(self) -> None:
+        allowlist = ("worker", "worker_2", "worker_3")
+        self.assertTrue(worker_rollout_enabled("worker", allowlist))
+        self.assertTrue(worker_rollout_enabled("worker_2", allowlist))
+        self.assertTrue(worker_rollout_enabled("worker_3", allowlist))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -16,6 +16,10 @@ from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 from server.services.common.feature_flags import DEFAULT_FEATURE_FLAGS, FLAG_HASH_KEY, RedisFeatureFlags
+from server.services.common.v42_family_catalog import (
+    V42_FAMILY_CATALOG_VERSION,
+    V42_FAMILY_PRESETS,
+)
 from server.services.common.notification_dead_letter import (
     NOTIFICATION_DEAD_LETTER_STREAM_NAME,
     NotificationDeadLetterEvent,
@@ -186,6 +190,26 @@ class NotificationReplayRequest(BaseModel):
     limit: int = Field(default=100, ge=1, le=500)
     dry_run: bool = False
     listing_id: str | None = Field(default=None, max_length=255)
+
+
+class QueryVariantUpsertRequest(BaseModel):
+    query_text: str = Field(min_length=1, max_length=512)
+    validation_state: str = Field(default="pending_validation", max_length=64)
+    is_enabled: bool = True
+    weight: float = Field(default=1.0, ge=0.0, le=1000.0)
+    notes: str | None = None
+
+
+class QueryFamilyUpsertRequest(BaseModel):
+    previous_name: str | None = Field(default=None, max_length=255)
+    is_enabled: bool = True
+    priority: int = Field(default=100, ge=0, le=100000)
+    lane: str = Field(default="warm", max_length=16)
+    min_gap_s: int = Field(default=5, ge=0, le=86400)
+    max_gap_s: int | None = Field(default=None, ge=0, le=86400)
+    legacy_route_name: str | None = Field(default=None, max_length=255)
+    legacy_worker_name: str | None = Field(default=None, max_length=255)
+    variants: list[QueryVariantUpsertRequest] = Field(default_factory=list)
 
 
 def _assert_api_token(token: str | None) -> None:
@@ -597,6 +621,48 @@ def _normalize_query_items(queries: list[str] | None = None, query_csv: str | No
     return normalized or ["BUCKETS"]
 
 
+def _normalize_variant_state(value: str | None) -> str:
+    state = str(value or "").strip().lower()
+    if state in {"validated", "pending_validation", "rejected"}:
+        return state
+    return "pending_validation"
+
+
+def _normalize_family_variant_items(
+    variants: list[QueryVariantUpsertRequest] | None,
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, variant in enumerate(list(variants or [])):
+        query_text = str(variant.query_text or "").strip()
+        if not query_text:
+            continue
+        identity = query_text.lower()
+        if identity in seen:
+            continue
+        seen.add(identity)
+        normalized.append(
+            {
+                "query_text": query_text,
+                "validation_state": _normalize_variant_state(variant.validation_state),
+                "is_enabled": bool(variant.is_enabled),
+                "weight": float(variant.weight),
+                "variant_order": index,
+                "notes": str(variant.notes or "").strip() or None,
+            }
+        )
+    return normalized
+
+
+def _normalize_family_name(value: str) -> str:
+    return str(value or "").strip()
+
+
+def _normalize_family_lane(value: str | None) -> str:
+    lane = normalize_route_lane(value)
+    return lane or "warm"
+
+
 async def _replace_route_queries(
     conn: asyncpg.Connection,
     *,
@@ -702,6 +768,190 @@ def _serialize_central_route_row(
     item["search_queries"] = ", ".join(enabled_query_texts) if enabled_query_texts else "BUCKETS"
     item["query_count"] = len(queries)
     return item
+
+
+def _serialize_query_family_row(
+    row: Mapping[str, Any],
+    variants: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    item = _serialize_datetimes(
+        dict(row),
+        (
+            "next_due_at",
+            "last_claimed_at",
+            "last_discovery_at",
+            "last_success_at",
+            "family_lease_expires_at",
+            "created_at",
+            "updated_at",
+        ),
+    )
+    family_variants = list(variants or [])
+    validated_variants = [
+        variant
+        for variant in family_variants
+        if bool(variant.get("is_enabled", True))
+        and str(variant.get("validation_state") or "pending_validation").strip().lower() == "validated"
+    ]
+    enabled_variants = [
+        variant for variant in family_variants if bool(variant.get("is_enabled", True))
+    ]
+    item["variants"] = family_variants
+    item["validated_variant_count"] = len(validated_variants)
+    item["enabled_variant_count"] = len(enabled_variants)
+    item["search_queries"] = ", ".join(
+        str(variant.get("query_text") or "").strip()
+        for variant in validated_variants
+        if str(variant.get("query_text") or "").strip()
+    )
+    if not item["search_queries"]:
+        item["search_queries"] = ", ".join(
+            str(variant.get("query_text") or "").strip()
+            for variant in enabled_variants
+            if str(variant.get("query_text") or "").strip()
+        )
+    item["search_queries"] = item["search_queries"] or "-"
+    item["has_active_worker"] = bool(str(item.get("active_worker_name") or "").strip())
+    item["is_leased"] = bool(item.get("family_lease_token"))
+    return item
+
+
+async def _load_query_variants_by_family_id(
+    conn: asyncpg.Connection,
+    family_ids: list[int],
+) -> dict[int, list[dict[str, Any]]]:
+    cleaned_ids = [int(item) for item in family_ids if int(item or 0) > 0]
+    if not cleaned_ids:
+        return {}
+    rows = await conn.fetch(
+        """
+        SELECT
+            variant_id,
+            family_id,
+            query_text,
+            url_template,
+            validation_state,
+            weight,
+            variant_order,
+            is_enabled,
+            last_selected_at,
+            last_success_at,
+            notes,
+            created_at,
+            updated_at
+        FROM query_variants
+        WHERE family_id = ANY($1::BIGINT[])
+        ORDER BY family_id ASC, variant_order ASC, variant_id ASC
+        """,
+        cleaned_ids,
+    )
+    variants_by_family: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        family_id = int(row["family_id"])
+        variants_by_family.setdefault(family_id, []).append(
+            _serialize_datetimes(
+                dict(row),
+                ("last_selected_at", "last_success_at", "created_at", "updated_at"),
+            )
+        )
+    return variants_by_family
+
+
+async def _bootstrap_query_family_presets(
+    conn: asyncpg.Connection,
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for preset in V42_FAMILY_PRESETS:
+        family_row = await conn.fetchrow(
+            """
+            INSERT INTO query_families (
+                name,
+                legacy_route_name,
+                legacy_worker_name,
+                is_enabled,
+                priority,
+                lane,
+                next_due_at,
+                min_gap_s,
+                max_gap_s,
+                variant_cursor,
+                variant_count,
+                last_error
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, NOW(), $7, $8, 0, 0, NULL
+            )
+            ON CONFLICT (name) DO UPDATE SET
+                legacy_route_name = COALESCE(EXCLUDED.legacy_route_name, query_families.legacy_route_name),
+                legacy_worker_name = COALESCE(EXCLUDED.legacy_worker_name, query_families.legacy_worker_name),
+                is_enabled = EXCLUDED.is_enabled,
+                priority = EXCLUDED.priority,
+                lane = EXCLUDED.lane,
+                min_gap_s = EXCLUDED.min_gap_s,
+                max_gap_s = EXCLUDED.max_gap_s,
+                next_due_at = LEAST(query_families.next_due_at, NOW()),
+                last_error = NULL
+            RETURNING family_id, name
+            """,
+            preset.name,
+            preset.legacy_route_name,
+            preset.legacy_worker_name,
+            preset.is_enabled,
+            preset.priority,
+            preset.lane,
+            preset.min_gap_s,
+            preset.max_gap_s,
+        )
+        if family_row is None:
+            raise HTTPException(status_code=500, detail=f"Failed to bootstrap family {preset.name}.")
+        family_id = int(family_row["family_id"])
+        for variant_order, variant in enumerate(preset.variants):
+            await conn.execute(
+                """
+                INSERT INTO query_variants (
+                    family_id,
+                    query_text,
+                    url_template,
+                    validation_state,
+                    weight,
+                    variant_order,
+                    is_enabled,
+                    notes
+                ) VALUES (
+                    $1, $2, NULL, $3, $4, $5, $6, $7
+                )
+                ON CONFLICT (family_id, query_text) DO UPDATE SET
+                    validation_state = EXCLUDED.validation_state,
+                    weight = EXCLUDED.weight,
+                    variant_order = EXCLUDED.variant_order,
+                    is_enabled = EXCLUDED.is_enabled,
+                    notes = EXCLUDED.notes
+                """,
+                family_id,
+                variant.query_text,
+                _normalize_variant_state(variant.validation_state),
+                float(variant.weight),
+                variant_order,
+                bool(variant.is_enabled),
+                variant.notes,
+            )
+        await conn.execute(
+            """
+            UPDATE query_families
+            SET
+                variant_count = COALESCE((
+                    SELECT COUNT(*)::INT
+                    FROM query_variants
+                    WHERE family_id = $1
+                      AND COALESCE(is_enabled, TRUE) = TRUE
+                      AND LOWER(COALESCE(validation_state, 'pending_validation')) = 'validated'
+                ), 0),
+                variant_cursor = 0
+            WHERE family_id = $1
+            """,
+            family_id,
+        )
+        results.append({"family_id": family_id, "name": str(family_row["name"] or "").strip()})
+    return results
 
 
 async def _ensure_worker_tables(pool: asyncpg.Pool) -> None:
@@ -1523,6 +1773,388 @@ async def delete_central_route(
         )
     deleted = result.split()[-1] != "0"
     return {"ok": True, "deleted": deleted}
+
+
+@app.get("/query-families")
+async def get_query_families(
+    family_name: str | None = Query(default=None),
+    x_api_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    await _auth_rest(x_api_token)
+    family_name_filter = _normalize_family_name(family_name or "")
+    async with app.state.db_pool.acquire() as conn:
+        if family_name_filter:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    qf.family_id,
+                    qf.name,
+                    qf.legacy_route_name,
+                    qf.legacy_worker_name,
+                    qf.is_enabled,
+                    qf.priority,
+                    qf.priority_score,
+                    qf.lane,
+                    qf.next_due_at,
+                    qf.min_gap_s,
+                    qf.max_gap_s,
+                    qf.variant_cursor,
+                    qf.variant_count,
+                    qf.consecutive_hits,
+                    qf.consecutive_empty,
+                    qf.last_claimed_at,
+                    qf.last_discovery_at,
+                    qf.last_success_at,
+                    qf.last_error,
+                    qf.family_lease_token,
+                    qf.family_lease_expires_at,
+                    qf.created_at,
+                    qf.updated_at,
+                    hb.worker_name AS active_worker_name,
+                    hb.route_search_queries AS active_query_text,
+                    hb.route_user_data_dir AS active_user_data_dir,
+                    hb.status AS active_worker_status
+                FROM query_families qf
+                LEFT JOIN worker_heartbeats hb
+                  ON LOWER(COALESCE(hb.route_source, '')) = 'v4'
+                 AND hb.route_name = qf.name
+                WHERE qf.name = $1
+                ORDER BY qf.priority DESC, qf.name ASC
+                """,
+                family_name_filter,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    qf.family_id,
+                    qf.name,
+                    qf.legacy_route_name,
+                    qf.legacy_worker_name,
+                    qf.is_enabled,
+                    qf.priority,
+                    qf.priority_score,
+                    qf.lane,
+                    qf.next_due_at,
+                    qf.min_gap_s,
+                    qf.max_gap_s,
+                    qf.variant_cursor,
+                    qf.variant_count,
+                    qf.consecutive_hits,
+                    qf.consecutive_empty,
+                    qf.last_claimed_at,
+                    qf.last_discovery_at,
+                    qf.last_success_at,
+                    qf.last_error,
+                    qf.family_lease_token,
+                    qf.family_lease_expires_at,
+                    qf.created_at,
+                    qf.updated_at,
+                    hb.worker_name AS active_worker_name,
+                    hb.route_search_queries AS active_query_text,
+                    hb.route_user_data_dir AS active_user_data_dir,
+                    hb.status AS active_worker_status
+                FROM query_families qf
+                LEFT JOIN worker_heartbeats hb
+                  ON LOWER(COALESCE(hb.route_source, '')) = 'v4'
+                 AND hb.route_name = qf.name
+                ORDER BY qf.priority DESC, qf.name ASC
+                """
+            )
+        family_ids = [int(row["family_id"]) for row in rows if int(row["family_id"] or 0) > 0]
+        variants_by_family = await _load_query_variants_by_family_id(conn, family_ids)
+
+    items = [
+        _serialize_query_family_row(dict(row), variants_by_family.get(int(row["family_id"]), []))
+        for row in rows
+    ]
+    return {
+        "count": len(items),
+        "catalog_version": V42_FAMILY_CATALOG_VERSION,
+        "items": items,
+    }
+
+
+@app.put("/query-families/{family_name}")
+async def upsert_query_family(
+    family_name: str,
+    payload: QueryFamilyUpsertRequest,
+    x_api_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    await _auth_rest(x_api_token)
+    family_name_clean = _normalize_family_name(family_name)
+    if not family_name_clean:
+        raise HTTPException(status_code=400, detail="family_name is required.")
+    previous_name = _normalize_family_name(payload.previous_name or "")
+    lane = _normalize_family_lane(payload.lane)
+    variants = _normalize_family_variant_items(payload.variants)
+    if not variants:
+        raise HTTPException(status_code=400, detail="At least one variant is required.")
+
+    async with app.state.db_pool.acquire() as conn:
+        async with conn.transaction():
+            family_row = None
+            if previous_name and previous_name != family_name_clean:
+                existing_target = await conn.fetchval(
+                    "SELECT 1 FROM query_families WHERE name = $1",
+                    family_name_clean,
+                )
+                if existing_target:
+                    raise HTTPException(status_code=409, detail="Target family name already exists.")
+                family_row = await conn.fetchrow(
+                    """
+                    UPDATE query_families
+                    SET
+                        name = $1,
+                        legacy_route_name = COALESCE($2, legacy_route_name),
+                        legacy_worker_name = COALESCE($3, legacy_worker_name),
+                        is_enabled = $4,
+                        priority = $5,
+                        lane = $6,
+                        min_gap_s = $7,
+                        max_gap_s = $8,
+                        next_due_at = NOW()
+                    WHERE name = $9
+                    RETURNING *
+                    """,
+                    family_name_clean,
+                    (payload.legacy_route_name or "").strip() or None,
+                    (payload.legacy_worker_name or "").strip() or None,
+                    bool(payload.is_enabled),
+                    int(payload.priority),
+                    lane,
+                    int(payload.min_gap_s),
+                    payload.max_gap_s,
+                    previous_name,
+                )
+                if family_row is None:
+                    raise HTTPException(status_code=404, detail="Previous family not found.")
+            else:
+                family_row = await conn.fetchrow(
+                    """
+                    INSERT INTO query_families (
+                        name,
+                        legacy_route_name,
+                        legacy_worker_name,
+                        is_enabled,
+                        priority,
+                        lane,
+                        next_due_at,
+                        min_gap_s,
+                        max_gap_s,
+                        variant_cursor,
+                        variant_count,
+                        last_error
+                    ) VALUES (
+                        $1, $2, $3, $4, $5, $6, NOW(), $7, $8, 0, 0, NULL
+                    )
+                    ON CONFLICT (name) DO UPDATE SET
+                        legacy_route_name = COALESCE(EXCLUDED.legacy_route_name, query_families.legacy_route_name),
+                        legacy_worker_name = COALESCE(EXCLUDED.legacy_worker_name, query_families.legacy_worker_name),
+                        is_enabled = EXCLUDED.is_enabled,
+                        priority = EXCLUDED.priority,
+                        lane = EXCLUDED.lane,
+                        min_gap_s = EXCLUDED.min_gap_s,
+                        max_gap_s = EXCLUDED.max_gap_s,
+                        next_due_at = NOW(),
+                        last_error = NULL
+                    RETURNING *
+                    """,
+                    family_name_clean,
+                    (payload.legacy_route_name or "").strip() or None,
+                    (payload.legacy_worker_name or "").strip() or None,
+                    bool(payload.is_enabled),
+                    int(payload.priority),
+                    lane,
+                    int(payload.min_gap_s),
+                    payload.max_gap_s,
+                )
+            if family_row is None:
+                raise HTTPException(status_code=500, detail="Failed to save query family.")
+
+            family_id = int(family_row["family_id"])
+            query_texts = [str(item["query_text"]) for item in variants]
+            await conn.execute(
+                """
+                DELETE FROM query_variants
+                WHERE family_id = $1
+                  AND NOT (query_text = ANY($2::TEXT[]))
+                """,
+                family_id,
+                query_texts,
+            )
+            for variant in variants:
+                await conn.execute(
+                    """
+                    INSERT INTO query_variants (
+                        family_id,
+                        query_text,
+                        url_template,
+                        validation_state,
+                        weight,
+                        variant_order,
+                        is_enabled,
+                        notes
+                    ) VALUES (
+                        $1, $2, NULL, $3, $4, $5, $6, $7
+                    )
+                    ON CONFLICT (family_id, query_text) DO UPDATE SET
+                        validation_state = EXCLUDED.validation_state,
+                        weight = EXCLUDED.weight,
+                        variant_order = EXCLUDED.variant_order,
+                        is_enabled = EXCLUDED.is_enabled,
+                        notes = EXCLUDED.notes
+                    """,
+                    family_id,
+                    variant["query_text"],
+                    variant["validation_state"],
+                    variant["weight"],
+                    variant["variant_order"],
+                    variant["is_enabled"],
+                    variant["notes"],
+                )
+            family_row = await conn.fetchrow(
+                """
+                UPDATE query_families
+                SET
+                    variant_count = COALESCE((
+                        SELECT COUNT(*)::INT
+                        FROM query_variants
+                        WHERE family_id = $1
+                          AND COALESCE(is_enabled, TRUE) = TRUE
+                          AND LOWER(COALESCE(validation_state, 'pending_validation')) = 'validated'
+                    ), 0),
+                    variant_cursor = CASE
+                        WHEN COALESCE((
+                            SELECT COUNT(*)::INT
+                            FROM query_variants
+                            WHERE family_id = $1
+                              AND COALESCE(is_enabled, TRUE) = TRUE
+                              AND LOWER(COALESCE(validation_state, 'pending_validation')) = 'validated'
+                        ), 0) <= 0 THEN 0
+                        ELSE LEAST(
+                            COALESCE(variant_cursor, 0),
+                            COALESCE((
+                                SELECT COUNT(*)::INT
+                                FROM query_variants
+                                WHERE family_id = $1
+                                  AND COALESCE(is_enabled, TRUE) = TRUE
+                                  AND LOWER(COALESCE(validation_state, 'pending_validation')) = 'validated'
+                            ), 1) - 1
+                        )
+                    END,
+                    next_due_at = NOW()
+                WHERE family_id = $1
+                RETURNING *
+                """,
+                family_id,
+            )
+            family_rows = await conn.fetch(
+                """
+                SELECT
+                    qf.family_id,
+                    qf.name,
+                    qf.legacy_route_name,
+                    qf.legacy_worker_name,
+                    qf.is_enabled,
+                    qf.priority,
+                    qf.priority_score,
+                    qf.lane,
+                    qf.next_due_at,
+                    qf.min_gap_s,
+                    qf.max_gap_s,
+                    qf.variant_cursor,
+                    qf.variant_count,
+                    qf.consecutive_hits,
+                    qf.consecutive_empty,
+                    qf.last_claimed_at,
+                    qf.last_discovery_at,
+                    qf.last_success_at,
+                    qf.last_error,
+                    qf.family_lease_token,
+                    qf.family_lease_expires_at,
+                    qf.created_at,
+                    qf.updated_at,
+                    hb.worker_name AS active_worker_name,
+                    hb.route_search_queries AS active_query_text,
+                    hb.route_user_data_dir AS active_user_data_dir,
+                    hb.status AS active_worker_status
+                FROM query_families qf
+                LEFT JOIN worker_heartbeats hb
+                  ON LOWER(COALESCE(hb.route_source, '')) = 'v4'
+                 AND hb.route_name = qf.name
+                WHERE qf.family_id = $1
+                """,
+                family_id,
+            )
+            variants_by_family = await _load_query_variants_by_family_id(conn, [family_id])
+
+    item = _serialize_query_family_row(dict(family_rows[0]), variants_by_family.get(family_id, []))
+    return {"ok": True, "catalog_version": V42_FAMILY_CATALOG_VERSION, "item": item}
+
+
+@app.post("/query-families/bootstrap-presets")
+async def bootstrap_query_family_presets(
+    x_api_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    await _auth_rest(x_api_token)
+    async with app.state.db_pool.acquire() as conn:
+        async with conn.transaction():
+            seeded = await _bootstrap_query_family_presets(conn)
+        rows = await conn.fetch(
+            """
+            SELECT
+                qf.family_id,
+                qf.name,
+                qf.legacy_route_name,
+                qf.legacy_worker_name,
+                qf.is_enabled,
+                qf.priority,
+                qf.priority_score,
+                qf.lane,
+                qf.next_due_at,
+                qf.min_gap_s,
+                qf.max_gap_s,
+                qf.variant_cursor,
+                qf.variant_count,
+                qf.consecutive_hits,
+                qf.consecutive_empty,
+                qf.last_claimed_at,
+                qf.last_discovery_at,
+                qf.last_success_at,
+                qf.last_error,
+                qf.family_lease_token,
+                qf.family_lease_expires_at,
+                qf.created_at,
+                qf.updated_at,
+                hb.worker_name AS active_worker_name,
+                hb.route_search_queries AS active_query_text,
+                hb.route_user_data_dir AS active_user_data_dir,
+                hb.status AS active_worker_status
+            FROM query_families qf
+            LEFT JOIN worker_heartbeats hb
+              ON LOWER(COALESCE(hb.route_source, '')) = 'v4'
+             AND hb.route_name = qf.name
+            WHERE qf.name = ANY($1::TEXT[])
+            ORDER BY qf.priority DESC, qf.name ASC
+            """,
+            [preset.name for preset in V42_FAMILY_PRESETS],
+        )
+        variants_by_family = await _load_query_variants_by_family_id(
+            conn,
+            [int(row["family_id"]) for row in rows if int(row["family_id"] or 0) > 0],
+        )
+
+    items = [
+        _serialize_query_family_row(dict(row), variants_by_family.get(int(row["family_id"]), []))
+        for row in rows
+    ]
+    return {
+        "ok": True,
+        "catalog_version": V42_FAMILY_CATALOG_VERSION,
+        "seeded_count": len(seeded),
+        "items": items,
+    }
 
 
 @app.get("/execution-profiles")

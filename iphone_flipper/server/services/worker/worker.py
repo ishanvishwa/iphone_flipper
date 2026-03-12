@@ -365,7 +365,9 @@ PRICE_DROP_UPDATE_MODE = _normalize_price_drop_update_mode(os.getenv("PRICE_DROP
 V4_DOM_INVESTIGATION_BACKOFF_SECONDS = 300
 V4_INFRA_FAMILY_BACKOFF_SECONDS = 60
 V4_ROLLOUT_FAMILY_ALLOWLIST = _parse_csv_tokens(os.getenv("V4_ROLLOUT_FAMILY_ALLOWLIST", "iphone_broad"))
-V4_ROLLOUT_WORKER_ALLOWLIST = _parse_csv_tokens(os.getenv("V4_ROLLOUT_WORKER_ALLOWLIST", ""))
+V4_ROLLOUT_WORKER_ALLOWLIST = _parse_csv_tokens(
+    os.getenv("V4_ROLLOUT_WORKER_ALLOWLIST", "worker,worker_2,worker_3")
+)
 IPHONE_BROAD_MIN_GAP_SECONDS = _parse_int(os.getenv("IPHONE_BROAD_MIN_GAP_SECONDS"), default=5, minimum=1)
 IPHONE_BROAD_INITIAL_VARIANTS = _parse_int(os.getenv("IPHONE_BROAD_INITIAL_VARIANTS"), default=1, minimum=1)
 V4_DOM_CHANGED_THRESHOLD = _parse_int(os.getenv("V4_DOM_CHANGED_THRESHOLD"), default=3, minimum=1)

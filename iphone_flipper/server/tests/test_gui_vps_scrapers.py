@@ -138,6 +138,12 @@ class GuiVpsScraperFallbackTests(unittest.TestCase):
             column_name: index for index, column_name in enumerate(app.dolphin_tree_columns)
         }
         app.selected_vps_scraper_key = None
+        app.query_manager_window = None
+        app.query_manager_variant_tree = None
+        app.query_manager_legacy_tree = None
+        app.query_manager_family_form_vars = {}
+        app.query_manager_family_variants = []
+        app.query_manager_family_original_name = None
         app.settings_window = None
         app.status_bar = _FakeStatusBar()
         app.vps_proxy_profile_options = {}
@@ -209,7 +215,7 @@ class GuiVpsScraperFallbackTests(unittest.TestCase):
         )
         self.assertEqual(
             app.vps_worker_summary_tree.rows["worker_3"],
-            ("worker_3", "env-backed", "env", "0/0", "env-only", "ok", "12", "2026-03-10 00:00:00"),
+            ("worker_3", "env", "-", "env-backed", "-", "ok", "12", "2026-03-10 00:00:00"),
         )
         self.assertTrue(app.vps_scraper_records_by_key[key]["route"]["is_synthetic_health_row"])
         self.assertIn("No saved central routes found", app.status_bar.text)
@@ -353,7 +359,7 @@ class GuiVpsScraperFallbackTests(unittest.TestCase):
         )
         self.assertEqual(
             app.vps_worker_summary_tree.rows["worker"],
-            ("worker", "iphone_16_hot", "hot", "2/2", "1 hot | 0 warm | 1 sweep", "ok", "19", "2026-03-10 02:03:04"),
+            ("worker", "central", "-", "iphone_16_hot", "iPhone 16 Pro, iPhone 16 Pro Max", "ok", "19", "2026-03-10 02:03:04"),
         )
 
         app.vps_worker_summary_tree.selection_set("worker")
@@ -434,24 +440,115 @@ class GuiVpsScraperFallbackTests(unittest.TestCase):
         self.assertIn("worker_3", health_by_worker)
         self.assertEqual(get_mock.call_count, 2)
 
-    def test_save_query_manager_route_queries_uses_central_route_endpoint(self) -> None:
+    def test_refresh_query_manager_routes_loads_v4_families_and_legacy_routes(self) -> None:
         app = self._build_gui()
         app.query_manager_tree = _FakeTreeview()
-        app.query_manager_tree.insert("", "end", iid="route::iphone_hot", values=())
-        app.query_manager_tree.selection_set("route::iphone_hot")
+        app.query_manager_variant_tree = _FakeTreeview()
+        app.query_manager_legacy_tree = _FakeTreeview()
+        app.query_manager_family_form_vars = {
+            "name": _FakeVar(),
+            "is_enabled": _FakeVar(),
+            "lane": _FakeVar(),
+            "priority": _FakeVar(),
+            "min_gap_s": _FakeVar(),
+        }
+        app._fetch_query_family_payloads = lambda: (
+            [
+                {
+                    "name": "iphone_broad",
+                    "is_enabled": True,
+                    "lane": "hot",
+                    "priority": 300,
+                    "min_gap_s": 5,
+                    "validated_variant_count": 1,
+                    "active_worker_name": "worker_3",
+                    "last_discovery_at": "2026-03-10T03:04:05+00:00",
+                    "variants": [
+                        {
+                            "query_text": "iPhone",
+                            "validation_state": "validated",
+                            "is_enabled": True,
+                            "weight": 1.0,
+                            "notes": "broad",
+                        }
+                    ],
+                }
+            ],
+            None,
+        )
+        app._fetch_vps_scraper_payloads = lambda: (
+            [
+                {
+                    "legacy_worker_name": "worker",
+                    "route_name": "env_default",
+                    "search_queries": "iPhone 15 Pro",
+                    "effective_lane": "warm",
+                    "computed_lane": "warm",
+                    "status": "ENABLED",
+                    "priority": 100,
+                }
+            ],
+            {},
+            None,
+        )
+
+        app._refresh_query_manager_routes()
+
+        self.assertEqual(
+            app.query_manager_tree.rows["family::iphone_broad"],
+            ("iphone_broad", "Yes", "hot", "5", "1/1", "worker_3", "2026-03-10 03:04:05"),
+        )
+        self.assertEqual(app.query_manager_family_form_vars["name"].get(), "iphone_broad")
+        self.assertEqual(app.query_manager_variant_tree.rows["variant::0"], ("iPhone", "validated", "Yes", "1", "broad"))
+        self.assertEqual(
+            app.query_manager_legacy_tree.rows["legacy::env_default"],
+            ("worker", "env_default", "warm", "iPhone 15 Pro", "ENABLED"),
+        )
+
+    def test_save_query_manager_route_queries_uses_v4_family_endpoint(self) -> None:
+        app = self._build_gui()
+        app.query_manager_tree = _FakeTreeview()
+        app.query_manager_tree.insert("", "end", iid="family::iphone_hot", values=())
+        app.query_manager_tree.selection_set("family::iphone_hot")
         app.query_manager_routes_by_key = {
-            "route::iphone_hot": {
-                "route_name": "iphone_hot",
-                "legacy_worker_name": "worker_3",
-                "search_queries": "iPhone 15",
+            "family::iphone_hot": {
+                "family": {
+                    "name": "iphone_hot",
+                    "legacy_route_name": "worker_3__env_default",
+                    "legacy_worker_name": "worker_3",
+                    "max_gap_s": None,
+                }
             }
         }
-        app.query_manager_query_var = _FakeVar("iPhone 15, iPhone 15 Pro")
+        app.query_manager_family_form_vars = {
+            "name": _FakeVar("iphone_hot"),
+            "is_enabled": _FakeVar("1"),
+            "lane": _FakeVar("warm"),
+            "priority": _FakeVar("220"),
+            "min_gap_s": _FakeVar("15"),
+        }
+        app.query_manager_family_variants = [
+            {
+                "query_text": "iPhone 15",
+                "validation_state": "validated",
+                "is_enabled": True,
+                "weight": 1.0,
+                "notes": "primary",
+            },
+            {
+                "query_text": "iPhone 15 Pro",
+                "validation_state": "pending_validation",
+                "is_enabled": False,
+                "weight": 0.5,
+                "notes": "staged",
+            },
+        ]
+        app.query_manager_family_original_name = "iphone_hot"
         app._get_server_api_context = lambda: (
             {"base_url": "https://example.com", "headers": {"x-api-token": "test", "Content-Type": "application/json"}},
             None,
         )
-        app._refresh_query_manager_routes = lambda: None
+        app._refresh_query_manager_routes = lambda preferred_family_name=None: None
 
         class _Response:
             status_code = 200
@@ -464,11 +561,36 @@ class GuiVpsScraperFallbackTests(unittest.TestCase):
 
         self.assertEqual(
             put_mock.call_args.args[0],
-            "https://example.com/routes/iphone_hot/queries",
+            "https://example.com/query-families/iphone_hot",
         )
         self.assertEqual(
             put_mock.call_args.kwargs["json"],
-            {"queries": ["iPhone 15", "iPhone 15 Pro"]},
+            {
+                "previous_name": "iphone_hot",
+                "is_enabled": True,
+                "priority": 220,
+                "lane": "warm",
+                "min_gap_s": 15,
+                "max_gap_s": None,
+                "legacy_route_name": "worker_3__env_default",
+                "legacy_worker_name": "worker_3",
+                "variants": [
+                    {
+                        "query_text": "iPhone 15",
+                        "validation_state": "validated",
+                        "is_enabled": True,
+                        "weight": 1.0,
+                        "notes": "primary",
+                    },
+                    {
+                        "query_text": "iPhone 15 Pro",
+                        "validation_state": "pending_validation",
+                        "is_enabled": False,
+                        "weight": 0.5,
+                        "notes": "staged",
+                    },
+                ],
+            },
         )
 
     def test_refresh_dolphin_profiles_populates_live_vps_status_columns(self) -> None:

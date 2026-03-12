@@ -86,6 +86,11 @@ class iPhoneFlipperGUI:
         self.query_manager_window = None
         self.query_manager_tree = None
         self.query_manager_routes_by_key = {}
+        self.query_manager_variant_tree = None
+        self.query_manager_legacy_tree = None
+        self.query_manager_family_form_vars = {}
+        self.query_manager_family_variants = []
+        self.query_manager_family_original_name = None
         self.query_manager_query_var = None
         self.query_manager_negative_keywords_var = None
         self.query_manager_accessory_max_price_var = None
@@ -1477,7 +1482,159 @@ PY"""
         )
         self._run_server_ssh_command("Listing Count", remote_cmd)
 
-    def _refresh_query_manager_routes(self):
+    def _fetch_query_family_payloads(self):
+        ctx, error = self._get_server_api_context()
+        if error:
+            return [], error
+
+        try:
+            response = requests.get(
+                f"{ctx['base_url']}/query-families",
+                headers=ctx["headers"],
+                timeout=(8, 25),
+            )
+            if response.status_code == 401:
+                return [], "Unauthorized for V4 query families (check Server API Token)."
+            response.raise_for_status()
+            payload = response.json() if response.content else {}
+        except Exception as exc:
+            return [], f"Failed to fetch V4 query families: {exc}"
+
+        return payload.get("items") or [], None
+
+    @staticmethod
+    def _normalize_query_manager_variant_state(value: str) -> str:
+        state = str(value or "").strip().lower()
+        if state in {"validated", "pending_validation", "rejected"}:
+            return state
+        return "pending_validation"
+
+    def _render_query_manager_variants(self):
+        if not self.query_manager_variant_tree:
+            return
+        for item in self.query_manager_variant_tree.get_children():
+            self.query_manager_variant_tree.delete(item)
+        for index, variant in enumerate(self.query_manager_family_variants):
+            query_text = str(variant.get("query_text") or "").strip()
+            if not query_text:
+                continue
+            weight = variant.get("weight")
+            try:
+                weight_display = f"{float(weight):.2f}".rstrip("0").rstrip(".")
+            except (TypeError, ValueError):
+                weight_display = str(weight or "1")
+            self.query_manager_variant_tree.insert(
+                "",
+                tk.END,
+                iid=f"variant::{index}",
+                values=(
+                    query_text,
+                    self._normalize_query_manager_variant_state(variant.get("validation_state") or ""),
+                    "Yes" if bool(variant.get("is_enabled", True)) else "No",
+                    weight_display,
+                    str(variant.get("notes") or "").strip(),
+                ),
+            )
+
+    def _selected_query_manager_variant_index(self):
+        if not self.query_manager_variant_tree:
+            return None
+        selection = self.query_manager_variant_tree.selection()
+        if not selection:
+            return None
+        key = str(selection[0] or "")
+        if not key.startswith("variant::"):
+            return None
+        return self._safe_int(key.split("::", 1)[1], -1)
+
+    def _clear_query_manager_family_editor(self):
+        self.query_manager_family_original_name = None
+        self.query_manager_family_variants = []
+        defaults = {
+            "name": "",
+            "is_enabled": "1",
+            "lane": "warm",
+            "priority": "100",
+            "min_gap_s": "15",
+        }
+        for key, value in defaults.items():
+            var = self.query_manager_family_form_vars.get(key)
+            if hasattr(var, "set"):
+                var.set(value)
+        self._render_query_manager_variants()
+
+    def _populate_query_manager_family_editor(self, family: dict):
+        self.query_manager_family_original_name = str(family.get("name") or "").strip() or None
+        values = {
+            "name": str(family.get("name") or "").strip(),
+            "is_enabled": "1" if bool(family.get("is_enabled", True)) else "0",
+            "lane": str(family.get("lane") or "warm").strip() or "warm",
+            "priority": str(self._safe_int(family.get("priority"), 100)),
+            "min_gap_s": str(self._safe_int(family.get("min_gap_s"), 15)),
+        }
+        for key, value in values.items():
+            var = self.query_manager_family_form_vars.get(key)
+            if hasattr(var, "set"):
+                var.set(value)
+        self.query_manager_family_variants = [
+            {
+                "query_text": str(variant.get("query_text") or "").strip(),
+                "validation_state": self._normalize_query_manager_variant_state(
+                    variant.get("validation_state") or ""
+                ),
+                "is_enabled": bool(variant.get("is_enabled", True)),
+                "weight": float(variant.get("weight") or 1.0),
+                "notes": str(variant.get("notes") or "").strip() or None,
+            }
+            for variant in list(family.get("variants") or [])
+            if str(variant.get("query_text") or "").strip()
+        ]
+        self._render_query_manager_variants()
+
+    def _on_query_manager_route_selected(self, event=None):
+        if not self.query_manager_tree:
+            return
+        selection = self.query_manager_tree.selection()
+        if not selection:
+            self._clear_query_manager_family_editor()
+            return
+        key = selection[0]
+        data = self.query_manager_routes_by_key.get(key, {})
+        family = data.get("family") or {}
+        self._populate_query_manager_family_editor(family)
+
+    def _refresh_query_manager_legacy_routes(self, routes: list[dict]):
+        if not self.query_manager_legacy_tree:
+            return
+        for item in self.query_manager_legacy_tree.get_children():
+            self.query_manager_legacy_tree.delete(item)
+        for route in sorted(
+            routes,
+            key=lambda item: (
+                str(item.get("legacy_worker_name") or item.get("worker_name") or "").strip(),
+                self._safe_int(item.get("priority"), 100),
+                str(item.get("route_name") or "").strip(),
+            ),
+        ):
+            route_name = str(route.get("route_name") or "").strip()
+            if not route_name:
+                continue
+            lane = str(route.get("effective_lane") or route.get("computed_lane") or "warm").strip() or "warm"
+            status = str(route.get("status") or "ENABLED").strip() or "ENABLED"
+            self.query_manager_legacy_tree.insert(
+                "",
+                tk.END,
+                iid=f"legacy::{route_name}",
+                values=(
+                    str(route.get("legacy_worker_name") or route.get("worker_name") or "central").strip() or "central",
+                    route_name,
+                    lane,
+                    str(route.get("search_queries") or "BUCKETS").strip() or "BUCKETS",
+                    status,
+                ),
+            )
+
+    def _refresh_query_manager_routes(self, preferred_family_name: str | None = None):
         if not self.query_manager_tree:
             return
 
@@ -1490,60 +1647,53 @@ PY"""
             self.query_manager_tree.delete(item)
         self.query_manager_routes_by_key = {}
 
-        routes, health_by_worker, error = self._fetch_vps_scraper_payloads()
-        if error:
-            self.status_bar.config(text=error)
+        families, family_error = self._fetch_query_family_payloads()
+        routes, _, route_error = self._fetch_vps_scraper_payloads()
+        if family_error:
+            self.status_bar.config(text=family_error)
             if self.query_manager_window and self.query_manager_window.winfo_exists():
-                messagebox.showwarning("Route Queries", error)
+                messagebox.showwarning("Worker Queries & Keywords", family_error)
             return
-
-        health_by_route_name: dict[str, dict] = {}
-        for worker_name, health in (health_by_worker or {}).items():
-            route_name = str((health or {}).get("route_name") or "").strip()
-            if route_name and route_name not in health_by_route_name:
-                health_by_route_name[route_name] = dict(health)
-                health_by_route_name[route_name]["_active_worker_name"] = worker_name
+        if route_error:
+            routes = []
 
         matched_selected = None
-        for route in sorted(
-            routes,
+        for family in sorted(
+            families,
             key=lambda item: (
-                str(item.get("legacy_worker_name") or item.get("worker_name") or "").strip(),
-                self._safe_int(item.get("priority"), 100),
-                str(item.get("route_name") or "").strip(),
+                -self._safe_int(item.get("priority"), 100),
+                str(item.get("name") or "").strip(),
             ),
         ):
-            route_name = str(route.get("route_name") or "").strip()
-            if not route_name:
+            family_name = str(family.get("name") or "").strip()
+            if not family_name:
                 continue
-            legacy_worker_name = str(route.get("legacy_worker_name") or route.get("worker_name") or "").strip() or "central"
-            health = health_by_route_name.get(route_name, {})
-            status = str(health.get("status") or route.get("status") or "unknown").strip() or "unknown"
-            lane = str(route.get("effective_lane") or route.get("computed_lane") or "warm").strip() or "warm"
-            key = f"route::{route_name}"
-            query_csv = str(route.get("search_queries") or "BUCKETS").strip() or "BUCKETS"
-
+            key = f"family::{family_name}"
+            validated_count = self._safe_int(family.get("validated_variant_count"), 0)
+            total_variants = len(list(family.get("variants") or []))
+            last_discovery = str(family.get("last_discovery_at") or "").strip()
+            last_discovery_display = last_discovery.replace("T", " ")[:19] if last_discovery else ""
             self.query_manager_tree.insert(
                 "",
                 tk.END,
                 iid=key,
                 values=(
-                    legacy_worker_name,
-                    route_name,
-                    status,
-                    lane,
-                    query_csv,
+                    family_name,
+                    "Yes" if bool(family.get("is_enabled", True)) else "No",
+                    str(family.get("lane") or "warm").strip() or "warm",
+                    str(max(0, self._safe_int(family.get("min_gap_s"), 0))),
+                    f"{validated_count}/{total_variants}",
+                    str(family.get("active_worker_name") or "-").strip() or "-",
+                    last_discovery_display,
                 ),
             )
-            self.query_manager_routes_by_key[key] = {
-                "route_name": route_name,
-                "legacy_worker_name": legacy_worker_name,
-                "active_worker_name": str(health.get("_active_worker_name") or "").strip() or None,
-                "route": route,
-                "search_queries": query_csv,
-            }
-            if selected_key == key:
+            self.query_manager_routes_by_key[key] = {"family": family}
+            if preferred_family_name and family_name == preferred_family_name:
                 matched_selected = key
+            elif selected_key == key and matched_selected is None:
+                matched_selected = key
+
+        self._refresh_query_manager_legacy_routes(routes)
 
         if matched_selected and matched_selected in self.query_manager_routes_by_key:
             self.query_manager_tree.selection_set(matched_selected)
@@ -1555,85 +1705,248 @@ PY"""
             self.query_manager_tree.selection_set(first)
             self.query_manager_tree.focus(first)
             self._on_query_manager_route_selected()
+        else:
+            self._clear_query_manager_family_editor()
 
-    def _on_query_manager_route_selected(self, event=None):
-        if not self.query_manager_tree or not self.query_manager_query_var:
+        status_text = (
+            f"Loaded {len(families)} V4 family/families. "
+            f"{len(routes)} legacy central route(s) remain visible for rollback only."
+        )
+        if route_error:
+            status_text += f" Legacy routes unavailable: {route_error}"
+        self.status_bar.config(text=status_text)
+
+    def _prompt_query_manager_variant(self, initial: dict | None = None):
+        initial = dict(initial or {})
+        query_text = simpledialog.askstring(
+            "Variant Query",
+            "Query text:",
+            parent=self.query_manager_window or self.root,
+            initialvalue=str(initial.get("query_text") or ""),
+        )
+        if query_text is None:
+            return None
+        query_text = query_text.strip()
+        if not query_text:
+            messagebox.showwarning("Variant Query", "Query text is required.")
+            return None
+
+        validation_state = simpledialog.askstring(
+            "Variant Validation",
+            "Validation state (validated, pending_validation, rejected):",
+            parent=self.query_manager_window or self.root,
+            initialvalue=self._normalize_query_manager_variant_state(initial.get("validation_state") or "validated"),
+        )
+        if validation_state is None:
+            return None
+        weight = simpledialog.askfloat(
+            "Variant Weight",
+            "Weight:",
+            parent=self.query_manager_window or self.root,
+            initialvalue=float(initial.get("weight") or 1.0),
+            minvalue=0.0,
+        )
+        if weight is None:
+            return None
+        notes = simpledialog.askstring(
+            "Variant Notes",
+            "Optional notes:",
+            parent=self.query_manager_window or self.root,
+            initialvalue=str(initial.get("notes") or ""),
+        )
+        enabled = messagebox.askyesno(
+            "Variant Enabled",
+            "Should this variant be enabled?",
+            parent=self.query_manager_window or self.root,
+        )
+        return {
+            "query_text": query_text,
+            "validation_state": self._normalize_query_manager_variant_state(validation_state),
+            "is_enabled": bool(enabled),
+            "weight": float(weight),
+            "notes": (notes or "").strip() or None,
+        }
+
+    def _append_query_to_selected_route(self):
+        variant = self._prompt_query_manager_variant(
+            {
+                "validation_state": "validated",
+                "weight": 1.0,
+                "notes": "",
+            }
+        )
+        if not variant:
             return
-        selection = self.query_manager_tree.selection()
-        if not selection:
-            self.query_manager_query_var.set("")
+        lowered = {
+            str(existing.get("query_text") or "").strip().lower()
+            for existing in self.query_manager_family_variants
+        }
+        if str(variant.get("query_text") or "").strip().lower() in lowered:
+            messagebox.showwarning("Variant Query", "That query already exists in this family.")
             return
-        key = selection[0]
-        data = self.query_manager_routes_by_key.get(key, {})
-        self.query_manager_query_var.set(str(data.get("search_queries") or "").strip())
+        self.query_manager_family_variants.append(variant)
+        self._render_query_manager_variants()
+
+    def _edit_query_manager_variant(self):
+        index = self._selected_query_manager_variant_index()
+        if index is None or index < 0 or index >= len(self.query_manager_family_variants):
+            messagebox.showwarning("Variant Query", "Select a variant first.")
+            return
+        updated = self._prompt_query_manager_variant(self.query_manager_family_variants[index])
+        if not updated:
+            return
+        updated_identity = str(updated.get("query_text") or "").strip().lower()
+        for candidate_index, candidate in enumerate(self.query_manager_family_variants):
+            if candidate_index == index:
+                continue
+            if str(candidate.get("query_text") or "").strip().lower() == updated_identity:
+                messagebox.showwarning("Variant Query", "That query already exists in this family.")
+                return
+        self.query_manager_family_variants[index] = updated
+        self._render_query_manager_variants()
+        self.query_manager_variant_tree.selection_set(f"variant::{index}")
+
+    def _move_query_manager_variant(self, direction: int):
+        index = self._selected_query_manager_variant_index()
+        if index is None or index < 0 or index >= len(self.query_manager_family_variants):
+            messagebox.showwarning("Variant Query", "Select a variant first.")
+            return
+        new_index = index + int(direction)
+        if new_index < 0 or new_index >= len(self.query_manager_family_variants):
+            return
+        variants = list(self.query_manager_family_variants)
+        variants[index], variants[new_index] = variants[new_index], variants[index]
+        self.query_manager_family_variants = variants
+        self._render_query_manager_variants()
+        if self.query_manager_variant_tree:
+            self.query_manager_variant_tree.selection_set(f"variant::{new_index}")
+
+    def _toggle_query_manager_variant_enabled(self):
+        index = self._selected_query_manager_variant_index()
+        if index is None or index < 0 or index >= len(self.query_manager_family_variants):
+            messagebox.showwarning("Variant Query", "Select a variant first.")
+            return
+        variant = dict(self.query_manager_family_variants[index])
+        variant["is_enabled"] = not bool(variant.get("is_enabled", True))
+        self.query_manager_family_variants[index] = variant
+        self._render_query_manager_variants()
+        if self.query_manager_variant_tree:
+            self.query_manager_variant_tree.selection_set(f"variant::{index}")
+
+    def _remove_query_manager_variant(self):
+        index = self._selected_query_manager_variant_index()
+        if index is None or index < 0 or index >= len(self.query_manager_family_variants):
+            messagebox.showwarning("Variant Query", "Select a variant first.")
+            return
+        del self.query_manager_family_variants[index]
+        self._render_query_manager_variants()
 
     def _save_query_manager_route_queries(self):
-        if not self.query_manager_tree:
-            return
-        selection = self.query_manager_tree.selection()
-        if not selection:
-            messagebox.showwarning("Route Queries", "Select a central route first.")
-            return
-        key = selection[0]
-        data = self.query_manager_routes_by_key.get(key)
-        if not data:
-            messagebox.showwarning("Route Queries", "Selected route is no longer available. Refresh and retry.")
-            return
-
-        route_name = str(data.get("route_name") or "").strip()
-        if not route_name:
-            messagebox.showwarning("Route Queries", "Invalid route selection.")
-            return
-
         ctx, error = self._get_server_api_context()
         if error:
-            messagebox.showwarning("Route Queries", error)
+            messagebox.showwarning("Worker Queries & Keywords", error)
             return
 
-        query_csv = (self.query_manager_query_var.get() if self.query_manager_query_var else "").strip()
-        query_items = [token.strip() for token in query_csv.split(",") if token.strip()]
+        family_name = str(self.query_manager_family_form_vars.get("name").get() or "").strip()
+        if not family_name:
+            messagebox.showwarning("Worker Queries & Keywords", "Family name is required.")
+            return
+        if not self.query_manager_family_variants:
+            messagebox.showwarning("Worker Queries & Keywords", "Add at least one query variant.")
+            return
+
+        priority = self._safe_int(self.query_manager_family_form_vars.get("priority").get(), -1)
+        min_gap_s = self._safe_int(self.query_manager_family_form_vars.get("min_gap_s").get(), -1)
+        if priority < 0:
+            messagebox.showwarning("Worker Queries & Keywords", "Priority must be zero or greater.")
+            return
+        if min_gap_s < 0:
+            messagebox.showwarning("Worker Queries & Keywords", "Min gap must be zero or greater.")
+            return
+
+        lane = str(self.query_manager_family_form_vars.get("lane").get() or "warm").strip().lower() or "warm"
+        if lane not in {"hot", "warm", "sweep"}:
+            messagebox.showwarning("Worker Queries & Keywords", "Lane must be hot, warm, or sweep.")
+            return
+
+        selected_family = {}
+        selection = self.query_manager_tree.selection() if self.query_manager_tree else ()
+        if selection:
+            selected_family = dict((self.query_manager_routes_by_key.get(selection[0]) or {}).get("family") or {})
+
+        payload = {
+            "previous_name": self.query_manager_family_original_name,
+            "is_enabled": self._is_truthy(self.query_manager_family_form_vars.get("is_enabled").get()),
+            "priority": priority,
+            "lane": lane,
+            "min_gap_s": min_gap_s,
+            "max_gap_s": selected_family.get("max_gap_s"),
+            "legacy_route_name": selected_family.get("legacy_route_name"),
+            "legacy_worker_name": selected_family.get("legacy_worker_name"),
+            "variants": [
+                {
+                    "query_text": str(variant.get("query_text") or "").strip(),
+                    "validation_state": self._normalize_query_manager_variant_state(
+                        variant.get("validation_state") or ""
+                    ),
+                    "is_enabled": bool(variant.get("is_enabled", True)),
+                    "weight": float(variant.get("weight") or 1.0),
+                    "notes": str(variant.get("notes") or "").strip() or None,
+                }
+                for variant in self.query_manager_family_variants
+                if str(variant.get("query_text") or "").strip()
+            ],
+        }
+
         try:
             response = requests.put(
-                f"{ctx['base_url']}/routes/{route_name}/queries",
+                f"{ctx['base_url']}/query-families/{quote(family_name, safe='')}",
                 headers=ctx["headers"],
-                json={"queries": query_items},
+                json=payload,
                 timeout=(8, 30),
             )
             if response.status_code == 401:
                 raise RuntimeError("Unauthorized (check Server API Token).")
             response.raise_for_status()
         except Exception as exc:
-            messagebox.showerror("Save Failed", f"Failed to save route queries:\n{exc}")
-            self.status_bar.config(text=f"Route query save failed for {route_name}")
+            messagebox.showerror("Save Failed", f"Failed to save V4 family:\n{exc}")
+            self.status_bar.config(text=f"Family save failed for {family_name}")
             return
 
-        self.status_bar.config(text=f"Saved canonical query set for route {route_name}")
-        self._refresh_query_manager_routes()
+        self.status_bar.config(text=f"Saved V4 family {family_name}")
+        self._refresh_query_manager_routes(preferred_family_name=family_name)
 
-    def _append_query_to_selected_route(self):
-        if not self.query_manager_query_var:
+    def _new_query_manager_family(self):
+        if self.query_manager_tree:
+            self.query_manager_tree.selection_remove(self.query_manager_tree.selection())
+        self._clear_query_manager_family_editor()
+        self.status_bar.config(text="Creating a new V4 query family")
+
+    def _bootstrap_query_manager_presets(self):
+        ctx, error = self._get_server_api_context()
+        if error:
+            messagebox.showwarning("Worker Queries & Keywords", error)
+            return
+        try:
+            response = requests.post(
+                f"{ctx['base_url']}/query-families/bootstrap-presets",
+                headers=ctx["headers"],
+                timeout=(8, 45),
+            )
+            if response.status_code == 401:
+                raise RuntimeError("Unauthorized (check Server API Token).")
+            response.raise_for_status()
+            payload = response.json() if response.content else {}
+        except Exception as exc:
+            messagebox.showerror("Preset Bootstrap Failed", f"Failed to bootstrap V4 presets:\n{exc}")
             return
 
-        query = simpledialog.askstring(
-            "Add Query",
-            "Query text to add for selected route:",
-            parent=self.query_manager_window or self.root,
+        items = list(payload.get("items") or [])
+        preferred_family = str(items[0].get("name") or "").strip() if items else None
+        self.status_bar.config(
+            text=f"Bootstrapped {self._safe_int(payload.get('seeded_count'), len(items))} V4 preset families"
         )
-        if query is None:
-            return
-        query = query.strip()
-        if not query:
-            return
-
-        existing = [
-            token.strip()
-            for token in str(self.query_manager_query_var.get() or "").split(",")
-            if token.strip()
-        ]
-        lowered = {token.lower() for token in existing}
-        if query.lower() not in lowered:
-            existing.append(query)
-        self.query_manager_query_var.set(", ".join(existing))
+        self._refresh_query_manager_routes(preferred_family_name=preferred_family)
 
     def _save_query_manager_negative_keywords(self):
         if not self.query_manager_negative_keywords_var:
@@ -1690,14 +2003,23 @@ PY"""
         messagebox.showinfo("Saved", "Negative keywords saved and synced to VPS worker runtime DBs.")
 
     def show_query_keyword_manager(self):
-        """Open central-route query manager and universal negative-keyword controls."""
+        """Open V4 family manager and universal negative-keyword controls."""
         if self.query_manager_window and self.query_manager_window.winfo_exists():
             self.query_manager_window.lift()
             self.query_manager_window.focus_force()
             self._refresh_query_manager_routes()
             return
 
-        self.query_manager_query_var = tk.StringVar(value="")
+        self.query_manager_query_var = None
+        self.query_manager_family_form_vars = {
+            "name": tk.StringVar(value=""),
+            "is_enabled": tk.StringVar(value="1"),
+            "lane": tk.StringVar(value="warm"),
+            "priority": tk.StringVar(value="100"),
+            "min_gap_s": tk.StringVar(value="15"),
+        }
+        self.query_manager_family_variants = []
+        self.query_manager_family_original_name = None
         self.query_manager_negative_keywords_var = tk.StringVar(
             value=self._get_scraper_setting("accessory_filter_keywords", self._default_accessory_keyword_csv())
         )
@@ -1706,14 +2028,19 @@ PY"""
         )
 
         window = tk.Toplevel(self.root)
-        window.title("Central Route Queries & Negative Keywords")
-        window.geometry("1240x760")
+        window.title("Worker Queries & Keywords")
+        window.geometry("1420x860")
         self.query_manager_window = window
 
         def on_close():
             self.query_manager_window = None
             self.query_manager_tree = None
+            self.query_manager_variant_tree = None
+            self.query_manager_legacy_tree = None
             self.query_manager_routes_by_key = {}
+            self.query_manager_family_form_vars = {}
+            self.query_manager_family_variants = []
+            self.query_manager_family_original_name = None
             self.query_manager_query_var = None
             self.query_manager_negative_keywords_var = None
             self.query_manager_accessory_max_price_var = None
@@ -1723,82 +2050,154 @@ PY"""
 
         main = ttk.Frame(window)
         main.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        main.columnconfigure(0, weight=3)
-        main.columnconfigure(1, weight=2)
-        main.rowconfigure(0, weight=1)
+        main.columnconfigure(0, weight=2)
+        main.columnconfigure(1, weight=3)
+        main.columnconfigure(2, weight=2)
+        main.rowconfigure(0, weight=3)
+        main.rowconfigure(1, weight=2)
 
-        routes_frame = ttk.LabelFrame(main, text="Central Route Query Sets")
-        routes_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        routes_frame.columnconfigure(0, weight=1)
-        routes_frame.rowconfigure(0, weight=1)
+        families_frame = ttk.LabelFrame(main, text="V4 Query Families")
+        families_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        families_frame.columnconfigure(0, weight=1)
+        families_frame.rowconfigure(0, weight=1)
 
         self.query_manager_tree = ttk.Treeview(
-            routes_frame,
-            columns=("Legacy Worker", "Route", "Status", "Lane", "Queries"),
+            families_frame,
+            columns=("Family", "Enabled", "Lane", "Min Gap", "Validated Variants", "Active Worker", "Last Discovery"),
             show="headings",
             selectmode="browse",
         )
         for col, width in [
-            ("Legacy Worker", 130),
-            ("Route", 190),
-            ("Status", 90),
-            ("Lane", 90),
-            ("Queries", 430),
+            ("Family", 170),
+            ("Enabled", 80),
+            ("Lane", 80),
+            ("Min Gap", 80),
+            ("Validated Variants", 130),
+            ("Active Worker", 110),
+            ("Last Discovery", 150),
         ]:
             self.query_manager_tree.heading(col, text=col)
             self.query_manager_tree.column(col, width=width, anchor=tk.W)
-        route_vsb = ttk.Scrollbar(routes_frame, orient="vertical", command=self.query_manager_tree.yview)
-        self.query_manager_tree.configure(yscrollcommand=route_vsb.set)
+        family_vsb = ttk.Scrollbar(families_frame, orient="vertical", command=self.query_manager_tree.yview)
+        family_hsb = ttk.Scrollbar(families_frame, orient="horizontal", command=self.query_manager_tree.xview)
+        self.query_manager_tree.configure(yscrollcommand=family_vsb.set, xscrollcommand=family_hsb.set)
         self.query_manager_tree.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
-        route_vsb.grid(row=0, column=1, sticky="ns", pady=8)
+        family_vsb.grid(row=0, column=1, sticky="ns", pady=8)
+        family_hsb.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
         self.query_manager_tree.bind("<<TreeviewSelect>>", self._on_query_manager_route_selected)
 
-        route_editor = ttk.Frame(routes_frame)
-        route_editor.grid(row=1, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 10))
-        route_editor.columnconfigure(1, weight=1)
-        ttk.Label(route_editor, text="Selected Route Query CSV:").grid(row=0, column=0, sticky="w")
-        ttk.Entry(route_editor, textvariable=self.query_manager_query_var).grid(
-            row=0, column=1, sticky="ew", padx=(8, 0)
-        )
-
-        route_actions = ttk.Frame(routes_frame)
-        route_actions.grid(row=2, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 10))
-        route_actions.columnconfigure(0, weight=1)
-        route_actions.columnconfigure(1, weight=1)
-        route_actions.columnconfigure(2, weight=1)
-        route_actions.columnconfigure(3, weight=1)
-        ttk.Button(route_actions, text="Save Route Queries", command=self._save_query_manager_route_queries).grid(
+        family_actions = ttk.Frame(families_frame)
+        family_actions.grid(row=2, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 10))
+        for col in range(4):
+            family_actions.columnconfigure(col, weight=1)
+        ttk.Button(family_actions, text="New Family", command=self._new_query_manager_family).grid(
             row=0, column=0, sticky="ew", padx=4
         )
-        ttk.Button(route_actions, text="Add Query", command=self._append_query_to_selected_route).grid(
+        ttk.Button(family_actions, text="Save Family", command=self._save_query_manager_route_queries).grid(
             row=0, column=1, sticky="ew", padx=4
         )
-        ttk.Button(route_actions, text="Clear Query Set", command=lambda: self.query_manager_query_var.set("")).grid(
+        ttk.Button(family_actions, text="Bootstrap Presets", command=self._bootstrap_query_manager_presets).grid(
             row=0, column=2, sticky="ew", padx=4
         )
-        ttk.Button(route_actions, text="Refresh Routes", command=self._refresh_query_manager_routes).grid(
+        ttk.Button(family_actions, text="Refresh", command=self._refresh_query_manager_routes).grid(
             row=0, column=3, sticky="ew", padx=4
         )
 
-        ttk.Label(
-            routes_frame,
-            text=(
-                "Worker_3 is intended for fast-lane newest-listing sweeps (default query: iPhone). "
-                "This panel edits the canonical query set for each central route. "
-                "Workers remain generic executors and profiles are managed separately."
-            ),
-            wraplength=760,
-        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 8))
+        editor_frame = ttk.LabelFrame(main, text="Selected Family")
+        editor_frame.grid(row=0, column=1, sticky="nsew", padx=(0, 10))
+        editor_frame.columnconfigure(1, weight=1)
+        editor_frame.rowconfigure(5, weight=1)
 
-        keywords_frame = ttk.LabelFrame(main, text="Universal Negative Keywords (Accessory Filter)")
-        keywords_frame.grid(row=0, column=1, sticky="nsew")
+        ttk.Label(editor_frame, text="Family Name:").grid(row=0, column=0, sticky="w", padx=8, pady=6)
+        ttk.Entry(editor_frame, textvariable=self.query_manager_family_form_vars["name"]).grid(
+            row=0, column=1, sticky="ew", padx=8, pady=6
+        )
+        ttk.Label(editor_frame, text="Enabled:").grid(row=1, column=0, sticky="w", padx=8, pady=6)
+        ttk.Checkbutton(
+            editor_frame,
+            variable=self.query_manager_family_form_vars["is_enabled"],
+            onvalue="1",
+            offvalue="0",
+        ).grid(row=1, column=1, sticky="w", padx=8, pady=6)
+        ttk.Label(editor_frame, text="Lane:").grid(row=2, column=0, sticky="w", padx=8, pady=6)
+        ttk.Combobox(
+            editor_frame,
+            textvariable=self.query_manager_family_form_vars["lane"],
+            values=("hot", "warm", "sweep"),
+            state="readonly",
+        ).grid(row=2, column=1, sticky="ew", padx=8, pady=6)
+        ttk.Label(editor_frame, text="Priority:").grid(row=3, column=0, sticky="w", padx=8, pady=6)
+        ttk.Entry(editor_frame, textvariable=self.query_manager_family_form_vars["priority"]).grid(
+            row=3, column=1, sticky="ew", padx=8, pady=6
+        )
+        ttk.Label(editor_frame, text="Min Gap (s):").grid(row=4, column=0, sticky="w", padx=8, pady=6)
+        ttk.Entry(editor_frame, textvariable=self.query_manager_family_form_vars["min_gap_s"]).grid(
+            row=4, column=1, sticky="ew", padx=8, pady=6
+        )
+
+        variants_frame = ttk.LabelFrame(editor_frame, text="Query Variants")
+        variants_frame.grid(row=5, column=0, columnspan=2, sticky="nsew", padx=8, pady=(10, 8))
+        variants_frame.columnconfigure(0, weight=1)
+        variants_frame.rowconfigure(0, weight=1)
+
+        self.query_manager_variant_tree = ttk.Treeview(
+            variants_frame,
+            columns=("Query Text", "Validation", "Enabled", "Weight", "Notes"),
+            show="headings",
+            selectmode="browse",
+            height=10,
+        )
+        for col, width in [
+            ("Query Text", 210),
+            ("Validation", 130),
+            ("Enabled", 80),
+            ("Weight", 80),
+            ("Notes", 220),
+        ]:
+            self.query_manager_variant_tree.heading(col, text=col)
+            self.query_manager_variant_tree.column(col, width=width, anchor=tk.W)
+        variant_vsb = ttk.Scrollbar(variants_frame, orient="vertical", command=self.query_manager_variant_tree.yview)
+        variant_hsb = ttk.Scrollbar(variants_frame, orient="horizontal", command=self.query_manager_variant_tree.xview)
+        self.query_manager_variant_tree.configure(yscrollcommand=variant_vsb.set, xscrollcommand=variant_hsb.set)
+        self.query_manager_variant_tree.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        variant_vsb.grid(row=0, column=1, sticky="ns", pady=8)
+        variant_hsb.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+
+        variant_actions = ttk.Frame(variants_frame)
+        variant_actions.grid(row=2, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 8))
+        for col in range(5):
+            variant_actions.columnconfigure(col, weight=1)
+        ttk.Button(variant_actions, text="Add Variant", command=self._append_query_to_selected_route).grid(
+            row=0, column=0, sticky="ew", padx=4
+        )
+        ttk.Button(variant_actions, text="Edit Variant", command=self._edit_query_manager_variant).grid(
+            row=0, column=1, sticky="ew", padx=4
+        )
+        ttk.Button(variant_actions, text="Move Up", command=lambda: self._move_query_manager_variant(-1)).grid(
+            row=0, column=2, sticky="ew", padx=4
+        )
+        ttk.Button(variant_actions, text="Move Down", command=lambda: self._move_query_manager_variant(1)).grid(
+            row=0, column=3, sticky="ew", padx=4
+        )
+        ttk.Button(variant_actions, text="Toggle Enabled", command=self._toggle_query_manager_variant_enabled).grid(
+            row=0, column=4, sticky="ew", padx=4
+        )
+        ttk.Button(variant_actions, text="Remove Variant", command=self._remove_query_manager_variant).grid(
+            row=1, column=0, columnspan=5, sticky="ew", padx=4, pady=(6, 0)
+        )
+
+        keywords_frame = ttk.LabelFrame(main, text="Negative Keywords")
+        keywords_frame.grid(row=0, column=2, sticky="nsew")
         keywords_frame.columnconfigure(0, weight=1)
         keywords_frame.columnconfigure(1, weight=1)
 
         ttk.Label(
             keywords_frame,
-            text="These keywords are applied globally to suppress accessory-only listings (case/cover/charger/etc).",
-            wraplength=380,
+            text=(
+                "V4 families define what workers search for. Negative keywords stay global and are still "
+                "used to suppress accessory-only listings like cases, chargers, and empty boxes."
+            ),
+            wraplength=320,
         ).grid(row=0, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 4))
 
         ttk.Label(keywords_frame, text="Negative Keywords (CSV):").grid(row=1, column=0, sticky="w", padx=8, pady=6)
@@ -1819,6 +2218,35 @@ PY"""
             command=self._save_query_manager_negative_keywords,
         ).grid(row=4, column=0, columnspan=2, sticky="ew", padx=8, pady=(8, 10))
 
+        legacy_frame = ttk.LabelFrame(main, text="Legacy Central Routes (Rollback Only)")
+        legacy_frame.grid(row=1, column=0, columnspan=3, sticky="nsew", pady=(10, 0))
+        legacy_frame.columnconfigure(0, weight=1)
+        legacy_frame.rowconfigure(0, weight=1)
+
+        self.query_manager_legacy_tree = ttk.Treeview(
+            legacy_frame,
+            columns=("Legacy Worker", "Route", "Lane", "Queries", "Status"),
+            show="headings",
+            selectmode="none",
+            height=8,
+        )
+        for col, width in [
+            ("Legacy Worker", 130),
+            ("Route", 200),
+            ("Lane", 90),
+            ("Queries", 520),
+            ("Status", 120),
+        ]:
+            self.query_manager_legacy_tree.heading(col, text=col)
+            self.query_manager_legacy_tree.column(col, width=width, anchor=tk.W)
+        legacy_vsb = ttk.Scrollbar(legacy_frame, orient="vertical", command=self.query_manager_legacy_tree.yview)
+        legacy_hsb = ttk.Scrollbar(legacy_frame, orient="horizontal", command=self.query_manager_legacy_tree.xview)
+        self.query_manager_legacy_tree.configure(yscrollcommand=legacy_vsb.set, xscrollcommand=legacy_hsb.set)
+        self.query_manager_legacy_tree.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        legacy_vsb.grid(row=0, column=1, sticky="ns", pady=8)
+        legacy_hsb.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+
+        self._clear_query_manager_family_editor()
         self._refresh_query_manager_routes()
 
     def send_server_telegram_test(self):
@@ -2309,11 +2737,19 @@ PY
             if active_route is not None and not active_route_name:
                 active_route_name = str(active_route.get("route_name") or "").strip()
 
-            active_lane = "env"
-            if active_route is not None:
-                active_lane = str(active_route.get("effective_lane") or active_route.get("computed_lane") or "warm").strip() or "warm"
-            enabled_count = sum(1 for route in worker_routes if bool(route.get("is_enabled", True)))
-            route_count_display = f"{enabled_count}/{len(worker_routes)}"
+            mode = str(health.get("route_source") or "").strip().lower()
+            if not mode:
+                mode = "central" if worker_routes else "env"
+            profile_dir = str(
+                health.get("route_user_data_dir")
+                or (active_route or {}).get("user_data_dir")
+                or ""
+            ).strip()
+            active_query = str(
+                health.get("route_search_queries")
+                or (active_route or {}).get("search_queries")
+                or ""
+            ).strip()
             last_run = str(
                 health.get("last_run_finished_at")
                 or health.get("last_run_started_at")
@@ -2323,10 +2759,10 @@ PY
             last_run_display = last_run.replace("T", " ")[:19] if last_run else ""
             values = (
                 worker_name,
+                mode,
+                self._profile_display_name(profile_dir) if profile_dir else "-",
                 active_route_name or "env-backed",
-                active_lane,
-                route_count_display,
-                self._lane_mix_display(worker_routes),
+                active_query or "-",
                 status,
                 str(max(0, self._safe_int(health.get("listings_scraped_last_minute"), 0))),
                 last_run_display,
@@ -2334,7 +2770,10 @@ PY
             self.vps_worker_summary_tree.insert("", tk.END, iid=worker_name, values=values)
             self.vps_worker_summary_records_by_key[worker_name] = {
                 "worker_name": worker_name,
+                "mode": mode,
+                "live_profile": profile_dir,
                 "active_route_name": active_route_name,
+                "active_query": active_query or None,
                 "health": health,
                 "routes": worker_routes,
             }
@@ -6853,10 +7292,10 @@ PY
             summary_frame,
             columns=(
                 "Worker",
-                "Active Route",
-                "Active Lane",
-                "Routes",
-                "Lane Mix",
+                "Mode",
+                "Live Profile",
+                "Active Family/Route",
+                "Active Query",
                 "Status",
                 "Scraped (1m)",
                 "Last run",
@@ -6867,10 +7306,10 @@ PY
         )
         for col, width in [
             ("Worker", 120),
-            ("Active Route", 220),
-            ("Active Lane", 110),
-            ("Routes", 90),
-            ("Lane Mix", 220),
+            ("Mode", 90),
+            ("Live Profile", 170),
+            ("Active Family/Route", 220),
+            ("Active Query", 220),
             ("Status", 160),
             ("Scraped (1m)", 120),
             ("Last run", 170),

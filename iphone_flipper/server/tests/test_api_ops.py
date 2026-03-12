@@ -139,6 +139,192 @@ class _RouteOpsConn:
         return None
 
 
+class _QueryFamilyListConn:
+    async def fetch(self, query: str, *args):
+        normalized = " ".join(str(query).split())
+        if "FROM query_families qf" in normalized:
+            return [
+                {
+                    "family_id": 11,
+                    "name": "iphone_broad",
+                    "legacy_route_name": "worker_3__env_default",
+                    "legacy_worker_name": "worker_3",
+                    "is_enabled": True,
+                    "priority": 300,
+                    "priority_score": 8.5,
+                    "lane": "hot",
+                    "next_due_at": None,
+                    "min_gap_s": 5,
+                    "max_gap_s": 5,
+                    "variant_cursor": 0,
+                    "variant_count": 1,
+                    "consecutive_hits": 0,
+                    "consecutive_empty": 0,
+                    "last_claimed_at": None,
+                    "last_discovery_at": None,
+                    "last_success_at": None,
+                    "last_error": None,
+                    "family_lease_token": None,
+                    "family_lease_expires_at": None,
+                    "created_at": None,
+                    "updated_at": None,
+                    "active_worker_name": "worker_3",
+                    "active_query_text": "iPhone",
+                    "active_user_data_dir": "/app/runtime/browser_profile_3",
+                    "active_worker_status": "ok",
+                }
+            ]
+        return []
+
+
+class _QueryFamilyUpsertConn:
+    def __init__(self) -> None:
+        self.deleted_args: tuple | None = None
+        self.variant_upserts: list[tuple] = []
+        self.family_insert_args: tuple | None = None
+
+    def transaction(self) -> _FakeTransaction:
+        return _FakeTransaction()
+
+    async def fetchval(self, query: str, *args):
+        return None
+
+    async def fetchrow(self, query: str, *args):
+        normalized = " ".join(str(query).split())
+        if normalized.startswith("INSERT INTO query_families"):
+            self.family_insert_args = args
+            return {
+                "family_id": 15,
+                "name": args[0],
+                "legacy_route_name": args[1],
+                "legacy_worker_name": args[2],
+                "is_enabled": args[3],
+                "priority": args[4],
+                "priority_score": None,
+                "lane": args[5],
+                "next_due_at": None,
+                "min_gap_s": args[6],
+                "max_gap_s": args[7],
+                "variant_cursor": 0,
+                "variant_count": 0,
+                "consecutive_hits": 0,
+                "consecutive_empty": 0,
+                "last_claimed_at": None,
+                "last_discovery_at": None,
+                "last_success_at": None,
+                "last_error": None,
+                "family_lease_token": None,
+                "family_lease_expires_at": None,
+                "created_at": None,
+                "updated_at": None,
+            }
+        if normalized.startswith("UPDATE query_families SET variant_count"):
+            return {
+                "family_id": 15,
+                "name": "iphone_15_pro",
+                "legacy_route_name": None,
+                "legacy_worker_name": None,
+                "is_enabled": True,
+                "priority": 215,
+                "priority_score": None,
+                "lane": "warm",
+                "next_due_at": None,
+                "min_gap_s": 20,
+                "max_gap_s": None,
+                "variant_cursor": 0,
+                "variant_count": 2,
+                "consecutive_hits": 0,
+                "consecutive_empty": 0,
+                "last_claimed_at": None,
+                "last_discovery_at": None,
+                "last_success_at": None,
+                "last_error": None,
+                "family_lease_token": None,
+                "family_lease_expires_at": None,
+                "created_at": None,
+                "updated_at": None,
+            }
+        return None
+
+    async def execute(self, query: str, *args):
+        normalized = " ".join(str(query).split())
+        if normalized.startswith("DELETE FROM query_variants"):
+            self.deleted_args = args
+        if normalized.startswith("INSERT INTO query_variants"):
+            self.variant_upserts.append(args)
+        return "OK"
+
+    async def fetch(self, query: str, *args):
+        normalized = " ".join(str(query).split())
+        if "FROM query_families qf" in normalized and "WHERE qf.family_id = $1" in normalized:
+            return [
+                {
+                    "family_id": 15,
+                    "name": "iphone_15_pro",
+                    "legacy_route_name": None,
+                    "legacy_worker_name": None,
+                    "is_enabled": True,
+                    "priority": 215,
+                    "priority_score": None,
+                    "lane": "warm",
+                    "next_due_at": None,
+                    "min_gap_s": 20,
+                    "max_gap_s": None,
+                    "variant_cursor": 0,
+                    "variant_count": 2,
+                    "consecutive_hits": 0,
+                    "consecutive_empty": 0,
+                    "last_claimed_at": None,
+                    "last_discovery_at": None,
+                    "last_success_at": None,
+                    "last_error": None,
+                    "family_lease_token": None,
+                    "family_lease_expires_at": None,
+                    "created_at": None,
+                    "updated_at": None,
+                    "active_worker_name": None,
+                    "active_query_text": None,
+                    "active_user_data_dir": None,
+                    "active_worker_status": None,
+                }
+            ]
+        return []
+
+
+class _BootstrapCatalogConn:
+    def __init__(self) -> None:
+        self._family_rows: dict[str, dict] = {}
+        self._variants_by_family: dict[int, dict[str, dict]] = {}
+        self._next_family_id = 1
+
+    async def fetchrow(self, query: str, *args):
+        normalized = " ".join(str(query).split())
+        if normalized.startswith("INSERT INTO query_families"):
+            family_name = str(args[0])
+            row = self._family_rows.get(family_name)
+            if row is None:
+                row = {"family_id": self._next_family_id, "name": family_name}
+                self._family_rows[family_name] = row
+                self._variants_by_family[row["family_id"]] = {}
+                self._next_family_id += 1
+            return dict(row)
+        return None
+
+    async def execute(self, query: str, *args):
+        normalized = " ".join(str(query).split())
+        if normalized.startswith("INSERT INTO query_variants"):
+            family_id = int(args[0])
+            query_text = str(args[1])
+            self._variants_by_family.setdefault(family_id, {})[query_text] = {
+                "validation_state": args[2],
+                "weight": args[3],
+                "variant_order": args[4],
+                "is_enabled": args[5],
+                "notes": args[6],
+            }
+        return "OK"
+
+
 class _FakePool:
     def __init__(self, conn: _FakeConn) -> None:
         self._conn = conn
@@ -346,6 +532,126 @@ class ApiOpsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item["legacy_worker_name"], "worker_3")
         self.assertEqual(item["queries"][0]["query_text"], "iPhone 15 Pro")
         self.assertEqual(item["search_queries"], "iPhone 15 Pro")
+
+    async def test_get_query_families_returns_variants_and_live_metadata(self) -> None:
+        api_main.app.state.db_pool = _FakePool(_QueryFamilyListConn())
+
+        with (
+            patch.object(api_main, "API_TOKEN", "test-token"),
+            patch.object(
+                api_main,
+                "_load_query_variants_by_family_id",
+                AsyncMock(
+                    return_value={
+                        11: [
+                            {
+                                "variant_id": 31,
+                                "family_id": 11,
+                                "query_text": "iPhone",
+                                "validation_state": "validated",
+                                "weight": 1.0,
+                                "variant_order": 0,
+                                "is_enabled": True,
+                                "notes": "Broad search",
+                            }
+                        ]
+                    }
+                ),
+            ),
+        ):
+            payload = await api_main.get_query_families(family_name=None, x_api_token="test-token")
+
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["catalog_version"], api_main.V42_FAMILY_CATALOG_VERSION)
+        item = payload["items"][0]
+        self.assertEqual(item["name"], "iphone_broad")
+        self.assertEqual(item["active_worker_name"], "worker_3")
+        self.assertEqual(item["active_query_text"], "iPhone")
+        self.assertEqual(item["validated_variant_count"], 1)
+        self.assertEqual(item["search_queries"], "iPhone")
+
+    async def test_upsert_query_family_persists_family_metadata_and_variants(self) -> None:
+        conn = _QueryFamilyUpsertConn()
+        api_main.app.state.db_pool = _FakePool(conn)
+
+        with (
+            patch.object(api_main, "API_TOKEN", "test-token"),
+            patch.object(
+                api_main,
+                "_load_query_variants_by_family_id",
+                AsyncMock(
+                    return_value={
+                        15: [
+                            {
+                                "variant_id": 71,
+                                "family_id": 15,
+                                "query_text": "iPhone 15 Pro",
+                                "validation_state": "validated",
+                                "weight": 1.0,
+                                "variant_order": 0,
+                                "is_enabled": True,
+                                "notes": "Primary",
+                            },
+                            {
+                                "variant_id": 72,
+                                "family_id": 15,
+                                "query_text": "iPhone 15 Pro 256GB",
+                                "validation_state": "pending_validation",
+                                "weight": 0.7,
+                                "variant_order": 1,
+                                "is_enabled": False,
+                                "notes": "Staged",
+                            },
+                        ]
+                    }
+                ),
+            ),
+        ):
+            payload = await api_main.upsert_query_family(
+                family_name="iphone_15_pro",
+                payload=api_main.QueryFamilyUpsertRequest(
+                    is_enabled=True,
+                    priority=215,
+                    lane="warm",
+                    min_gap_s=20,
+                    variants=[
+                        api_main.QueryVariantUpsertRequest(
+                            query_text="iPhone 15 Pro",
+                            validation_state="validated",
+                            is_enabled=True,
+                            weight=1.0,
+                            notes="Primary",
+                        ),
+                        api_main.QueryVariantUpsertRequest(
+                            query_text="iPhone 15 Pro 256GB",
+                            validation_state="pending_validation",
+                            is_enabled=False,
+                            weight=0.7,
+                            notes="Staged",
+                        ),
+                    ],
+                ),
+                x_api_token="test-token",
+            )
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(conn.family_insert_args[0], "iphone_15_pro")
+        self.assertEqual(conn.deleted_args, (15, ["iPhone 15 Pro", "iPhone 15 Pro 256GB"]))
+        self.assertEqual(len(conn.variant_upserts), 2)
+        self.assertEqual(conn.variant_upserts[0][1], "iPhone 15 Pro")
+        self.assertEqual(payload["item"]["validated_variant_count"], 1)
+        self.assertEqual(payload["item"]["enabled_variant_count"], 1)
+
+    async def test_bootstrap_query_family_presets_is_idempotent(self) -> None:
+        conn = _BootstrapCatalogConn()
+
+        await api_main._bootstrap_query_family_presets(conn)
+        await api_main._bootstrap_query_family_presets(conn)
+
+        self.assertEqual(len(conn._family_rows), len(api_main.V42_FAMILY_PRESETS))
+        total_variants = sum(len(variants) for variants in conn._variants_by_family.values())
+        preset_variants = sum(len(preset.variants) for preset in api_main.V42_FAMILY_PRESETS)
+        self.assertEqual(total_variants, preset_variants)
 
     async def test_get_execution_profiles_returns_profile_health_rows(self) -> None:
         api_main.app.state.db_pool = _FakePool(_RouteOpsConn())
