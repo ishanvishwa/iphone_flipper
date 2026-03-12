@@ -87,6 +87,12 @@ async def _backfill_central_scheduler_tables(conn: asyncpg.Connection) -> None:
             effective_lane,
             priority_score,
             priority_score_updated_at,
+            manual_login_required,
+            manual_login_reason,
+            manual_login_required_at,
+            quarantined_at,
+            quarantine_reason,
+            quarantine_evidence,
             last_error
         FROM worker_routes
         ORDER BY worker_name ASC, route_name ASC
@@ -248,16 +254,24 @@ async def _backfill_central_scheduler_tables(conn: asyncpg.Connection) -> None:
                 ON CONFLICT (user_data_dir) DO UPDATE SET
                     worker_name = EXCLUDED.worker_name,
                     is_enabled = EXCLUDED.is_enabled,
-                    status = EXCLUDED.status,
+                    status = CASE
+                        WHEN EXCLUDED.is_enabled = FALSE THEN 'DISABLED'
+                        WHEN COALESCE(execution_profiles.manual_login_required, FALSE)
+                            OR COALESCE(EXCLUDED.manual_login_required, FALSE) THEN 'NEEDS_LOGIN'
+                        WHEN COALESCE(EXCLUDED.cooldown_until, execution_profiles.cooldown_until) IS NOT NULL
+                            AND COALESCE(EXCLUDED.cooldown_until, execution_profiles.cooldown_until) > NOW() THEN 'COOLDOWN'
+                        ELSE COALESCE(execution_profiles.status, EXCLUDED.status, 'READY')
+                    END,
                     status_reason = COALESCE(EXCLUDED.status_reason, execution_profiles.status_reason),
                     status_since = COALESCE(EXCLUDED.status_since, execution_profiles.status_since),
                     cooldown_until = COALESCE(EXCLUDED.cooldown_until, execution_profiles.cooldown_until),
-                    manual_login_required = EXCLUDED.manual_login_required,
-                    manual_login_reason = COALESCE(EXCLUDED.manual_login_reason, execution_profiles.manual_login_reason),
-                    manual_login_required_at = COALESCE(EXCLUDED.manual_login_required_at, execution_profiles.manual_login_required_at),
-                    quarantined_at = COALESCE(EXCLUDED.quarantined_at, execution_profiles.quarantined_at),
-                    quarantine_reason = COALESCE(EXCLUDED.quarantine_reason, execution_profiles.quarantine_reason),
-                    quarantine_evidence = COALESCE(EXCLUDED.quarantine_evidence, execution_profiles.quarantine_evidence),
+                    manual_login_required = COALESCE(execution_profiles.manual_login_required, FALSE)
+                        OR COALESCE(EXCLUDED.manual_login_required, FALSE),
+                    manual_login_reason = COALESCE(execution_profiles.manual_login_reason, EXCLUDED.manual_login_reason),
+                    manual_login_required_at = COALESCE(execution_profiles.manual_login_required_at, EXCLUDED.manual_login_required_at),
+                    quarantined_at = COALESCE(execution_profiles.quarantined_at, EXCLUDED.quarantined_at),
+                    quarantine_reason = COALESCE(execution_profiles.quarantine_reason, EXCLUDED.quarantine_reason),
+                    quarantine_evidence = COALESCE(execution_profiles.quarantine_evidence, EXCLUDED.quarantine_evidence),
                     last_selected_at = COALESCE(EXCLUDED.last_selected_at, execution_profiles.last_selected_at),
                     last_success_at = COALESCE(EXCLUDED.last_success_at, execution_profiles.last_success_at),
                     consecutive_failures = GREATEST(execution_profiles.consecutive_failures, EXCLUDED.consecutive_failures),
@@ -269,12 +283,12 @@ async def _backfill_central_scheduler_tables(conn: asyncpg.Connection) -> None:
                 str(row["status_reason"] or "").strip() or None,
                 row["status_since"],
                 row["cooldown_until"],
-                False,
-                None,
-                None,
-                None,
-                None,
-                None,
+                bool(row["manual_login_required"]),
+                str(row["manual_login_reason"] or "").strip() or None,
+                row["manual_login_required_at"],
+                row["quarantined_at"],
+                str(row["quarantine_reason"] or "").strip() or None,
+                row["quarantine_evidence"],
                 row["last_selected_at"],
                 row["last_success_at"],
                 int(row["consecutive_failures"] or 0),
@@ -385,16 +399,24 @@ async def _backfill_v4_scheduler_tables(conn: asyncpg.Connection) -> None:
         ON CONFLICT (user_data_dir) DO UPDATE SET
             worker_name = EXCLUDED.worker_name,
             is_enabled = EXCLUDED.is_enabled,
-            status = EXCLUDED.status,
+            status = CASE
+                WHEN EXCLUDED.is_enabled = FALSE THEN 'DISABLED'
+                WHEN COALESCE(profiles.manual_login_required, FALSE)
+                    OR COALESCE(EXCLUDED.manual_login_required, FALSE) THEN 'NEEDS_LOGIN'
+                WHEN COALESCE(EXCLUDED.cooldown_until, profiles.cooldown_until) IS NOT NULL
+                    AND COALESCE(EXCLUDED.cooldown_until, profiles.cooldown_until) > NOW() THEN 'COOLDOWN'
+                ELSE COALESCE(profiles.status, EXCLUDED.status, 'READY')
+            END,
             status_reason = COALESCE(EXCLUDED.status_reason, profiles.status_reason),
             status_since = COALESCE(EXCLUDED.status_since, profiles.status_since),
             cooldown_until = COALESCE(EXCLUDED.cooldown_until, profiles.cooldown_until),
-            manual_login_required = EXCLUDED.manual_login_required,
-            manual_login_reason = COALESCE(EXCLUDED.manual_login_reason, profiles.manual_login_reason),
-            manual_login_required_at = COALESCE(EXCLUDED.manual_login_required_at, profiles.manual_login_required_at),
-            quarantined_at = COALESCE(EXCLUDED.quarantined_at, profiles.quarantined_at),
-            quarantine_reason = COALESCE(EXCLUDED.quarantine_reason, profiles.quarantine_reason),
-            quarantine_evidence = COALESCE(EXCLUDED.quarantine_evidence, profiles.quarantine_evidence),
+            manual_login_required = COALESCE(profiles.manual_login_required, FALSE)
+                OR COALESCE(EXCLUDED.manual_login_required, FALSE),
+            manual_login_reason = COALESCE(profiles.manual_login_reason, EXCLUDED.manual_login_reason),
+            manual_login_required_at = COALESCE(profiles.manual_login_required_at, EXCLUDED.manual_login_required_at),
+            quarantined_at = COALESCE(profiles.quarantined_at, EXCLUDED.quarantined_at),
+            quarantine_reason = COALESCE(profiles.quarantine_reason, EXCLUDED.quarantine_reason),
+            quarantine_evidence = COALESCE(profiles.quarantine_evidence, EXCLUDED.quarantine_evidence),
             failure_count = GREATEST(COALESCE(profiles.failure_count, 0), COALESCE(EXCLUDED.failure_count, 0)),
             last_started_at = COALESCE(EXCLUDED.last_started_at, profiles.last_started_at),
             last_success_at = COALESCE(EXCLUDED.last_success_at, profiles.last_success_at),

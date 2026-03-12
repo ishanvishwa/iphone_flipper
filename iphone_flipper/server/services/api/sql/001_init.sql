@@ -618,16 +618,24 @@ WHERE NULLIF(BTRIM(COALESCE(ep.user_data_dir, '')), '') IS NOT NULL
 ON CONFLICT (user_data_dir) DO UPDATE SET
     worker_name = EXCLUDED.worker_name,
     is_enabled = EXCLUDED.is_enabled,
-    status = EXCLUDED.status,
+    status = CASE
+        WHEN EXCLUDED.is_enabled = FALSE THEN 'DISABLED'
+        WHEN COALESCE(profiles.manual_login_required, FALSE)
+            OR COALESCE(EXCLUDED.manual_login_required, FALSE) THEN 'NEEDS_LOGIN'
+        WHEN COALESCE(EXCLUDED.cooldown_until, profiles.cooldown_until) IS NOT NULL
+            AND COALESCE(EXCLUDED.cooldown_until, profiles.cooldown_until) > NOW() THEN 'COOLDOWN'
+        ELSE COALESCE(profiles.status, EXCLUDED.status, 'READY')
+    END,
     status_reason = COALESCE(EXCLUDED.status_reason, profiles.status_reason),
     status_since = COALESCE(EXCLUDED.status_since, profiles.status_since),
     cooldown_until = COALESCE(EXCLUDED.cooldown_until, profiles.cooldown_until),
-    manual_login_required = EXCLUDED.manual_login_required,
-    manual_login_reason = COALESCE(EXCLUDED.manual_login_reason, profiles.manual_login_reason),
-    manual_login_required_at = COALESCE(EXCLUDED.manual_login_required_at, profiles.manual_login_required_at),
-    quarantined_at = COALESCE(EXCLUDED.quarantined_at, profiles.quarantined_at),
-    quarantine_reason = COALESCE(EXCLUDED.quarantine_reason, profiles.quarantine_reason),
-    quarantine_evidence = COALESCE(EXCLUDED.quarantine_evidence, profiles.quarantine_evidence),
+    manual_login_required = COALESCE(profiles.manual_login_required, FALSE)
+        OR COALESCE(EXCLUDED.manual_login_required, FALSE),
+    manual_login_reason = COALESCE(profiles.manual_login_reason, EXCLUDED.manual_login_reason),
+    manual_login_required_at = COALESCE(profiles.manual_login_required_at, EXCLUDED.manual_login_required_at),
+    quarantined_at = COALESCE(profiles.quarantined_at, EXCLUDED.quarantined_at),
+    quarantine_reason = COALESCE(profiles.quarantine_reason, EXCLUDED.quarantine_reason),
+    quarantine_evidence = COALESCE(profiles.quarantine_evidence, EXCLUDED.quarantine_evidence),
     failure_count = GREATEST(COALESCE(profiles.failure_count, 0), COALESCE(EXCLUDED.failure_count, 0)),
     last_started_at = COALESCE(EXCLUDED.last_started_at, profiles.last_started_at),
     last_success_at = COALESCE(EXCLUDED.last_success_at, profiles.last_success_at),

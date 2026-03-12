@@ -44,6 +44,62 @@ class _RecordingPool:
         return _FakeAcquire(self.conn)
 
 
+class _CentralBackfillConn(_RecordingConn):
+    async def fetch(self, query: str, *args):
+        _ = args
+        normalized = " ".join(str(query).split())
+        self.queries.append(normalized)
+        if "FROM central_routes" in normalized:
+            return []
+        if "FROM worker_routes" in normalized:
+            return [
+                {
+                    "worker_name": "worker_3",
+                    "route_name": "worker_3__env_default",
+                    "is_enabled": True,
+                    "proxy_server": "proxy.example:443",
+                    "proxy_username": "user",
+                    "proxy_password": "pass",
+                    "proxy_mode": "fixed",
+                    "proxy_pool": None,
+                    "preferred_proxy_key": None,
+                    "preferred_proxy_updated_at": None,
+                    "user_data_dir": "/app/runtime/browser_profile_3",
+                    "search_queries": "iPhone",
+                    "priority": 100,
+                    "status": "ENABLED",
+                    "status_reason": None,
+                    "status_since": None,
+                    "next_run_at": None,
+                    "route_interval_seconds": 5,
+                    "avg_result_count": None,
+                    "profitable_hit_rate": 0.0,
+                    "recent_duplicate_ratio": 0.0,
+                    "avg_page_load_ms": None,
+                    "successful_cycles": 0,
+                    "last_selected_at": None,
+                    "last_success_at": None,
+                    "consecutive_failures": 0,
+                    "cooldown_until": None,
+                    "lane_override": None,
+                    "computed_lane": "hot",
+                    "effective_lane": "hot",
+                    "priority_score": 6.9,
+                    "priority_score_updated_at": None,
+                    "manual_login_required": True,
+                    "manual_login_reason": "Manual login required. checkpoint",
+                    "manual_login_required_at": None,
+                    "quarantined_at": None,
+                    "quarantine_reason": "checkpoint",
+                    "quarantine_evidence": {"source": "test"},
+                    "last_error": "MANUAL_LOGIN_REQUIRED: checkpoint",
+                }
+            ]
+        if "FROM worker_heartbeats" in normalized:
+            return []
+        return []
+
+
 class V4SchemaFoundationTests(unittest.IsolatedAsyncioTestCase):
     async def test_ensure_worker_tables_adds_v4_schema_and_is_repeatable(self) -> None:
         pool = _RecordingPool()
@@ -113,6 +169,31 @@ class V4SchemaFoundationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ON CONFLICT (family_id, query_text) DO UPDATE", combined)
         self.assertIn("UPDATE query_families qf", combined)
         self.assertIn("variant_count", combined)
+        self.assertIn(
+            "manual_login_required = COALESCE(profiles.manual_login_required, FALSE) OR COALESCE(EXCLUDED.manual_login_required, FALSE)",
+            combined,
+        )
+
+    async def test_central_backfill_preserves_manual_login_quarantine(self) -> None:
+        conn = _CentralBackfillConn()
+
+        await schema_ensure._backfill_central_scheduler_tables(conn)
+
+        combined = "\n".join(conn.queries)
+        self.assertIn("manual_login_required", combined)
+        self.assertIn("manual_login_reason", combined)
+        self.assertIn(
+            "manual_login_required = COALESCE(execution_profiles.manual_login_required, FALSE) OR COALESCE(EXCLUDED.manual_login_required, FALSE)",
+            combined,
+        )
+        self.assertIn(
+            "manual_login_reason = COALESCE(execution_profiles.manual_login_reason, EXCLUDED.manual_login_reason)",
+            combined,
+        )
+        self.assertIn(
+            "WHEN COALESCE(execution_profiles.manual_login_required, FALSE) OR COALESCE(EXCLUDED.manual_login_required, FALSE) THEN 'NEEDS_LOGIN'",
+            combined,
+        )
 
     def test_sql_bootstrap_file_contains_v4_backfill_statements(self) -> None:
         sql_path = (
@@ -127,6 +208,10 @@ class V4SchemaFoundationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("FROM central_routes cr", sql_text)
         self.assertIn("INSERT INTO query_variants (", sql_text)
         self.assertIn("FROM route_queries rq", sql_text)
+        self.assertIn(
+            "manual_login_required = COALESCE(profiles.manual_login_required, FALSE)",
+            sql_text,
+        )
 
 
 if __name__ == "__main__":
