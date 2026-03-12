@@ -166,7 +166,33 @@ Then:
 docker compose --env-file ../.env up -d --build
 ```
 
-## 9.1) Hardening Baseline (Do this before long runs)
+## 9.1) V4.1 Cutover And Rollback
+
+Use the V4.1 cutover tool to seed the initial `iphone_broad` family, snapshot the current flag state, and keep central dispatch available for fast rollback.
+
+From the server project root:
+
+```bash
+cd /home/ubuntu/iphone-flipper-server/server
+python scripts/v41_cutover.py status
+python scripts/v41_cutover.py snapshot
+python scripts/v41_cutover.py prepare
+python scripts/v41_cutover.py activate
+```
+
+Behavior notes:
+- `prepare` creates or refreshes the `iphone_broad` family with one validated broad `iPhone` variant and `min_gap_s=5`, but does not enable V4.
+- `activate` writes a snapshot file under `server/runtime/`, seeds the broad family, and enables `ENABLE_V4_WARM_RUNTIME=1`. Central routes stay in place for rollback.
+- `rollback` disables the V4 flags and restores central-dispatch-friendly defaults. If you provide the snapshot file created during activation, the prior flag values are restored.
+
+Examples:
+
+```bash
+python scripts/v41_cutover.py activate --source-route worker_3__env_default
+python scripts/v41_cutover.py rollback --snapshot runtime/v41-cutover-snapshot-20260312T030000Z.json
+```
+
+## 9.2) Hardening Baseline (Do this before long runs)
 
 1. Keep worker browser/runtime data persistent:
 - mount `../runtime:/app/runtime` for every worker service.
