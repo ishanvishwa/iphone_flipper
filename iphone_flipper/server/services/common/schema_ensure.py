@@ -331,7 +331,7 @@ async def _backfill_central_scheduler_tables(conn: asyncpg.Connection) -> None:
                 last_success_at,
                 last_error
             ) VALUES (
-                $1, $2, NULL, NULL, TRUE, 'READY', NOW(), $3, $4, $5
+                $1, $2, $3, $4, TRUE, 'READY', NOW(), $5, $6, $7
             )
             ON CONFLICT (user_data_dir) DO UPDATE SET
                 worker_name = EXCLUDED.worker_name,
