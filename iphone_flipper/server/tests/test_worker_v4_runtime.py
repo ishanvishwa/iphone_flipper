@@ -101,6 +101,67 @@ class WorkerV4RuntimeTests(unittest.IsolatedAsyncioTestCase):
             worker.V4_ROLLOUT_FAMILY_ALLOWLIST or None,
         )
 
+    async def test_interruptible_worker_sleep_wakes_when_v4_canary_turns_on(self) -> None:
+        feature_flags = AsyncMock()
+        feature_flags.is_enabled = AsyncMock(side_effect=[False, True])
+
+        with (
+            patch.object(worker, "_worker_v4_rollout_enabled", return_value=True),
+            patch.object(worker.asyncio, "sleep", AsyncMock()) as sleep_mock,
+        ):
+            result = await worker._interruptible_worker_sleep(
+                30.0,
+                feature_flags=feature_flags,
+                max_chunk_seconds=5.0,
+                wake_on_v4_enable=True,
+            )
+
+        self.assertEqual(result, "v4_enabled")
+        sleep_mock.assert_awaited_once_with(5.0)
+
+    async def test_interruptible_worker_sleep_ignores_v4_enable_for_non_canary_worker(self) -> None:
+        feature_flags = AsyncMock()
+        feature_flags.is_enabled = AsyncMock(return_value=True)
+
+        with (
+            patch.object(worker, "_worker_v4_rollout_enabled", return_value=False),
+            patch.object(worker.asyncio, "sleep", AsyncMock()) as sleep_mock,
+        ):
+            result = await worker._interruptible_worker_sleep(
+                10.0,
+                feature_flags=feature_flags,
+                max_chunk_seconds=5.0,
+                wake_on_v4_enable=True,
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(sleep_mock.await_count, 2)
+
+    async def test_apply_v4_profile_claim_outcome_checkpoint_quarantines_execution_profile(self) -> None:
+        claim_result = worker.V4FamilyClaimResult(
+            metrics={},
+            outcome=worker.FamilyClaimOutcome.CHECKPOINT,
+            error_text="manual_login_required: checkpoint",
+            error_category=worker.ErrorCategory.AUTH_REQUIRED,
+            final_url="https://www.facebook.com/checkpoint/",
+        )
+
+        with (
+            patch.object(worker, "_mark_v4_profile_manual_login_required", AsyncMock()) as mark_v4_profile,
+            patch.object(worker, "_mark_execution_profile_manual_login_required", AsyncMock()) as mark_execution_profile,
+            patch.object(worker, "_should_send_manual_login_alert", return_value=False),
+        ):
+            should_abort = await worker._apply_v4_profile_claim_outcome(
+                pool=object(),
+                profile={"profile_id": 3, "user_data_dir": "/profiles/3"},
+                family={"family_id": 70, "name": "iphone_broad"},
+                claim_result=claim_result,
+            )
+
+        self.assertTrue(should_abort)
+        mark_v4_profile.assert_awaited_once()
+        mark_execution_profile.assert_awaited_once()
+
     def test_v4_variant_urls_expand_query_placeholder(self) -> None:
         urls = worker._v4_variant_urls(
             {

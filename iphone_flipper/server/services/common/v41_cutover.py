@@ -113,13 +113,6 @@ def build_flag_restore_mapping(snapshot: Mapping[str, Any] | None) -> dict[str, 
         restored[flag_name] = "1" if parse_feature_flag_value(raw_value, default=default_value == "1") else "0"
     return restored
 
-
-async def _ensure_worker_tables(pool: Any) -> None:
-    from server.services.common.schema_ensure import ensure_worker_tables
-
-    await ensure_worker_tables(pool)
-
-
 async def fetch_feature_flags(redis_client: Any | None) -> dict[str, str]:
     if redis_client is None:
         return {}
@@ -188,7 +181,6 @@ async def seed_v41_broad_family(
     preferred_route_name: str | None = None,
     min_gap_seconds: int = V41_MIN_GAP_SECONDS,
 ) -> dict[str, Any]:
-    await _ensure_worker_tables(pool)
     routes = await fetch_central_route_candidates(pool)
     candidate = choose_v41_seed_route(
         routes,
@@ -346,7 +338,6 @@ async def collect_v41_status(
     *,
     family_name: str = V41_FAMILY_NAME,
 ) -> dict[str, Any]:
-    await _ensure_worker_tables(pool)
     async with pool.acquire() as conn:
         counts_row = await conn.fetchrow(
             """

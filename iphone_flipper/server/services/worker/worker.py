@@ -133,6 +133,7 @@ from server.services.worker.v4_runtime import (  # noqa: E402
     normalize_warm_session_config,
     should_abort_warm_session,
     scrub_orphaned_chromium_locks,
+    worker_rollout_enabled,
 )
 
 logging.basicConfig(
@@ -364,6 +365,7 @@ PRICE_DROP_UPDATE_MODE = _normalize_price_drop_update_mode(os.getenv("PRICE_DROP
 V4_DOM_INVESTIGATION_BACKOFF_SECONDS = 300
 V4_INFRA_FAMILY_BACKOFF_SECONDS = 60
 V4_ROLLOUT_FAMILY_ALLOWLIST = _parse_csv_tokens(os.getenv("V4_ROLLOUT_FAMILY_ALLOWLIST", "iphone_broad"))
+V4_ROLLOUT_WORKER_ALLOWLIST = _parse_csv_tokens(os.getenv("V4_ROLLOUT_WORKER_ALLOWLIST", ""))
 IPHONE_BROAD_MIN_GAP_SECONDS = _parse_int(os.getenv("IPHONE_BROAD_MIN_GAP_SECONDS"), default=5, minimum=1)
 IPHONE_BROAD_INITIAL_VARIANTS = _parse_int(os.getenv("IPHONE_BROAD_INITIAL_VARIANTS"), default=1, minimum=1)
 V4_DOM_CHANGED_THRESHOLD = _parse_int(os.getenv("V4_DOM_CHANGED_THRESHOLD"), default=3, minimum=1)
@@ -509,6 +511,38 @@ class V4FamilyClaimResult:
     final_url: str | None = None
     feed_present: bool = False
     empty_state_detected: bool = False
+
+
+def _worker_v4_rollout_enabled() -> bool:
+    return worker_rollout_enabled(WORKER_NAME, V4_ROLLOUT_WORKER_ALLOWLIST)
+
+
+async def _interruptible_worker_sleep(
+    seconds: float,
+    *,
+    feature_flags: RedisFeatureFlags | None = None,
+    max_chunk_seconds: float = 5.0,
+    wake_on_v4_enable: bool = False,
+    wake_on_v4_disable: bool = False,
+) -> str | None:
+    remaining = max(0.0, float(seconds or 0.0))
+    if remaining <= 0:
+        return None
+
+    chunk_size = max(0.1, float(max_chunk_seconds or 5.0))
+    while remaining > 0 and not _worker_shutdown_requested():
+        if feature_flags is not None:
+            v4_enabled = await feature_flags.is_enabled("ENABLE_V4_WARM_RUNTIME")
+            if wake_on_v4_enable and v4_enabled and _worker_v4_rollout_enabled():
+                return "v4_enabled"
+            if wake_on_v4_disable and not v4_enabled:
+                return "v4_disabled"
+
+        chunk = min(remaining, chunk_size)
+        await asyncio.sleep(chunk)
+        remaining = max(0.0, remaining - chunk)
+
+    return None
 
 
 def _parse_quiet_hours(raw: str) -> tuple[tuple[int, int], tuple[int, int]] | None:
@@ -2729,6 +2763,12 @@ async def _apply_v4_profile_claim_outcome(
             "outcome": claim_result.outcome.value,
         }
         await _mark_v4_profile_manual_login_required(pool, profile, reason=manual_reason, evidence=evidence)
+        await _mark_execution_profile_manual_login_required(
+            pool,
+            {"user_data_dir": profile.get("user_data_dir")},
+            reason=manual_reason,
+            evidence=evidence,
+        )
         if _should_send_manual_login_alert(route, manual_reason):
             await asyncio.to_thread(_send_telegram_manual_login_required_alert, route, manual_reason)
         return True
@@ -3064,7 +3104,11 @@ async def _run_v4_worker_loop(
                 finished_at=datetime.now(timezone.utc),
                 route=None,
             )
-            await asyncio.sleep(float(WORKER_NO_PROFILE_BACKOFF_SECONDS))
+            await _interruptible_worker_sleep(
+                float(WORKER_NO_PROFILE_BACKOFF_SECONDS),
+                feature_flags=feature_flags,
+                wake_on_v4_disable=True,
+            )
             continue
 
         warm_session: V4WarmSessionState | None = None
@@ -3111,7 +3155,11 @@ async def _run_v4_worker_loop(
                             finished_at=datetime.now(timezone.utc),
                             route=_build_v4_family_route(warm_session.profile),
                         )
-                        await asyncio.sleep(min(float(dom_pause_remaining), float(LEASE_HEARTBEAT_SECONDS)))
+                        await _interruptible_worker_sleep(
+                            min(float(dom_pause_remaining), float(LEASE_HEARTBEAT_SECONDS)),
+                            feature_flags=feature_flags,
+                            wake_on_v4_disable=True,
+                        )
                         continue
 
                     family = await _claim_v4_family(pool)
@@ -3127,7 +3175,11 @@ async def _run_v4_worker_loop(
                             finished_at=datetime.now(timezone.utc),
                             route=_build_v4_family_route(warm_session.profile),
                         )
-                        await asyncio.sleep(min(5.0, float(LEASE_HEARTBEAT_SECONDS)))
+                        await _interruptible_worker_sleep(
+                            min(5.0, float(LEASE_HEARTBEAT_SECONDS)),
+                            feature_flags=feature_flags,
+                            wake_on_v4_disable=True,
+                        )
                         continue
 
                     variant = await _load_v4_family_variant(pool, family)
@@ -3258,7 +3310,11 @@ async def _run_v4_worker_loop(
                         rng=random,
                     )
                     if pause_seconds > 0 and not _worker_shutdown_requested():
-                        await asyncio.sleep(pause_seconds)
+                        await _interruptible_worker_sleep(
+                            pause_seconds,
+                            feature_flags=feature_flags,
+                            wake_on_v4_disable=True,
+                        )
             finally:
                 profile_heartbeat_stop.set()
                 await asyncio.gather(profile_heartbeat_task, return_exceptions=True)
@@ -6193,7 +6249,11 @@ async def _run_worker_loop(
     global _SINGLE_ROUTE_ENFORCEMENT_ACTIVE, _CENTRAL_ROUTE_DISPATCH_COUNT
     try:
         while not _worker_shutdown_requested():
-            if feature_flags is not None and await feature_flags.is_enabled("ENABLE_V4_WARM_RUNTIME"):
+            if (
+                feature_flags is not None
+                and await feature_flags.is_enabled("ENABLE_V4_WARM_RUNTIME")
+                and _worker_v4_rollout_enabled()
+            ):
                 await _run_v4_worker_loop(pool=pool, redis_client=redis_client, feature_flags=feature_flags, runtime_config=runtime_config)
                 continue
             cycle_started_monotonic = time.monotonic()
@@ -6489,7 +6549,11 @@ async def _run_worker_loop(
                         min_sleep_seconds=0.1,
                     )
                     if sleep_seconds > 0 and not _worker_shutdown_requested():
-                        await asyncio.sleep(sleep_seconds)
+                        await _interruptible_worker_sleep(
+                            sleep_seconds,
+                            feature_flags=feature_flags,
+                            wake_on_v4_enable=True,
+                        )
                     continue
 
                 route_name = str(route.get("route_name") or "unknown")

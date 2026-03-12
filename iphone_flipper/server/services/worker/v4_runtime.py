@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from server.services.worker.runtime import ErrorCategory, classify_error
 
@@ -178,6 +178,21 @@ def should_abort_warm_session(outcome: FamilyClaimOutcome) -> bool:
         FamilyClaimOutcome.DOM_CHANGED,
         FamilyClaimOutcome.INFRASTRUCTURE_ERROR,
     }
+
+
+def worker_rollout_enabled(
+    worker_name: str | None,
+    rollout_allowlist: Sequence[str] | None,
+) -> bool:
+    normalized_worker_name = str(worker_name or "").strip().lower()
+    normalized_allowlist = {
+        str(item or "").strip().lower()
+        for item in (rollout_allowlist or ())
+        if str(item or "").strip()
+    }
+    if not normalized_allowlist:
+        return True
+    return normalized_worker_name in normalized_allowlist
 
 
 def scrub_orphaned_chromium_locks(user_data_dir: str | None) -> list[str]:

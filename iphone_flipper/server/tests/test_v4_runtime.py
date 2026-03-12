@@ -16,6 +16,7 @@ from server.services.worker.v4_runtime import (
     normalize_warm_session_config,
     should_abort_warm_session,
     scrub_orphaned_chromium_locks,
+    worker_rollout_enabled,
 )
 
 
@@ -214,6 +215,14 @@ class V4RuntimeTests(unittest.TestCase):
         self.assertTrue(should_abort_warm_session(FamilyClaimOutcome.DOM_CHANGED))
         self.assertTrue(should_abort_warm_session(FamilyClaimOutcome.CHECKPOINT))
         self.assertFalse(should_abort_warm_session(FamilyClaimOutcome.EMPTY_FEED))
+
+    def test_worker_rollout_enabled_defaults_to_all_workers_when_allowlist_empty(self) -> None:
+        self.assertTrue(worker_rollout_enabled("worker", ()))
+        self.assertTrue(worker_rollout_enabled("worker_3", []))
+
+    def test_worker_rollout_enabled_respects_allowlist(self) -> None:
+        self.assertTrue(worker_rollout_enabled("worker_3", ("worker_3",)))
+        self.assertFalse(worker_rollout_enabled("worker", ("worker_3",)))
 
 
 if __name__ == "__main__":

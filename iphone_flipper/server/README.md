@@ -174,6 +174,8 @@ From the VPS server project root:
 
 ```bash
 cd /home/ubuntu/iphone-flipper-server/server
+grep '^V4_ROLLOUT_WORKER_ALLOWLIST=' ../.env || echo 'V4_ROLLOUT_WORKER_ALLOWLIST=worker_3' >> ../.env
+docker compose --env-file ../.env up -d --build worker worker_2 worker_3
 docker compose --env-file ../.env exec -T worker python server/scripts/v41_cutover.py status
 docker compose --env-file ../.env exec -T worker python server/scripts/v41_cutover.py snapshot
 docker compose --env-file ../.env exec -T worker python server/scripts/v41_cutover.py prepare
@@ -181,7 +183,9 @@ docker compose --env-file ../.env exec -T worker python server/scripts/v41_cutov
 ```
 
 Behavior notes:
+- Set `V4_ROLLOUT_WORKER_ALLOWLIST=worker_3` before activation so the first live cutover stays canary-only. `worker` and `worker_2` remain on central dispatch until the canary is clean.
 - `prepare` creates or refreshes the `iphone_broad` family with one validated broad `iPhone` variant and `min_gap_s=5`, but does not enable V4.
+- `status` and `snapshot` are read-only checks. They do not backfill or rewrite V4 profile state.
 - `activate` writes a snapshot file under `server/runtime/`, seeds the broad family, and enables `ENABLE_V4_WARM_RUNTIME=1`. Central routes stay in place for rollback.
 - `rollback` disables the V4 flags and restores central-dispatch-friendly defaults. If you provide the snapshot file created during activation, the prior flag values are restored.
 
