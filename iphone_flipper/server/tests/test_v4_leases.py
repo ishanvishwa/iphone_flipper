@@ -59,8 +59,6 @@ class _LeaseConn:
     def _claim_profile(self, worker_name: str, lease_token: str, lease_seconds: int):
         eligible = []
         for row in self.profiles.values():
-            if str(row.get("worker_name") or "").strip() != str(worker_name):
-                continue
             if not bool(row.get("is_enabled", True)):
                 continue
             if str(row.get("status") or "READY") not in {"READY", "DEGRADED", "THROTTLED"}:
@@ -86,6 +84,7 @@ class _LeaseConn:
             status = str(row.get("status") or "READY")
             status_order = {"READY": 0, "DEGRADED": 1, "THROTTLED": 2}.get(status, 9)
             return (
+                0 if str(row.get("worker_name") or "").strip() == str(worker_name) else 1,
                 status_order,
                 last_started_at is not None,
                 last_started_at or datetime.min.replace(tzinfo=timezone.utc),
@@ -276,6 +275,85 @@ class V4LeaseManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(claimed)
         self.assertEqual(claimed["profile_id"], 3)
+
+    async def test_profile_claim_falls_back_to_other_workers_profile_when_own_is_ineligible(self) -> None:
+        conn = _LeaseConn(
+            profiles=[
+                {
+                    "profile_id": 1,
+                    "worker_name": "worker",
+                    "is_enabled": True,
+                    "status": "COOLDOWN",
+                    "manual_login_required": False,
+                    "available_after": None,
+                    "cooldown_until": datetime(2026, 3, 11, 0, 1, tzinfo=timezone.utc),
+                    "profile_lease_expires_at": None,
+                    "last_started_at": None,
+                },
+                {
+                    "profile_id": 2,
+                    "worker_name": "worker_3",
+                    "is_enabled": True,
+                    "status": "READY",
+                    "manual_login_required": False,
+                    "available_after": None,
+                    "cooldown_until": None,
+                    "profile_lease_expires_at": None,
+                    "last_started_at": None,
+                },
+            ]
+        )
+        pool = _LeasePool(conn)
+
+        claimed = await lease_manager.claim_next_profile(
+            pool,
+            worker_name="worker",
+            lease_token="lease-1",
+            lease_seconds=120,
+        )
+
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed["profile_id"], 2)
+        self.assertEqual(claimed["worker_name"], "worker_3")
+
+    async def test_profile_claim_prefers_owned_profile_before_shared_fallback(self) -> None:
+        conn = _LeaseConn(
+            profiles=[
+                {
+                    "profile_id": 1,
+                    "worker_name": "worker",
+                    "is_enabled": True,
+                    "status": "READY",
+                    "manual_login_required": False,
+                    "available_after": None,
+                    "cooldown_until": None,
+                    "profile_lease_expires_at": None,
+                    "last_started_at": datetime(2026, 3, 11, 0, 0, 30, tzinfo=timezone.utc),
+                },
+                {
+                    "profile_id": 2,
+                    "worker_name": "worker_3",
+                    "is_enabled": True,
+                    "status": "READY",
+                    "manual_login_required": False,
+                    "available_after": None,
+                    "cooldown_until": None,
+                    "profile_lease_expires_at": None,
+                    "last_started_at": None,
+                },
+            ]
+        )
+        pool = _LeasePool(conn)
+
+        claimed = await lease_manager.claim_next_profile(
+            pool,
+            worker_name="worker",
+            lease_token="lease-1",
+            lease_seconds=120,
+        )
+
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed["profile_id"], 1)
 
     async def test_profile_heartbeat_release_and_available_after_require_matching_token(self) -> None:
         conn = _LeaseConn(

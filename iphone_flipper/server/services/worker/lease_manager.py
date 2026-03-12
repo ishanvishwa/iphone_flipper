@@ -263,14 +263,17 @@ async def claim_next_profile(
             WHERE profile_id = (
                 SELECT profile_id
                 FROM profiles
-                WHERE worker_name = $1
-                  AND is_enabled = TRUE
+                WHERE is_enabled = TRUE
                   AND status IN ('READY', 'DEGRADED', 'THROTTLED')
                   AND COALESCE(manual_login_required, FALSE) = FALSE
                   AND (cooldown_until IS NULL OR cooldown_until <= NOW())
                   AND (available_after IS NULL OR available_after <= NOW())
                   AND (profile_lease_expires_at IS NULL OR profile_lease_expires_at <= NOW())
                 ORDER BY
+                    CASE
+                        WHEN worker_name = $1 THEN 0
+                        ELSE 1
+                    END,
                     CASE status
                         WHEN 'READY' THEN 0
                         WHEN 'DEGRADED' THEN 1
