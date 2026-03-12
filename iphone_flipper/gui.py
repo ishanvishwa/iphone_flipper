@@ -7304,6 +7304,9 @@ PY
         dolphin_buttons.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
         
         ttk.Button(dolphin_buttons, text="Fetch Profiles", command=self._refresh_dolphin_profiles).pack(side=tk.LEFT, padx=5)
+        ttk.Button(dolphin_buttons, text="Sync To VPS Pool", command=self._sync_all_dolphin_profiles_to_execution_pool).pack(
+            side=tk.LEFT, padx=5
+        )
         ttk.Button(dolphin_buttons, text="Start Selected", command=self._start_selected_dolphin_profiles).pack(side=tk.LEFT, padx=5)
         ttk.Button(dolphin_buttons, text="Stop Selected", command=self._stop_selected_dolphin_profiles).pack(side=tk.LEFT, padx=5)
         ttk.Button(dolphin_buttons, text="Clear Manual Login", command=self._clear_selected_dolphin_manual_login).pack(
@@ -8405,6 +8408,73 @@ PY
         if unmapped_profiles:
             status_text += f" {len(unmapped_profiles)} selected profile(s) had no VPS mapping."
         self.status_bar.config(text=status_text)
+
+    def _sync_all_dolphin_profiles_to_execution_pool(self):
+        if not hasattr(self, "dolphin_tree") or not self.dolphin_tree:
+            return
+
+        if not self.dolphin_profile_records_by_id:
+            self._refresh_dolphin_profiles()
+
+        cloud_profiles = [
+            record.get("cloud_profile") or {}
+            for record in self.dolphin_profile_records_by_id.values()
+            if isinstance(record, dict) and isinstance(record.get("cloud_profile"), dict)
+        ]
+        if not cloud_profiles:
+            messagebox.showinfo(
+                "Dolphin Profiles",
+                "No Dolphin profiles are loaded yet. Fetch profiles first, then sync them to the VPS pool.",
+            )
+            return
+
+        slot_set: set[int] = set()
+        for profile_payload in cloud_profiles:
+            for slot in self._extract_dolphin_profile_slots(profile_payload):
+                if slot > 0:
+                    slot_set.add(int(slot))
+
+        slots = sorted(slot_set)
+        if not slots:
+            messagebox.showwarning(
+                "Dolphin Profiles",
+                "No browser_profile_N slots could be detected from the loaded Dolphin profiles.",
+            )
+            return
+
+        if not messagebox.askyesno(
+            "Sync To VPS Pool",
+            f"Add or refresh {len(slots)} Dolphin profile slot(s) in the VPS execution-profile pool?",
+        ):
+            return
+
+        ctx, error = self._get_server_api_context()
+        if error:
+            messagebox.showwarning("Dolphin Profiles", error)
+            return
+
+        try:
+            response = requests.post(
+                f"{ctx['base_url']}/execution-profiles/sync-pool",
+                headers=ctx["headers"],
+                json={"slots": slots},
+                timeout=(8, 45),
+            )
+            if response.status_code == 401:
+                raise RuntimeError("Unauthorized (check Server API Token).")
+            response.raise_for_status()
+            payload = response.json() if response.content else {}
+        except Exception as exc:
+            messagebox.showerror("Sync Failed", f"Failed to sync Dolphin profiles to VPS pool:\n{exc}")
+            self.status_bar.config(text="Dolphin-to-VPS pool sync failed")
+            return
+
+        self._refresh_dolphin_profiles()
+        self._refresh_vps_scraper_tree(preserve_selection=True)
+        synced_count = self._safe_int(payload.get("synced_count"), len(slots)) if isinstance(payload, dict) else len(slots)
+        self.status_bar.config(
+            text=f"Synced {synced_count} Dolphin profile slot(s) into the VPS execution-profile pool."
+        )
 
 
 def main():

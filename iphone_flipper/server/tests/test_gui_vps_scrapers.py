@@ -745,6 +745,68 @@ class GuiVpsScraperFallbackTests(unittest.TestCase):
         )
         self.assertIn("Cleared manual login on 1 profile", app.status_bar.text)
 
+    def test_sync_all_dolphin_profiles_to_execution_pool_posts_detected_slots(self) -> None:
+        app = self._build_gui()
+        app.dolphin_profile_records_by_id = {
+            "100": {
+                "cloud_profile": {
+                    "id": 100,
+                    "name": "browser_profile_4",
+                    "tags": ["worker_4"],
+                }
+            },
+            "101": {
+                "cloud_profile": {
+                    "id": 101,
+                    "name": "Seller Browser",
+                    "tags": ["browser_profile_5", "warm"],
+                }
+            },
+            "102": {
+                "cloud_profile": {
+                    "id": 102,
+                    "name": "No slot",
+                    "tags": [],
+                }
+            },
+        }
+        app._get_server_api_context = lambda: (
+            {"base_url": "https://example.com", "headers": {"x-api-token": "test", "Content-Type": "application/json"}},
+            None,
+        )
+        refresh_calls: list[str] = []
+        app._refresh_dolphin_profiles = lambda: refresh_calls.append("dolphin")
+        app._refresh_vps_scraper_tree = lambda preserve_selection=True: refresh_calls.append("vps")
+
+        class _Response:
+            status_code = 200
+            content = b'{"ok": true, "synced_count": 2, "slots": [4, 5], "items": []}'
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict:
+                return {"ok": True, "synced_count": 2, "slots": [4, 5], "items": []}
+
+        with (
+            patch.object(gui.messagebox, "askyesno", return_value=True),
+            patch.object(gui.requests, "post", return_value=_Response()) as post_mock,
+        ):
+            app._sync_all_dolphin_profiles_to_execution_pool()
+
+        self.assertEqual(
+            post_mock.call_args.args[0],
+            "https://example.com/execution-profiles/sync-pool",
+        )
+        self.assertEqual(
+            post_mock.call_args.kwargs["json"],
+            {
+                "slots": [4, 5],
+            },
+        )
+        self.assertEqual(refresh_calls, ["dolphin", "vps"])
+        self.assertIn("Synced 2 Dolphin profile slot(s)", app.status_bar.text)
+
 
 if __name__ == "__main__":
     unittest.main()

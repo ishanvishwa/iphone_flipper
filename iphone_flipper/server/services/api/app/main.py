@@ -77,6 +77,7 @@ LISTING_SELECT_COLUMNS = """
 """
 WEBSOCKET_PING_INTERVAL_SECONDS = 15.0
 WEBSOCKET_PONG_TIMEOUT_SECONDS = 35.0
+EXECUTION_PROFILE_WORKER_CYCLE: tuple[str, ...] = ("worker", "worker_2", "worker_3")
 
 
 @dataclass(slots=True)
@@ -173,6 +174,10 @@ class ExecutionProfileManualLoginClearRequest(BaseModel):
     reason: str | None = None
 
 
+class ExecutionProfilePoolSyncRequest(BaseModel):
+    slots: list[int] = Field(default_factory=list)
+
+
 class ProxyStatsResetRequest(BaseModel):
     proxy_key: str | None = None
     proxy_server: str | None = None
@@ -239,6 +244,33 @@ def _serialize_datetimes(item: dict[str, Any], keys: tuple[str, ...]) -> dict[st
         if hasattr(value, "isoformat"):
             item[key] = value.isoformat()
     return item
+
+
+def _normalize_execution_profile_slots(raw_slots: list[int] | tuple[int, ...] | None) -> list[int]:
+    normalized: list[int] = []
+    seen: set[int] = set()
+    for raw_slot in raw_slots or []:
+        try:
+            slot = int(raw_slot)
+        except (TypeError, ValueError):
+            continue
+        if slot <= 0 or slot in seen:
+            continue
+        seen.add(slot)
+        normalized.append(slot)
+    return sorted(normalized)
+
+
+def _execution_profile_user_data_dir_for_slot(slot: int) -> str:
+    return f"/app/runtime/browser_profile_{int(slot)}"
+
+
+def _execution_profile_worker_name_for_slot(slot: int) -> str:
+    cycle = tuple(name for name in EXECUTION_PROFILE_WORKER_CYCLE if str(name or "").strip())
+    if not cycle:
+        return "worker"
+    safe_slot = max(1, int(slot or 1))
+    return cycle[(safe_slot - 1) % len(cycle)]
 
 
 def _extract_listing_observation_fields(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -2279,6 +2311,194 @@ async def get_execution_profiles(
         for row in rows
     ]
     return {"count": len(items), "items": items}
+
+
+@app.post("/execution-profiles/sync-pool")
+async def sync_execution_profile_pool(
+    payload: ExecutionProfilePoolSyncRequest,
+    x_api_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    await _auth_rest(x_api_token)
+    slots = _normalize_execution_profile_slots(payload.slots)
+    if not slots:
+        raise HTTPException(status_code=400, detail="At least one positive profile slot is required.")
+
+    execution_profile_rows: list[dict[str, Any]] = []
+    async with app.state.db_pool.acquire() as conn:
+        async with conn.transaction():
+            for slot in slots:
+                worker_name = _execution_profile_worker_name_for_slot(slot)
+                user_data_dir = _execution_profile_user_data_dir_for_slot(slot)
+                execution_profile = await conn.fetchrow(
+                    """
+                    INSERT INTO execution_profiles (
+                        user_data_dir,
+                        worker_name,
+                        is_enabled,
+                        status,
+                        status_reason,
+                        status_since,
+                        cooldown_until,
+                        manual_login_required,
+                        manual_login_reason,
+                        manual_login_required_at,
+                        quarantined_at,
+                        quarantine_reason,
+                        quarantine_evidence,
+                        consecutive_failures,
+                        last_error
+                    ) VALUES (
+                        $1, $2, TRUE, 'READY', NULL, NOW(),
+                        NULL, FALSE, NULL, NULL, NULL, NULL, NULL, 0, NULL
+                    )
+                    ON CONFLICT (user_data_dir) DO UPDATE SET
+                        worker_name = EXCLUDED.worker_name,
+                        is_enabled = TRUE,
+                        status = CASE
+                            WHEN COALESCE(execution_profiles.manual_login_required, FALSE) = TRUE THEN 'NEEDS_LOGIN'
+                            WHEN execution_profiles.cooldown_until IS NOT NULL AND execution_profiles.cooldown_until > NOW()
+                                THEN 'COOLDOWN'
+                            WHEN COALESCE(execution_profiles.status, 'READY') = 'DISABLED' THEN 'READY'
+                            ELSE COALESCE(execution_profiles.status, 'READY')
+                        END,
+                        status_reason = CASE
+                            WHEN COALESCE(execution_profiles.manual_login_required, FALSE) = TRUE
+                                THEN COALESCE(execution_profiles.manual_login_reason, execution_profiles.status_reason)
+                            WHEN execution_profiles.cooldown_until IS NOT NULL AND execution_profiles.cooldown_until > NOW()
+                                THEN execution_profiles.status_reason
+                            WHEN COALESCE(execution_profiles.status, 'READY') = 'DISABLED' THEN NULL
+                            ELSE execution_profiles.status_reason
+                        END,
+                        status_since = CASE
+                            WHEN COALESCE(execution_profiles.status, 'READY') = 'DISABLED' THEN NOW()
+                            ELSE COALESCE(execution_profiles.status_since, NOW())
+                        END,
+                        cooldown_until = execution_profiles.cooldown_until,
+                        manual_login_required = COALESCE(execution_profiles.manual_login_required, FALSE),
+                        manual_login_reason = execution_profiles.manual_login_reason,
+                        manual_login_required_at = execution_profiles.manual_login_required_at,
+                        quarantined_at = execution_profiles.quarantined_at,
+                        quarantine_reason = execution_profiles.quarantine_reason,
+                        quarantine_evidence = execution_profiles.quarantine_evidence,
+                        last_selected_at = execution_profiles.last_selected_at,
+                        last_success_at = execution_profiles.last_success_at,
+                        consecutive_failures = COALESCE(execution_profiles.consecutive_failures, 0),
+                        last_error = execution_profiles.last_error
+                    RETURNING
+                        user_data_dir,
+                        worker_name,
+                        is_enabled,
+                        status,
+                        status_reason,
+                        status_since,
+                        cooldown_until,
+                        manual_login_required,
+                        manual_login_reason,
+                        manual_login_required_at,
+                        quarantined_at,
+                        quarantine_reason,
+                        quarantine_evidence,
+                        last_selected_at,
+                        last_success_at,
+                        consecutive_failures,
+                        last_error,
+                        created_at,
+                        updated_at
+                    """,
+                    user_data_dir,
+                    worker_name,
+                )
+                await conn.fetchrow(
+                    """
+                    INSERT INTO profiles (
+                        worker_name,
+                        user_data_dir,
+                        is_enabled,
+                        status,
+                        status_reason,
+                        status_since,
+                        available_after,
+                        cooldown_until,
+                        manual_login_required,
+                        manual_login_reason,
+                        manual_login_required_at,
+                        quarantined_at,
+                        quarantine_reason,
+                        quarantine_evidence,
+                        failure_count,
+                        consecutive_empty_claims,
+                        last_error
+                    ) VALUES (
+                        $1, $2, TRUE, 'READY', NULL, NOW(),
+                        NULL, NULL, FALSE, NULL, NULL, NULL, NULL, NULL, 0, 0, NULL
+                    )
+                    ON CONFLICT (user_data_dir) DO UPDATE SET
+                        worker_name = EXCLUDED.worker_name,
+                        is_enabled = TRUE,
+                        status = CASE
+                            WHEN COALESCE(profiles.manual_login_required, FALSE) = TRUE THEN 'NEEDS_LOGIN'
+                            WHEN profiles.cooldown_until IS NOT NULL AND profiles.cooldown_until > NOW()
+                                THEN 'COOLDOWN'
+                            WHEN COALESCE(profiles.status, 'READY') = 'DISABLED' THEN 'READY'
+                            ELSE COALESCE(profiles.status, 'READY')
+                        END,
+                        status_reason = CASE
+                            WHEN COALESCE(profiles.manual_login_required, FALSE) = TRUE
+                                THEN COALESCE(profiles.manual_login_reason, profiles.status_reason)
+                            WHEN profiles.cooldown_until IS NOT NULL AND profiles.cooldown_until > NOW()
+                                THEN profiles.status_reason
+                            WHEN COALESCE(profiles.status, 'READY') = 'DISABLED' THEN NULL
+                            ELSE profiles.status_reason
+                        END,
+                        status_since = CASE
+                            WHEN COALESCE(profiles.status, 'READY') = 'DISABLED' THEN NOW()
+                            ELSE COALESCE(profiles.status_since, NOW())
+                        END,
+                        available_after = profiles.available_after,
+                        cooldown_until = profiles.cooldown_until,
+                        manual_login_required = COALESCE(profiles.manual_login_required, FALSE),
+                        manual_login_reason = profiles.manual_login_reason,
+                        manual_login_required_at = profiles.manual_login_required_at,
+                        quarantined_at = profiles.quarantined_at,
+                        quarantine_reason = profiles.quarantine_reason,
+                        quarantine_evidence = profiles.quarantine_evidence,
+                        failure_count = COALESCE(profiles.failure_count, 0),
+                        consecutive_empty_claims = COALESCE(profiles.consecutive_empty_claims, 0),
+                        last_started_at = profiles.last_started_at,
+                        last_success_at = profiles.last_success_at,
+                        last_failure_at = profiles.last_failure_at,
+                        last_heartbeat_at = profiles.last_heartbeat_at,
+                        last_error = profiles.last_error,
+                        profile_lease_token = profiles.profile_lease_token,
+                        profile_lease_expires_at = profiles.profile_lease_expires_at
+                    RETURNING profile_id
+                    """,
+                    worker_name,
+                    user_data_dir,
+                )
+                if execution_profile is not None:
+                    execution_profile_rows.append(
+                        _serialize_datetimes(
+                            dict(execution_profile),
+                            (
+                                "status_since",
+                                "cooldown_until",
+                                "manual_login_required_at",
+                                "quarantined_at",
+                                "last_selected_at",
+                                "last_success_at",
+                                "created_at",
+                                "updated_at",
+                            ),
+                        )
+                    )
+
+    return {
+        "ok": True,
+        "synced_count": len(execution_profile_rows),
+        "slots": slots,
+        "items": execution_profile_rows,
+    }
 
 
 @app.post("/execution-profiles/{worker_name}/clear-manual-login")

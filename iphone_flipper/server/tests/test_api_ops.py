@@ -320,6 +320,45 @@ class _QueryFamilyDeleteConn:
         return "OK"
 
 
+class _ExecutionProfilePoolSyncConn:
+    def __init__(self) -> None:
+        self.execution_profile_upserts: list[tuple] = []
+        self.v4_profile_upserts: list[tuple] = []
+
+    def transaction(self) -> _FakeTransaction:
+        return _FakeTransaction()
+
+    async def fetchrow(self, query: str, *args):
+        normalized = " ".join(str(query).split())
+        if normalized.startswith("INSERT INTO execution_profiles"):
+            self.execution_profile_upserts.append(args)
+            return {
+                "user_data_dir": args[0],
+                "worker_name": args[1],
+                "is_enabled": True,
+                "status": "READY",
+                "status_reason": None,
+                "status_since": None,
+                "cooldown_until": None,
+                "manual_login_required": False,
+                "manual_login_reason": None,
+                "manual_login_required_at": None,
+                "quarantined_at": None,
+                "quarantine_reason": None,
+                "quarantine_evidence": None,
+                "last_selected_at": None,
+                "last_success_at": None,
+                "consecutive_failures": 0,
+                "last_error": None,
+                "created_at": None,
+                "updated_at": None,
+            }
+        if normalized.startswith("INSERT INTO profiles"):
+            self.v4_profile_upserts.append(args)
+            return {"profile_id": len(self.v4_profile_upserts)}
+        return None
+
+
 class _BootstrapCatalogConn:
     def __init__(self) -> None:
         self._family_rows: dict[str, dict] = {}
@@ -710,6 +749,34 @@ class ApiOpsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(exc_info.exception.status_code, 409)
         self.assertEqual(conn.delete_args, None)
+
+    async def test_sync_execution_profile_pool_upserts_slots(self) -> None:
+        conn = _ExecutionProfilePoolSyncConn()
+        api_main.app.state.db_pool = _FakePool(conn)
+
+        with patch.object(api_main, "API_TOKEN", "test-token"):
+            payload = await api_main.sync_execution_profile_pool(
+                payload=api_main.ExecutionProfilePoolSyncRequest(slots=[4, 5, 5, -1]),
+                x_api_token="test-token",
+            )
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["synced_count"], 2)
+        self.assertEqual(payload["slots"], [4, 5])
+        self.assertEqual(
+            conn.execution_profile_upserts,
+            [
+                ("/app/runtime/browser_profile_4", "worker"),
+                ("/app/runtime/browser_profile_5", "worker_2"),
+            ],
+        )
+        self.assertEqual(
+            conn.v4_profile_upserts,
+            [
+                ("worker", "/app/runtime/browser_profile_4"),
+                ("worker_2", "/app/runtime/browser_profile_5"),
+            ],
+        )
 
     async def test_get_execution_profiles_returns_profile_health_rows(self) -> None:
         api_main.app.state.db_pool = _FakePool(_RouteOpsConn())
