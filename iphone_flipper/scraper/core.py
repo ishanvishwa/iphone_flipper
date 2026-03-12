@@ -112,14 +112,6 @@ def _default_search_url(query: str) -> str:
     )
 
 
-def _marketplace_home_url() -> str:
-    from scraper.config import SEARCH_LOCATION
-
-    location_slug = str(SEARCH_LOCATION or "perth").strip().strip("/")
-    encoded_location = quote(location_slug or "perth", safe="-_")
-    return f"https://www.facebook.com/marketplace/{encoded_location}/"
-
-
 def _resolve_query_targets(
     runtime_settings: Dict[str, Any],
     *,
@@ -279,26 +271,6 @@ async def _wait_for_marketplace_results_surface(
         "manual_login": await _detect_manual_login_required_state(page),
         **surface,
     }
-
-
-async def prime_marketplace_home(
-    page: Any,
-    *,
-    timeout_ms: int = 20000,
-) -> Dict[str, Any]:
-    from scraper.config import MANUAL_LOGIN_REQUIRED_PREFIX
-    from scraper.legacy_utils import _detect_manual_login_required_state
-
-    await page.goto(_marketplace_home_url(), wait_until="domcontentloaded", timeout=60000)
-    surface = await _wait_for_marketplace_results_surface(page, timeout_ms=timeout_ms)
-    await random_delay(1.0, 2.0)
-
-    checkpoint_reason = str(surface.get("manual_login") or "").strip()
-    if not checkpoint_reason:
-        checkpoint_reason = str(await _detect_manual_login_required_state(page) or "").strip()
-    if checkpoint_reason:
-        raise RuntimeError(f"{MANUAL_LOGIN_REQUIRED_PREFIX} {checkpoint_reason}")
-    return surface
 
 
 async def open_profile_session(
@@ -755,7 +727,6 @@ async def execute_family_claim(
     scroll_target_cards_override: Optional[int] = None,
     scroll_max_rounds_override: Optional[int] = None,
     apply_inter_query_delay: bool = False,
-    prime_marketplace_home_before_query: bool = False,
 ) -> MarketplaceClaimExecution:
     try:
         page = await session.context.new_page()
@@ -769,8 +740,6 @@ async def execute_family_claim(
             ) from exc
         raise
     try:
-        if prime_marketplace_home_before_query:
-            await prime_marketplace_home(page)
         return await _execute_queries_on_page(
             session,
             page,

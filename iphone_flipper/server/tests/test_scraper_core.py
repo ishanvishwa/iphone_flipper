@@ -34,8 +34,6 @@ class _FakePage:
     def __init__(self) -> None:
         self.wait_for_load_state = AsyncMock()
         self.wait_for_function = AsyncMock()
-        self.goto = AsyncMock()
-        self.close = AsyncMock()
 
 
 @unittest.skipIf(core is None, "Scraper core dependencies are not installed.")
@@ -126,52 +124,6 @@ class ScraperCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["networkidle_reached"])
         self.assertIn("networkidle timeout", result["wait_error"])
         page.wait_for_function.assert_awaited_once()
-
-    async def test_prime_marketplace_home_raises_manual_login_error_after_settle(self) -> None:
-        page = _FakePage()
-
-        with (
-            patch.object(
-                core,
-                "_wait_for_marketplace_results_surface",
-                AsyncMock(
-                    return_value={
-                        "final_url": "https://www.facebook.com/checkpoint/test",
-                        "marketplace_shell_detected": False,
-                        "feed_present": False,
-                        "empty_state_detected": False,
-                        "manual_login": "checkpoint",
-                    }
-                ),
-            ),
-            patch.object(core, "random_delay", AsyncMock()) as random_delay,
-        ):
-            with self.assertRaises(RuntimeError) as exc_info:
-                await core.prime_marketplace_home(page)
-
-        page.goto.assert_awaited_once()
-        random_delay.assert_awaited_once()
-        self.assertIn("MANUAL_LOGIN_REQUIRED", str(exc_info.exception))
-
-    async def test_execute_family_claim_primes_marketplace_home_before_query(self) -> None:
-        page = _FakePage()
-        session = _fake_session()
-        session.context = types.SimpleNamespace(new_page=AsyncMock(return_value=page))
-        execution = core.MarketplaceClaimExecution(listings=[], query_diagnostics=[], cancelled=False)
-
-        with (
-            patch.object(core, "prime_marketplace_home", AsyncMock()) as prime_home,
-            patch.object(core, "_execute_queries_on_page", AsyncMock(return_value=execution)) as execute_queries,
-        ):
-            result = await core.execute_family_claim(
-                session,
-                prime_marketplace_home_before_query=True,
-            )
-
-        self.assertIs(result, execution)
-        prime_home.assert_awaited_once_with(page)
-        execute_queries.assert_awaited_once()
-        page.close.assert_awaited_once()
 
 
 if __name__ == "__main__":

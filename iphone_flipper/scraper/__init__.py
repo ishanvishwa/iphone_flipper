@@ -93,7 +93,6 @@ from scraper.core import (  # noqa: F401
     execute_family_claim,
     execute_session_queries,
     open_profile_session,
-    prime_marketplace_home,
     purge_accessory_only_listings,
     recalculate_listing_financials,
     scrape_marketplace,
