@@ -5,6 +5,7 @@ import contextlib
 import os
 import unittest
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 os.environ.setdefault("IPHONE_FLIPPER_DB_PATH", "/tmp/iphone_flipper_worker_v4_test.db")
@@ -174,6 +175,38 @@ class WorkerV4RuntimeTests(unittest.IsolatedAsyncioTestCase):
             urls,
             ["https://example.com/search?query=iPhone%2015%20Pro&sort=creation_time_descend"],
         )
+
+    async def test_run_v4_family_claim_reports_active_variant_query_in_heartbeat(self) -> None:
+        warm_session = worker.V4WarmSessionState(
+            profile={"profile_id": 3, "user_data_dir": "/profiles/3"},
+            profile_lease_token="lease-3",
+            runtime_identity="/profiles/3",
+            session=object(),
+            started_at=datetime(2026, 3, 11, tzinfo=timezone.utc),
+            last_activity_at=datetime(2026, 3, 11, tzinfo=timezone.utc),
+        )
+
+        with (
+            patch.object(
+                worker,
+                "execute_family_claim",
+                AsyncMock(return_value=SimpleNamespace(query_diagnostics=[])),
+            ),
+            patch.object(worker, "_upsert_worker_heartbeat", AsyncMock()) as heartbeat,
+            patch.object(worker, "_cleanup_old_scrape_events", AsyncMock()),
+        ):
+            await worker._run_v4_family_claim(
+                pool=object(),
+                redis_client=object(),
+                feature_flags=None,
+                warm_session=warm_session,
+                family={"family_id": 70, "name": "iphone_broad"},
+                variant={"variant_id": 440, "query_text": "iPhone"},
+            )
+
+        first_route = heartbeat.await_args_list[0].kwargs["route"]
+        self.assertEqual(first_route["source"], "v4")
+        self.assertEqual(first_route["search_queries"], "iPhone")
 
     async def test_dom_circuit_breaker_requires_distinct_profiles(self) -> None:
         class _FakeRedis:

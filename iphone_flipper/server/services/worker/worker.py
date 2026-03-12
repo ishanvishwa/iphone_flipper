@@ -2265,13 +2265,23 @@ def _v4_warm_session_config() -> WarmSessionConfig:
     )
 
 
-def _build_v4_family_route(profile: dict[str, Any], family: dict[str, Any] | None = None) -> dict[str, Any]:
+def _build_v4_family_route(
+    profile: dict[str, Any],
+    family: dict[str, Any] | None = None,
+    *,
+    search_queries: list[str] | str | None = None,
+) -> dict[str, Any]:
     route_name = str((family or {}).get("name") or "v4_warm_session").strip() or "v4_warm_session"
+    if isinstance(search_queries, (list, tuple)):
+        search_queries_value = ", ".join(str(query).strip() for query in search_queries if str(query).strip()) or None
+    else:
+        search_queries_value = str(search_queries or "").strip() or None
     return {
         "route_name": route_name,
         "worker_name": WORKER_NAME,
         "user_data_dir": str(profile.get("user_data_dir") or "").strip() or None,
         "source": "v4",
+        "search_queries": search_queries_value,
     }
 
 
@@ -2890,7 +2900,6 @@ async def _run_v4_family_claim(
     family: dict[str, Any],
     variant: dict[str, Any],
 ) -> V4FamilyClaimResult:
-    route = _build_v4_family_route(warm_session.profile, family)
     query_error_text_samples: list[str] = []
     ingest_tasks: set[asyncio.Task] = set()
     scrape_event_tasks: set[asyncio.Task] = set()
@@ -2932,6 +2941,11 @@ async def _run_v4_family_claim(
     }
     query_override = _v4_variant_queries(variant)
     url_override = _v4_variant_urls(variant)
+    route = _build_v4_family_route(
+        warm_session.profile,
+        family,
+        search_queries=query_override,
+    )
     selected_query = str((variant or {}).get("query_text") or "").strip() or (query_override[0] if query_override else None)
 
     def _on_progress(payload: dict[str, Any]) -> None:

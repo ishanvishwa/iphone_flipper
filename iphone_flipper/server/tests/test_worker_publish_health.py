@@ -83,6 +83,17 @@ class WorkerPublishHealthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(args[10], "iPhone")
         self.assertEqual(args[11], "fixed")
 
+    def test_build_v4_family_route_includes_active_variant_queries(self) -> None:
+        route = worker._build_v4_family_route(
+            {"user_data_dir": "/app/runtime/browser_profile_3"},
+            {"name": "iphone_broad"},
+            search_queries=["iPhone"],
+        )
+
+        self.assertEqual(route["route_name"], "iphone_broad")
+        self.assertEqual(route["source"], "v4")
+        self.assertEqual(route["search_queries"], "iPhone")
+
     async def test_process_listing_event_records_failed_publish_health(self) -> None:
         feature_flags = MagicMock()
         feature_flags.is_enabled = AsyncMock(return_value=False)
