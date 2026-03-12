@@ -1922,6 +1922,66 @@ PY"""
         self._clear_query_manager_family_editor()
         self.status_bar.config(text="Creating a new V4 query family")
 
+    def _delete_query_manager_family(self):
+        family_name = str(self.query_manager_family_original_name or "").strip()
+        if not family_name and self.query_manager_tree:
+            selection = self.query_manager_tree.selection()
+            if selection:
+                family = dict((self.query_manager_routes_by_key.get(selection[0]) or {}).get("family") or {})
+                family_name = str(family.get("name") or "").strip()
+        if not family_name:
+            family_name = str(self.query_manager_family_form_vars.get("name").get() or "").strip()
+        if not family_name:
+            messagebox.showwarning("Delete Failed", "Select a V4 family first.")
+            return False
+
+        if not messagebox.askyesno(
+            "Delete V4 Family",
+            f"Delete V4 query family '{family_name}'?\n\nAll query variants in this family will also be deleted.",
+        ):
+            return False
+
+        ctx, error = self._get_server_api_context()
+        if error:
+            messagebox.showwarning("Worker Queries & Keywords", error)
+            return False
+
+        response_payload = {}
+        try:
+            response = requests.delete(
+                f"{ctx['base_url']}/query-families/{quote(family_name, safe='')}",
+                headers=ctx["headers"],
+                timeout=(8, 30),
+            )
+            if response.status_code == 401:
+                raise RuntimeError("Unauthorized (check Server API Token).")
+            response_payload = response.json() if response.content else {}
+            if response.status_code == 409:
+                detail = response_payload.get("detail") if isinstance(response_payload, dict) else None
+                messagebox.showwarning(
+                    "Delete Failed",
+                    detail or "Cannot delete a V4 family while it is actively leased by a worker.",
+                )
+                self.status_bar.config(text=f"Family delete blocked for {family_name}")
+                return False
+            response.raise_for_status()
+        except Exception as exc:
+            messagebox.showerror("Delete Failed", f"Failed to delete V4 family:\n{exc}")
+            self.status_bar.config(text=f"Family delete failed for {family_name}")
+            return False
+
+        deleted = bool(response_payload.get("deleted", True)) if isinstance(response_payload, dict) else True
+        if not deleted:
+            messagebox.showwarning("Delete Failed", f"V4 family '{family_name}' was not found.")
+            self.status_bar.config(text=f"Family delete skipped for {family_name}")
+            self._refresh_query_manager_routes()
+            return False
+
+        self.query_manager_family_original_name = None
+        self._refresh_query_manager_routes()
+        self.status_bar.config(text=f"Deleted V4 family {family_name}")
+        return True
+
     def _bootstrap_query_manager_presets(self):
         ctx, error = self._get_server_api_context()
         if error:
@@ -2088,7 +2148,7 @@ PY"""
 
         family_actions = ttk.Frame(families_frame)
         family_actions.grid(row=2, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 10))
-        for col in range(4):
+        for col in range(5):
             family_actions.columnconfigure(col, weight=1)
         ttk.Button(family_actions, text="New Family", command=self._new_query_manager_family).grid(
             row=0, column=0, sticky="ew", padx=4
@@ -2096,11 +2156,14 @@ PY"""
         ttk.Button(family_actions, text="Save Family", command=self._save_query_manager_route_queries).grid(
             row=0, column=1, sticky="ew", padx=4
         )
-        ttk.Button(family_actions, text="Bootstrap Presets", command=self._bootstrap_query_manager_presets).grid(
+        ttk.Button(family_actions, text="Delete Family", command=self._delete_query_manager_family).grid(
             row=0, column=2, sticky="ew", padx=4
         )
-        ttk.Button(family_actions, text="Refresh", command=self._refresh_query_manager_routes).grid(
+        ttk.Button(family_actions, text="Bootstrap Presets", command=self._bootstrap_query_manager_presets).grid(
             row=0, column=3, sticky="ew", padx=4
+        )
+        ttk.Button(family_actions, text="Refresh", command=self._refresh_query_manager_routes).grid(
+            row=0, column=4, sticky="ew", padx=4
         )
 
         editor_frame = ttk.LabelFrame(main, text="Selected Family")

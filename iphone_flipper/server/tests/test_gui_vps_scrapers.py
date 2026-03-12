@@ -39,6 +39,7 @@ _install_stub_module(
     get=lambda *args, **kwargs: None,
     post=lambda *args, **kwargs: None,
     put=lambda *args, **kwargs: None,
+    delete=lambda *args, **kwargs: None,
 )
 
 import gui
@@ -592,6 +593,52 @@ class GuiVpsScraperFallbackTests(unittest.TestCase):
                 ],
             },
         )
+
+    def test_delete_query_manager_family_uses_v4_family_delete_endpoint(self) -> None:
+        app = self._build_gui()
+        app.query_manager_tree = _FakeTreeview()
+        app.query_manager_tree.insert("", "end", iid="family::iphone_hot", values=())
+        app.query_manager_tree.selection_set("family::iphone_hot")
+        app.query_manager_routes_by_key = {
+            "family::iphone_hot": {
+                "family": {
+                    "name": "iphone_hot",
+                }
+            }
+        }
+        app.query_manager_family_form_vars = {
+            "name": _FakeVar("iphone_hot"),
+        }
+        app.query_manager_family_original_name = "iphone_hot"
+        app._get_server_api_context = lambda: (
+            {"base_url": "https://example.com", "headers": {"x-api-token": "test", "Content-Type": "application/json"}},
+            None,
+        )
+        refresh_calls: list[str | None] = []
+        app._refresh_query_manager_routes = lambda preferred_family_name=None: refresh_calls.append(preferred_family_name)
+
+        class _Response:
+            status_code = 200
+            content = b'{"ok": true, "deleted": true}'
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict[str, bool]:
+                return {"ok": True, "deleted": True}
+
+        with (
+            patch.object(gui.messagebox, "askyesno", return_value=True),
+            patch.object(gui.requests, "delete", return_value=_Response()) as delete_mock,
+        ):
+            deleted = app._delete_query_manager_family()
+
+        self.assertTrue(deleted)
+        self.assertEqual(
+            delete_mock.call_args.args[0],
+            "https://example.com/query-families/iphone_hot",
+        )
+        self.assertEqual(refresh_calls, [None])
 
     def test_refresh_dolphin_profiles_populates_live_vps_status_columns(self) -> None:
         app = self._build_gui()

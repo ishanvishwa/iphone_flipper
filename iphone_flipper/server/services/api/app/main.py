@@ -2093,6 +2093,47 @@ async def upsert_query_family(
     return {"ok": True, "catalog_version": V42_FAMILY_CATALOG_VERSION, "item": item}
 
 
+@app.delete("/query-families/{family_name}")
+async def delete_query_family(
+    family_name: str,
+    x_api_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    await _auth_rest(x_api_token)
+    family_name_clean = _normalize_family_name(family_name)
+    if not family_name_clean:
+        raise HTTPException(status_code=400, detail="family_name is required.")
+
+    async with app.state.db_pool.acquire() as conn:
+        async with conn.transaction():
+            family_row = await conn.fetchrow(
+                """
+                SELECT family_id, family_lease_token, family_lease_expires_at
+                FROM query_families
+                WHERE name = $1
+                FOR UPDATE
+                """,
+                family_name_clean,
+            )
+            if family_row is None:
+                return {"ok": True, "deleted": False}
+
+            lease_token = str(family_row.get("family_lease_token") or "").strip()
+            lease_expires_at = family_row.get("family_lease_expires_at")
+            if lease_token and lease_expires_at and lease_expires_at > datetime.now(timezone.utc):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Cannot delete a query family while it has an active V4 lease.",
+                )
+
+            result = await conn.execute(
+                "DELETE FROM query_families WHERE family_id = $1",
+                int(family_row["family_id"]),
+            )
+
+    deleted = result.split()[-1] != "0"
+    return {"ok": True, "deleted": deleted}
+
+
 @app.post("/query-families/bootstrap-presets")
 async def bootstrap_query_family_presets(
     x_api_token: str | None = Header(default=None),

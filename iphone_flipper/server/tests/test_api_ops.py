@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 try:
@@ -289,6 +290,34 @@ class _QueryFamilyUpsertConn:
                 }
             ]
         return []
+
+
+class _QueryFamilyDeleteConn:
+    def __init__(self, *, leased: bool = False) -> None:
+        self.lookup_args: tuple | None = None
+        self.delete_args: tuple | None = None
+        self.leased = leased
+
+    def transaction(self) -> _FakeTransaction:
+        return _FakeTransaction()
+
+    async def fetchrow(self, query: str, *args):
+        normalized = " ".join(str(query).split())
+        if normalized.startswith("SELECT family_id, family_lease_token, family_lease_expires_at FROM query_families"):
+            self.lookup_args = args
+            return {
+                "family_id": 15,
+                "family_lease_token": "lease-15" if self.leased else None,
+                "family_lease_expires_at": datetime.now(timezone.utc) if self.leased else None,
+            }
+        return None
+
+    async def execute(self, query: str, *args):
+        normalized = " ".join(str(query).split())
+        if normalized.startswith("DELETE FROM query_families"):
+            self.delete_args = args
+            return "DELETE 1"
+        return "OK"
 
 
 class _BootstrapCatalogConn:
@@ -652,6 +681,35 @@ class ApiOpsTests(unittest.IsolatedAsyncioTestCase):
         total_variants = sum(len(variants) for variants in conn._variants_by_family.values())
         preset_variants = sum(len(preset.variants) for preset in api_main.V42_FAMILY_PRESETS)
         self.assertEqual(total_variants, preset_variants)
+
+    async def test_delete_query_family_removes_family(self) -> None:
+        conn = _QueryFamilyDeleteConn()
+        api_main.app.state.db_pool = _FakePool(conn)
+
+        with patch.object(api_main, "API_TOKEN", "test-token"):
+            payload = await api_main.delete_query_family(
+                family_name="iphone_15_pro",
+                x_api_token="test-token",
+            )
+
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["deleted"])
+        self.assertEqual(conn.lookup_args, ("iphone_15_pro",))
+        self.assertEqual(conn.delete_args, (15,))
+
+    async def test_delete_query_family_rejects_active_lease(self) -> None:
+        conn = _QueryFamilyDeleteConn(leased=True)
+        api_main.app.state.db_pool = _FakePool(conn)
+
+        with patch.object(api_main, "API_TOKEN", "test-token"):
+            with self.assertRaises(api_main.HTTPException) as exc_info:
+                await api_main.delete_query_family(
+                    family_name="iphone_15_pro",
+                    x_api_token="test-token",
+                )
+
+        self.assertEqual(exc_info.exception.status_code, 409)
+        self.assertEqual(conn.delete_args, None)
 
     async def test_get_execution_profiles_returns_profile_health_rows(self) -> None:
         api_main.app.state.db_pool = _FakePool(_RouteOpsConn())
