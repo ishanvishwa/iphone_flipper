@@ -52,6 +52,7 @@ from server.services.common.runtime_config import (  # noqa: E402
     RUNTIME_CONFIG_HASH_KEY,
     RedisRuntimeConfig,
 )
+from server.services.common.v42_family_catalog import V42_FAMILY_PRESETS  # noqa: E402
 from server.services.common.observability import (  # noqa: E402
     emit_json_log,
     emit_json_payload,
@@ -364,7 +365,12 @@ REDIS_FIRST_SEEN_TTL_SECONDS = _parse_int(
 PRICE_DROP_UPDATE_MODE = _normalize_price_drop_update_mode(os.getenv("PRICE_DROP_UPDATE_MODE", "off"))
 V4_DOM_INVESTIGATION_BACKOFF_SECONDS = 300
 V4_INFRA_FAMILY_BACKOFF_SECONDS = 60
-V4_ROLLOUT_FAMILY_ALLOWLIST = _parse_csv_tokens(os.getenv("V4_ROLLOUT_FAMILY_ALLOWLIST", "iphone_broad"))
+DEFAULT_V4_ROLLOUT_FAMILY_ALLOWLIST = ",".join(
+    preset.name for preset in V42_FAMILY_PRESETS if str(preset.name or "").strip()
+)
+V4_ROLLOUT_FAMILY_ALLOWLIST = _parse_csv_tokens(
+    os.getenv("V4_ROLLOUT_FAMILY_ALLOWLIST", DEFAULT_V4_ROLLOUT_FAMILY_ALLOWLIST)
+)
 V4_ROLLOUT_WORKER_ALLOWLIST = _parse_csv_tokens(
     os.getenv("V4_ROLLOUT_WORKER_ALLOWLIST", "worker,worker_2,worker_3")
 )

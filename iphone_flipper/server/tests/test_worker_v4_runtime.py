@@ -15,6 +15,8 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - optional dependency in local test env
     worker = None
 
+from server.services.common.v42_family_catalog import V42_FAMILY_PRESETS
+
 
 @unittest.skipIf(worker is None, "Worker dependencies are not installed.")
 class WorkerV4RuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -100,6 +102,12 @@ class WorkerV4RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             claim_family.await_args.kwargs["family_names"],
             worker.V4_ROLLOUT_FAMILY_ALLOWLIST or None,
+        )
+
+    def test_default_v4_family_allowlist_matches_v42_catalog(self) -> None:
+        self.assertEqual(
+            worker.V4_ROLLOUT_FAMILY_ALLOWLIST,
+            tuple(preset.name for preset in V42_FAMILY_PRESETS),
         )
 
     async def test_interruptible_worker_sleep_wakes_when_v4_canary_turns_on(self) -> None:
