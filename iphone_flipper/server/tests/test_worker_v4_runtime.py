@@ -124,7 +124,7 @@ class WorkerV4RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             claim_family.await_args.kwargs["family_names"],
-            worker.V4_ROLLOUT_FAMILY_ALLOWLIST or None,
+            worker._v4_worker_family_allowlist(),
         )
 
     def test_default_v4_family_allowlist_matches_v42_catalog(self) -> None:
@@ -132,6 +132,45 @@ class WorkerV4RuntimeTests(unittest.IsolatedAsyncioTestCase):
             worker.V4_ROLLOUT_FAMILY_ALLOWLIST,
             tuple(preset.name for preset in V42_FAMILY_PRESETS),
         )
+
+    def test_worker_specific_v4_family_allowlist_partitions_broad_and_model_families(self) -> None:
+        family_names = ("iphone_broad", "iphone_15_pro", "iphone_14_pro")
+        with (
+            patch.object(worker, "V4_ROLLOUT_FAMILY_ALLOWLIST", family_names),
+            patch.object(worker, "V4_BROAD_FAMILY_ALLOWLIST", ("iphone_broad",)),
+            patch.object(worker, "V4_BROAD_WORKER_ALLOWLIST", ("worker_3",)),
+        ):
+            with patch.object(worker, "WORKER_NAME", "worker_3"):
+                self.assertEqual(worker._v4_worker_family_allowlist(), ("iphone_broad",))
+            with patch.object(worker, "WORKER_NAME", "worker"):
+                self.assertEqual(
+                    worker._v4_worker_family_allowlist(),
+                    ("iphone_15_pro", "iphone_14_pro"),
+                )
+
+    async def test_apply_v4_rollout_family_overrides_syncs_presets_before_overrides(self) -> None:
+        conn = AsyncMock()
+
+        class _PoolAcquire:
+            async def __aenter__(self_inner):
+                return conn
+
+            async def __aexit__(self_inner, exc_type, exc, tb):
+                return False
+
+        pool = SimpleNamespace(acquire=lambda: _PoolAcquire())
+
+        with (
+            patch.object(worker, "V4_ROLLOUT_FAMILY_ALLOWLIST", ("iphone_broad", "iphone_15_pro")),
+            patch.object(worker, "sync_v42_family_presets", AsyncMock(return_value=[{"name": "iphone_broad"}])) as sync_presets,
+        ):
+            await worker._apply_v4_rollout_family_overrides(pool)
+
+        sync_presets.assert_awaited_once_with(
+            conn,
+            family_names=("iphone_broad", "iphone_15_pro"),
+        )
+        self.assertGreaterEqual(conn.execute.await_count, 3)
 
     def test_profile_display_label_prefers_dolphin_profile_name(self) -> None:
         self.assertEqual(

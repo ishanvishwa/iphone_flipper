@@ -19,6 +19,8 @@ from server.services.common.feature_flags import DEFAULT_FEATURE_FLAGS, FLAG_HAS
 from server.services.common.v42_family_catalog import (
     V42_FAMILY_CATALOG_VERSION,
     V42_FAMILY_PRESETS,
+    normalize_v42_family_names,
+    sync_v42_family_presets,
 )
 from server.services.common.notification_dead_letter import (
     NOTIFICATION_DEAD_LETTER_STREAM_NAME,
@@ -931,98 +933,10 @@ async def _load_query_variants_by_family_id(
 async def _bootstrap_query_family_presets(
     conn: asyncpg.Connection,
 ) -> list[dict[str, Any]]:
-    results: list[dict[str, Any]] = []
-    for preset in V42_FAMILY_PRESETS:
-        family_row = await conn.fetchrow(
-            """
-            INSERT INTO query_families (
-                name,
-                legacy_route_name,
-                legacy_worker_name,
-                is_enabled,
-                priority,
-                lane,
-                next_due_at,
-                min_gap_s,
-                max_gap_s,
-                variant_cursor,
-                variant_count,
-                last_error
-            ) VALUES (
-                $1, $2, $3, $4, $5, $6, NOW(), $7, $8, 0, 0, NULL
-            )
-            ON CONFLICT (name) DO UPDATE SET
-                legacy_route_name = COALESCE(EXCLUDED.legacy_route_name, query_families.legacy_route_name),
-                legacy_worker_name = COALESCE(EXCLUDED.legacy_worker_name, query_families.legacy_worker_name),
-                is_enabled = EXCLUDED.is_enabled,
-                priority = EXCLUDED.priority,
-                lane = EXCLUDED.lane,
-                min_gap_s = EXCLUDED.min_gap_s,
-                max_gap_s = EXCLUDED.max_gap_s,
-                next_due_at = LEAST(query_families.next_due_at, NOW()),
-                last_error = NULL
-            RETURNING family_id, name
-            """,
-            preset.name,
-            preset.legacy_route_name,
-            preset.legacy_worker_name,
-            preset.is_enabled,
-            preset.priority,
-            preset.lane,
-            preset.min_gap_s,
-            preset.max_gap_s,
-        )
-        if family_row is None:
-            raise HTTPException(status_code=500, detail=f"Failed to bootstrap family {preset.name}.")
-        family_id = int(family_row["family_id"])
-        for variant_order, variant in enumerate(preset.variants):
-            await conn.execute(
-                """
-                INSERT INTO query_variants (
-                    family_id,
-                    query_text,
-                    url_template,
-                    validation_state,
-                    weight,
-                    variant_order,
-                    is_enabled,
-                    notes
-                ) VALUES (
-                    $1, $2, NULL, $3, $4, $5, $6, $7
-                )
-                ON CONFLICT (family_id, query_text) DO UPDATE SET
-                    validation_state = EXCLUDED.validation_state,
-                    weight = EXCLUDED.weight,
-                    variant_order = EXCLUDED.variant_order,
-                    is_enabled = EXCLUDED.is_enabled,
-                    notes = EXCLUDED.notes
-                """,
-                family_id,
-                variant.query_text,
-                _normalize_variant_state(variant.validation_state),
-                float(variant.weight),
-                variant_order,
-                bool(variant.is_enabled),
-                variant.notes,
-            )
-        await conn.execute(
-            """
-            UPDATE query_families
-            SET
-                variant_count = COALESCE((
-                    SELECT COUNT(*)::INT
-                    FROM query_variants
-                    WHERE family_id = $1
-                      AND COALESCE(is_enabled, TRUE) = TRUE
-                      AND LOWER(COALESCE(validation_state, 'pending_validation')) = 'validated'
-                ), 0),
-                variant_cursor = 0
-            WHERE family_id = $1
-            """,
-            family_id,
-        )
-        results.append({"family_id": family_id, "name": str(family_row["name"] or "").strip()})
-    return results
+    try:
+        return await sync_v42_family_presets(conn)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 async def _ensure_worker_tables(pool: asyncpg.Pool) -> None:
@@ -2254,7 +2168,7 @@ async def bootstrap_query_family_presets(
             WHERE qf.name = ANY($1::TEXT[])
             ORDER BY qf.priority DESC, qf.name ASC
             """,
-            [preset.name for preset in V42_FAMILY_PRESETS],
+            list(normalize_v42_family_names(None)),
         )
         variants_by_family = await _load_query_variants_by_family_id(
             conn,

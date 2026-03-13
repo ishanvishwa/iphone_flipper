@@ -52,7 +52,11 @@ from server.services.common.runtime_config import (  # noqa: E402
     RUNTIME_CONFIG_HASH_KEY,
     RedisRuntimeConfig,
 )
-from server.services.common.v42_family_catalog import V42_FAMILY_PRESETS  # noqa: E402
+from server.services.common.v42_family_catalog import (  # noqa: E402
+    V42_BROAD_FAMILY_NAMES,
+    normalize_v42_family_names,
+    sync_v42_family_presets,
+)
 from server.services.common.observability import (  # noqa: E402
     emit_json_log,
     emit_json_payload,
@@ -366,13 +370,24 @@ PRICE_DROP_UPDATE_MODE = _normalize_price_drop_update_mode(os.getenv("PRICE_DROP
 V4_DOM_INVESTIGATION_BACKOFF_SECONDS = 300
 V4_INFRA_FAMILY_BACKOFF_SECONDS = 60
 DEFAULT_V4_ROLLOUT_FAMILY_ALLOWLIST = ",".join(
-    preset.name for preset in V42_FAMILY_PRESETS if str(preset.name or "").strip()
+    normalize_v42_family_names(None)
 )
 V4_ROLLOUT_FAMILY_ALLOWLIST = _parse_csv_tokens(
     os.getenv("V4_ROLLOUT_FAMILY_ALLOWLIST", DEFAULT_V4_ROLLOUT_FAMILY_ALLOWLIST)
 )
 V4_ROLLOUT_WORKER_ALLOWLIST = _parse_csv_tokens(
     os.getenv("V4_ROLLOUT_WORKER_ALLOWLIST", "worker,worker_2,worker_3")
+)
+V4_BROAD_FAMILY_ALLOWLIST = _parse_csv_tokens(
+    os.getenv("V4_BROAD_FAMILY_ALLOWLIST", ",".join(V42_BROAD_FAMILY_NAMES))
+)
+V4_BROAD_WORKER_ALLOWLIST = _parse_csv_tokens(
+    os.getenv("V4_BROAD_WORKER_ALLOWLIST", "worker_3")
+)
+V4_FAMILY_SYNC_INTERVAL_SECONDS = _parse_int(
+    os.getenv("V4_FAMILY_SYNC_INTERVAL_SECONDS"),
+    default=60,
+    minimum=15,
 )
 IPHONE_BROAD_MIN_GAP_SECONDS = _parse_int(os.getenv("IPHONE_BROAD_MIN_GAP_SECONDS"), default=5, minimum=1)
 IPHONE_BROAD_INITIAL_VARIANTS = _parse_int(os.getenv("IPHONE_BROAD_INITIAL_VARIANTS"), default=1, minimum=1)
@@ -2322,10 +2337,51 @@ def _build_v4_family_route(
     }
 
 
+def _v4_worker_family_allowlist() -> tuple[str, ...] | None:
+    rollout_families = tuple(
+        str(name).strip() for name in (V4_ROLLOUT_FAMILY_ALLOWLIST or ()) if str(name).strip()
+    )
+    if not rollout_families:
+        return None
+
+    broad_families = {
+        str(name).strip().lower()
+        for name in (V4_BROAD_FAMILY_ALLOWLIST or ())
+        if str(name).strip()
+    }
+    if not broad_families:
+        return rollout_families
+
+    model_families = tuple(
+        family_name for family_name in rollout_families if family_name.lower() not in broad_families
+    )
+    broad_family_names = tuple(
+        family_name for family_name in rollout_families if family_name.lower() in broad_families
+    )
+    if not broad_family_names or not model_families:
+        return rollout_families
+
+    broad_workers = {
+        str(name).strip().lower()
+        for name in (V4_BROAD_WORKER_ALLOWLIST or ())
+        if str(name).strip()
+    }
+    if not broad_workers:
+        return rollout_families
+
+    if WORKER_NAME.lower() in broad_workers:
+        return broad_family_names
+    return model_families
+
+
 async def _apply_v4_rollout_family_overrides(pool: asyncpg.Pool) -> None:
     if not V4_ROLLOUT_FAMILY_ALLOWLIST:
         return
     async with pool.acquire() as conn:
+        repaired = await sync_v42_family_presets(
+            conn,
+            family_names=V4_ROLLOUT_FAMILY_ALLOWLIST,
+        )
         await conn.execute(
             """
             UPDATE query_families
@@ -2401,6 +2457,12 @@ async def _apply_v4_rollout_family_overrides(pool: asyncpg.Pool) -> None:
             """,
             list(V4_ROLLOUT_FAMILY_ALLOWLIST),
         )
+    if repaired:
+        logging.debug(
+            "[%s] synchronized V4 family presets: %s",
+            WORKER_NAME,
+            ", ".join(sorted(str(item.get("name") or "").strip() for item in repaired if str(item.get("name") or "").strip())),
+        )
 
 
 async def _claim_v4_profile(pool: asyncpg.Pool) -> dict[str, Any] | None:
@@ -2417,7 +2479,7 @@ async def _claim_v4_family(pool: asyncpg.Pool) -> dict[str, Any] | None:
         pool,
         lease_token=uuid.uuid4().hex,
         lease_seconds=FAMILY_LEASE_SECONDS,
-        family_names=V4_ROLLOUT_FAMILY_ALLOWLIST or None,
+        family_names=_v4_worker_family_allowlist(),
     )
 
 
@@ -3160,7 +3222,17 @@ async def _run_v4_worker_loop(
     _ = runtime_config
     logging.info("[%s] V4 warm-session worker loop online", WORKER_NAME)
     config = _v4_warm_session_config()
-    await _apply_v4_rollout_family_overrides(pool)
+    next_family_sync_at = 0.0
+
+    async def maybe_sync_rollout_families(*, force: bool = False) -> None:
+        nonlocal next_family_sync_at
+        now_monotonic = time.monotonic()
+        if not force and now_monotonic < next_family_sync_at:
+            return
+        await _apply_v4_rollout_family_overrides(pool)
+        next_family_sync_at = time.monotonic() + float(V4_FAMILY_SYNC_INTERVAL_SECONDS)
+
+    await maybe_sync_rollout_families(force=True)
 
     while not _worker_shutdown_requested():
         if feature_flags is not None and not await feature_flags.is_enabled("ENABLE_V4_WARM_RUNTIME"):
@@ -3217,6 +3289,8 @@ async def _run_v4_worker_loop(
                     if recycle_reason is not None:
                         idle_close = recycle_reason == "idle_close"
                         break
+
+                    await maybe_sync_rollout_families()
 
                     dom_pause_remaining = await _v4_dom_circuit_pause_remaining_seconds(redis_client)
                     if dom_pause_remaining > 0:
