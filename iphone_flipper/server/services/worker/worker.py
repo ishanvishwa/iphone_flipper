@@ -2761,7 +2761,11 @@ async def _complete_v4_family_claim(
     listings_saved = max(0, int(metrics_payload.get("listings_saved", 0) or 0))
     listings_scraped = max(0, int(metrics_payload.get("listings_scraped", 0) or 0))
     next_hits = max(0, int(family.get("consecutive_hits") or 0)) + 1 if outcome == FamilyClaimOutcome.MATCHES else 0
-    next_empty = max(0, int(family.get("consecutive_empty") or 0)) + 1 if outcome == FamilyClaimOutcome.EMPTY_FEED else 0
+    next_empty = (
+        max(0, int(family.get("consecutive_empty") or 0)) + 1
+        if outcome in {FamilyClaimOutcome.STALE_FEED, FamilyClaimOutcome.EMPTY_FEED}
+        else 0
+    )
     next_cursor = next_variant_cursor(
         variant_count=int(family.get("variant_count") or 0),
         current_cursor=int(family.get("variant_cursor") or 0),
@@ -2828,7 +2832,7 @@ async def _complete_v4_family_claim(
             int(next_cursor),
             int(next_hits),
             int(next_empty),
-            bool(outcome == FamilyClaimOutcome.MATCHES and max(listings_saved, listings_scraped) > 0),
+            bool(outcome == FamilyClaimOutcome.MATCHES and listings_saved > 0),
             extracted_success,
             error_text,
         )
@@ -2845,6 +2849,10 @@ async def _apply_v4_profile_claim_outcome(
     reason_text = _default_v4_claim_error_text(claim_result.outcome, claim_result.error_text) or ""
 
     if claim_result.outcome == FamilyClaimOutcome.MATCHES:
+        await _record_v4_profile_success(pool, profile)
+        return False
+
+    if claim_result.outcome == FamilyClaimOutcome.STALE_FEED:
         await _record_v4_profile_success(pool, profile)
         return False
 
@@ -3423,6 +3431,16 @@ async def _run_v4_worker_loop(
                         metrics = claim_result.metrics
                         logging.info(
                             "[%s] V4 family claim complete family=%s query=%s saved=%s scraped=%s",
+                            WORKER_NAME,
+                            family.get("name"),
+                            family.get("selected_query"),
+                            metrics.get("listings_saved", 0),
+                            metrics.get("listings_scraped", 0),
+                        )
+                    elif claim_result.outcome == FamilyClaimOutcome.STALE_FEED:
+                        metrics = claim_result.metrics
+                        logging.info(
+                            "[%s] V4 family claim stale_feed family=%s query=%s saved=%s scraped=%s",
                             WORKER_NAME,
                             family.get("name"),
                             family.get("selected_query"),

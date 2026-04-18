@@ -244,6 +244,32 @@ class WorkerV4RuntimeTests(unittest.IsolatedAsyncioTestCase):
         mark_v4_profile.assert_awaited_once()
         mark_execution_profile.assert_awaited_once()
 
+    async def test_apply_v4_profile_claim_outcome_stale_feed_counts_as_profile_success(self) -> None:
+        claim_result = worker.V4FamilyClaimResult(
+            metrics={"listings_scraped": 72, "listings_saved": 0},
+            outcome=worker.FamilyClaimOutcome.STALE_FEED,
+            error_text=None,
+            error_category=worker.ErrorCategory.NONE,
+            final_url="https://www.facebook.com/marketplace/perth/search?query=iphone",
+            feed_present=True,
+            empty_state_detected=False,
+        )
+
+        with (
+            patch.object(worker, "_record_v4_profile_success", AsyncMock()) as profile_success,
+            patch.object(worker, "_record_v4_profile_empty_feed", AsyncMock()) as profile_empty,
+        ):
+            should_abort = await worker._apply_v4_profile_claim_outcome(
+                pool=object(),
+                profile={"profile_id": 3, "user_data_dir": "/profiles/3"},
+                family={"family_id": 70, "name": "iphone_broad"},
+                claim_result=claim_result,
+            )
+
+        self.assertFalse(should_abort)
+        profile_success.assert_awaited_once()
+        profile_empty.assert_not_awaited()
+
     def test_v4_variant_urls_expand_query_placeholder(self) -> None:
         urls = worker._v4_variant_urls(
             {

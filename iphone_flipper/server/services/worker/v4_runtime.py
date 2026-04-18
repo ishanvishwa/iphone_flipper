@@ -22,6 +22,7 @@ class WarmSessionConfig:
 
 class FamilyClaimOutcome(str, Enum):
     MATCHES = "matches"
+    STALE_FEED = "stale_feed"
     EMPTY_FEED = "empty_feed"
     DOM_CHANGED = "dom_changed"
     CHECKPOINT = "checkpoint"
@@ -102,8 +103,10 @@ def classify_family_claim(
     if "/login" in final_url_text and "marketplace" not in final_url_text:
         return FamilyClaimOutcome.CHECKPOINT
 
-    if max(0, int(listings_saved or 0)) > 0 or max(0, int(listings_scraped or 0)) > 0:
+    if max(0, int(listings_saved or 0)) > 0:
         return FamilyClaimOutcome.MATCHES
+    if max(0, int(listings_scraped or 0)) > 0:
+        return FamilyClaimOutcome.STALE_FEED
 
     if error_text:
         if category == ErrorCategory.PARSE_FAILED:
@@ -116,7 +119,11 @@ def classify_family_claim(
 
 
 def family_claim_succeeded(outcome: FamilyClaimOutcome) -> bool:
-    return outcome in {FamilyClaimOutcome.MATCHES, FamilyClaimOutcome.EMPTY_FEED}
+    return outcome in {
+        FamilyClaimOutcome.MATCHES,
+        FamilyClaimOutcome.STALE_FEED,
+        FamilyClaimOutcome.EMPTY_FEED,
+    }
 
 
 def next_variant_cursor(
@@ -129,7 +136,11 @@ def next_variant_cursor(
     if safe_variant_count <= 1:
         return 0 if safe_variant_count == 1 else max(0, int(current_cursor or 0))
     cursor = max(0, int(current_cursor or 0))
-    if outcome not in {FamilyClaimOutcome.MATCHES, FamilyClaimOutcome.EMPTY_FEED}:
+    if outcome not in {
+        FamilyClaimOutcome.MATCHES,
+        FamilyClaimOutcome.STALE_FEED,
+        FamilyClaimOutcome.EMPTY_FEED,
+    }:
         return min(cursor, safe_variant_count - 1)
     return (cursor + 1) % safe_variant_count
 
@@ -157,6 +168,9 @@ def next_family_due_seconds(
         _ = consecutive_hits
         _ = listings_saved
         return min_gap
+    if outcome == FamilyClaimOutcome.STALE_FEED:
+        streak = max(1, int(consecutive_empty or 1))
+        return min(max_gap, max(min_gap, safe_min_gap * (2 ** min(streak, 4))))
     if outcome == FamilyClaimOutcome.EMPTY_FEED:
         streak = max(1, int(consecutive_empty or 1))
         return min(max_gap, max(min_gap, safe_min_gap * (2 ** min(streak - 1, 4))))

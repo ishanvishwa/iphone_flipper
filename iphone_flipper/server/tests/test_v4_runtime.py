@@ -96,7 +96,7 @@ class V4RuntimeTests(unittest.TestCase):
             for path in expected:
                 self.assertFalse(Path(path).exists())
 
-    def test_classify_family_claim_distinguishes_matches_empty_dom_checkpoint_and_infra(self) -> None:
+    def test_classify_family_claim_distinguishes_matches_stale_empty_dom_checkpoint_and_infra(self) -> None:
         self.assertEqual(
             classify_family_claim(
                 listings_saved=2,
@@ -107,6 +107,17 @@ class V4RuntimeTests(unittest.TestCase):
                 empty_state_detected=False,
             ),
             FamilyClaimOutcome.MATCHES,
+        )
+        self.assertEqual(
+            classify_family_claim(
+                listings_saved=0,
+                listings_scraped=72,
+                error_text=None,
+                final_url="https://www.facebook.com/marketplace/perth/search?query=iphone",
+                feed_present=True,
+                empty_state_detected=False,
+            ),
+            FamilyClaimOutcome.STALE_FEED,
         )
         self.assertEqual(
             classify_family_claim(
@@ -173,6 +184,16 @@ class V4RuntimeTests(unittest.TestCase):
         self.assertEqual(
             next_family_due_seconds(
                 family=family,
+                outcome=FamilyClaimOutcome.STALE_FEED,
+                listings_saved=0,
+                consecutive_hits=0,
+                consecutive_empty=3,
+            ),
+            40,
+        )
+        self.assertEqual(
+            next_family_due_seconds(
+                family=family,
                 outcome=FamilyClaimOutcome.EMPTY_FEED,
                 listings_saved=0,
                 consecutive_hits=0,
@@ -203,6 +224,14 @@ class V4RuntimeTests(unittest.TestCase):
             next_variant_cursor(
                 variant_count=3,
                 current_cursor=1,
+                outcome=FamilyClaimOutcome.STALE_FEED,
+            ),
+            2,
+        )
+        self.assertEqual(
+            next_variant_cursor(
+                variant_count=3,
+                current_cursor=1,
                 outcome=FamilyClaimOutcome.DOM_CHANGED,
             ),
             1,
@@ -210,10 +239,12 @@ class V4RuntimeTests(unittest.TestCase):
 
     def test_family_success_and_abort_flags_match_blueprint_intent(self) -> None:
         self.assertTrue(family_claim_succeeded(FamilyClaimOutcome.MATCHES))
+        self.assertTrue(family_claim_succeeded(FamilyClaimOutcome.STALE_FEED))
         self.assertTrue(family_claim_succeeded(FamilyClaimOutcome.EMPTY_FEED))
         self.assertFalse(family_claim_succeeded(FamilyClaimOutcome.DOM_CHANGED))
         self.assertTrue(should_abort_warm_session(FamilyClaimOutcome.DOM_CHANGED))
         self.assertTrue(should_abort_warm_session(FamilyClaimOutcome.CHECKPOINT))
+        self.assertFalse(should_abort_warm_session(FamilyClaimOutcome.STALE_FEED))
         self.assertFalse(should_abort_warm_session(FamilyClaimOutcome.EMPTY_FEED))
 
     def test_worker_rollout_enabled_defaults_to_all_workers_when_allowlist_empty(self) -> None:
