@@ -512,27 +512,31 @@ async def launch_browser_context(
             async with aiohttp.ClientSession(headers=headers) as session:
                 last_error: BrowserLaunchError | None = None
                 for recycle_attempt in range(2):
-                    if recycle_attempt == 0:
-                        ws_endpoint, launch_mode = await _start_or_reuse_dolphin_profile(session, profile_id_value)
-                    else:
-                        ws_endpoint = await _hard_recycle_dolphin_profile(session, profile_id_value)
-                        launch_mode = "recycled_start"
-
+                    attempt_launch_mode = "reused" if recycle_attempt == 0 else "recycled_start"
                     try:
+                        if recycle_attempt == 0:
+                            ws_endpoint, attempt_launch_mode = await _start_or_reuse_dolphin_profile(
+                                session,
+                                profile_id_value,
+                            )
+                        else:
+                            ws_endpoint = await _hard_recycle_dolphin_profile(session, profile_id_value)
+                        launch_mode = attempt_launch_mode
                         browser = await _connect_dolphin_browser(
                             p,
                             ws_endpoint=ws_endpoint,
                             profile_id=profile_id_value,
-                            launch_mode=launch_mode,
+                            launch_mode=attempt_launch_mode,
                         )
                         context, page = await _probe_browser_ready(
                             browser,
                             profile_id=profile_id_value,
-                            launch_mode=launch_mode,
+                            launch_mode=attempt_launch_mode,
                         )
                         break
                     except BrowserLaunchError as exc:
                         last_error = exc
+                        launch_mode = str(exc.launch_mode or attempt_launch_mode or launch_mode)
                         logger.warning(
                             "Dolphin profile %s failed during %s (%s): %s",
                             profile_id_value,

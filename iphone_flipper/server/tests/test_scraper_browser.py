@@ -133,6 +133,40 @@ class ScraperBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(connect_mock.await_count, 2)
         cleanup_mock.assert_awaited()
 
+    async def test_launch_browser_context_recycles_when_active_profile_has_no_automation_endpoint(self) -> None:
+        ready_page = _FakePage()
+        ready_context = _FakeContext(pages=[ready_page], new_page_result=ready_page)
+        ready_browser = _FakeBrowser(contexts=[ready_context], new_context_result=ready_context)
+        fake_playwright = types.SimpleNamespace(chromium=types.SimpleNamespace(), stop=AsyncMock())
+        client_session = _FakeClientSession()
+
+        with (
+            patch.object(browser, "async_playwright", return_value=_FakeAsyncPlaywrightFactory(fake_playwright)),
+            patch.object(browser.aiohttp, "ClientSession", return_value=client_session),
+            patch.object(
+                browser,
+                "_start_or_reuse_dolphin_profile",
+                AsyncMock(
+                    side_effect=browser.BrowserLaunchError(
+                        "active session missing automation endpoint",
+                        failure_stage="start",
+                        launch_mode="reused",
+                        details={"dolphin_profile_id": "123"},
+                    )
+                ),
+            ),
+            patch.object(browser, "_hard_recycle_dolphin_profile", AsyncMock(return_value="ws://recycled")) as recycle_mock,
+            patch.object(browser, "_connect_dolphin_browser", AsyncMock(return_value=ready_browser)) as connect_mock,
+            patch.object(browser, "_probe_browser_ready", AsyncMock(return_value=(ready_context, ready_page))),
+            patch.object(browser, "_safe_close_browser_targets", AsyncMock()) as cleanup_mock,
+        ):
+            result = await browser.launch_browser_context(headless=False, profile_id="123")
+
+        self.assertEqual(result.launch_mode, "recycled_start")
+        recycle_mock.assert_awaited_once()
+        connect_mock.assert_awaited_once()
+        cleanup_mock.assert_awaited_once()
+
 
 if __name__ == "__main__":
     unittest.main()
