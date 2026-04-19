@@ -5,11 +5,15 @@ from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Iterable, Mapping
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import asyncpg
 
-PERTH_TZ = ZoneInfo("Australia/Perth")
+try:
+    PERTH_TZ = ZoneInfo("Australia/Perth")
+except ZoneInfoNotFoundError:
+    # Perth is a fixed UTC+08:00 offset without DST, so a fixed fallback is safe.
+    PERTH_TZ = timezone(timedelta(hours=8), name="Australia/Perth")
 LOWBALL_REPORT_TIME = time(hour=6, minute=0, tzinfo=PERTH_TZ)
 LOWBALL_REPORT_RUN_SOURCE_SCHEDULED = "scheduled"
 LOWBALL_REPORT_RUN_SOURCE_MANUAL = "manual"
