@@ -13,6 +13,7 @@ from urllib.parse import quote
 from scraper.browser import (
     BrowserSessionError,
     BrowserSessionLostError,
+    ensure_single_context_page,
     is_benign_browser_shutdown_error,
     is_browser_session_error,
     launch_browser_context,
@@ -348,7 +349,7 @@ async def close_profile_session(
     effective_stop_profile = session.stop_profile_on_close if stop_profile is None else bool(stop_profile)
     if effective_stop_profile:
         try:
-            await stop_dolphin_profile(session.profile_id)
+            await stop_dolphin_profile(session.profile_id, wait_for_inactive=True)
         except Exception as exc:
             errors.append(exc)
 
@@ -743,33 +744,33 @@ async def execute_family_claim(
     apply_inter_query_delay: bool = False,
 ) -> MarketplaceClaimExecution:
     try:
-        page = await session.context.new_page()
+        page = await ensure_single_context_page(
+            session.context,
+            preferred_page=session.page,
+            profile_id=session.profile_id,
+            launch_mode=session.launch_mode,
+        )
+        session.page = page
     except Exception as exc:
         if is_browser_session_error(exc):
             raise BrowserSessionLostError(
-                f"Browser session lost before opening a fresh family page: {exc}",
-                failure_stage="new_page",
+                f"Browser session lost before preparing the family claim page: {exc}",
+                failure_stage="ready_page",
                 launch_mode=session.launch_mode,
                 details={"runtime_identity": session.profile_id},
             ) from exc
         raise
-    try:
-        return await _execute_queries_on_page(
-            session,
-            page,
-            progress_callback=progress_callback,
-            stop_event=stop_event,
-            search_queries=search_queries,
-            search_urls=search_urls,
-            scroll_target_cards_override=scroll_target_cards_override,
-            scroll_max_rounds_override=scroll_max_rounds_override,
-            apply_inter_query_delay=apply_inter_query_delay,
-        )
-    finally:
-        try:
-            await page.close()
-        except Exception:
-            pass
+    return await _execute_queries_on_page(
+        session,
+        page,
+        progress_callback=progress_callback,
+        stop_event=stop_event,
+        search_queries=search_queries,
+        search_urls=search_urls,
+        scroll_target_cards_override=scroll_target_cards_override,
+        scroll_max_rounds_override=scroll_max_rounds_override,
+        apply_inter_query_delay=apply_inter_query_delay,
+    )
 
 
 async def scrape_marketplace(

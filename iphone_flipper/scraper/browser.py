@@ -4,6 +4,7 @@ context launching, and human-like random delays.
 """
 
 import asyncio
+import contextlib
 from dataclasses import dataclass
 import logging
 import os
@@ -466,12 +467,11 @@ async def _probe_browser_ready(
 ) -> tuple[Any, Any]:
     try:
         context = browser.contexts[0] if browser and getattr(browser, "contexts", None) else await browser.new_context()
-        existing_pages = []
-        try:
-            existing_pages = [page for page in (context.pages or []) if not page.is_closed()]
-        except Exception:
-            existing_pages = []
-        page = existing_pages[0] if existing_pages else await context.new_page()
+        page = await ensure_single_context_page(
+            context,
+            profile_id=profile_id,
+            launch_mode=launch_mode,
+        )
         if hasattr(page, "is_closed") and page.is_closed():
             raise RuntimeError("Browser returned a closed page during readiness probe.")
         await page.evaluate("() => document.readyState || 'unknown'")
@@ -502,11 +502,58 @@ async def _safe_close_browser_targets(context: Any, browser: Any) -> None:
         pass
 
 
-async def stop_dolphin_profile(profile_id: str) -> None:
+async def ensure_single_context_page(
+    context: Any,
+    *,
+    preferred_page: Any | None = None,
+    profile_id: str | None = None,
+    launch_mode: str = "unknown",
+) -> Any:
+    try:
+        existing_pages = [page for page in (context.pages or []) if not page.is_closed()]
+    except Exception:
+        existing_pages = []
+
+    page = None
+    if preferred_page is not None and hasattr(preferred_page, "is_closed") and not preferred_page.is_closed():
+        for existing_page in existing_pages:
+            if existing_page is preferred_page:
+                page = existing_page
+                break
+    if page is None:
+        page = existing_pages[0] if existing_pages else await context.new_page()
+
+    extra_pages_closed = 0
+    for existing_page in existing_pages:
+        if existing_page is page:
+            continue
+        try:
+            await existing_page.close()
+            extra_pages_closed += 1
+        except Exception as exc:
+            logger.warning(
+                "Failed to close extra page for profile %s during %s cleanup: %s",
+                profile_id or "local",
+                launch_mode,
+                exc,
+            )
+
+    if extra_pages_closed > 0:
+        logger.info(
+            "Collapsed browser context for profile %s to a single page by closing %d extra tab(s).",
+            profile_id or "local",
+            extra_pages_closed,
+        )
+    return page
+
+
+async def stop_dolphin_profile(profile_id: str, *, wait_for_inactive: bool = True) -> None:
     """Stop a Dolphin Anty profile."""
     headers = _dolphin_auth_headers()
     async with aiohttp.ClientSession(headers=headers) as session:
         await _stop_dolphin_profile_with_session(session, profile_id)
+        if wait_for_inactive:
+            await _wait_for_dolphin_profile_inactive(session, profile_id)
 
 async def launch_browser_context(
     headless: bool,
@@ -535,6 +582,7 @@ async def launch_browser_context(
     context = None
     page = None
     launch_mode = "unknown"
+    stop_profile_on_failure = False
     try:
         try:
             p = await async_playwright().start()
@@ -562,6 +610,7 @@ async def launch_browser_context(
                             )
                         else:
                             ws_endpoint = await _hard_recycle_dolphin_profile(session, profile_id_value)
+                        stop_profile_on_failure = True
                         launch_mode = attempt_launch_mode
                         browser = await _connect_dolphin_browser(
                             p,
@@ -616,11 +665,11 @@ async def launch_browser_context(
                     details={"user_data_dir": launch_dir},
                 ) from exc
             browser = None
-            try:
-                existing_pages = [existing for existing in (context.pages or []) if not existing.is_closed()]
-            except Exception:
-                existing_pages = []
-            page = existing_pages[0] if existing_pages else await context.new_page()
+            page = await ensure_single_context_page(
+                context,
+                profile_id=launch_dir,
+                launch_mode=launch_mode,
+            )
             if hasattr(page, "is_closed") and page.is_closed():
                 raise BrowserLaunchError(
                     f"Persistent browser context for {launch_dir} returned a closed page.",
@@ -671,6 +720,9 @@ async def launch_browser_context(
             await _safe_close_browser_targets(context, browser)
         except Exception:
             pass
+        if profile_id_value and stop_profile_on_failure:
+            with contextlib.suppress(Exception):
+                await stop_dolphin_profile(profile_id_value, wait_for_inactive=True)
         if p is not None:
             await p.stop()
         raise

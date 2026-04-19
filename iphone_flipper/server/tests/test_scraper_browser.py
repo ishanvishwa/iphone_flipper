@@ -14,6 +14,7 @@ class _FakePage:
     def __init__(self, *, closed: bool = False, evaluate_result: object = "complete") -> None:
         self._closed = closed
         self._evaluate_result = evaluate_result
+        self.close = AsyncMock(side_effect=self._close)
 
     def is_closed(self) -> bool:
         return self._closed
@@ -22,6 +23,9 @@ class _FakePage:
         if isinstance(self._evaluate_result, Exception):
             raise self._evaluate_result
         return self._evaluate_result
+
+    async def _close(self) -> None:
+        self._closed = True
 
 
 class _FakeContext:
@@ -222,6 +226,49 @@ class ScraperBrowserTests(unittest.IsolatedAsyncioTestCase):
         stop_mock.assert_awaited_once()
         sleep_mock.assert_awaited_once_with(browser.DOLPHIN_STOP_WAIT_POLL_SECONDS)
         self.assertEqual(len(session.urls), 2)
+
+    async def test_ensure_single_context_page_closes_extra_tabs(self) -> None:
+        keeper = _FakePage()
+        extra = _FakePage()
+        context = _FakeContext(pages=[keeper, extra], new_page_result=keeper)
+
+        page = await browser.ensure_single_context_page(
+            context,
+            preferred_page=keeper,
+            profile_id="123",
+            launch_mode="reused",
+        )
+
+        self.assertIs(page, keeper)
+        extra.close.assert_awaited_once()
+
+    async def test_launch_browser_context_stops_profile_after_launch_failure(self) -> None:
+        fake_playwright = types.SimpleNamespace(chromium=types.SimpleNamespace(), stop=AsyncMock())
+        client_session = _FakeClientSession()
+
+        with (
+            patch.object(browser, "async_playwright", return_value=_FakeAsyncPlaywrightFactory(fake_playwright)),
+            patch.object(browser.aiohttp, "ClientSession", return_value=client_session),
+            patch.object(browser, "_start_or_reuse_dolphin_profile", AsyncMock(return_value=("ws://active", "fresh_start"))),
+            patch.object(
+                browser,
+                "_connect_dolphin_browser",
+                AsyncMock(
+                    side_effect=browser.BrowserLaunchError(
+                        "connect failed",
+                        failure_stage="connect",
+                        launch_mode="fresh_start",
+                        details={"dolphin_profile_id": "123"},
+                    )
+                ),
+            ),
+            patch.object(browser, "stop_dolphin_profile", AsyncMock()) as stop_profile,
+            patch.object(browser, "_safe_close_browser_targets", AsyncMock()),
+        ):
+            with self.assertRaises(browser.BrowserLaunchError):
+                await browser.launch_browser_context(headless=False, profile_id="123")
+
+        stop_profile.assert_awaited_once_with("123", wait_for_inactive=True)
 
 
 if __name__ == "__main__":

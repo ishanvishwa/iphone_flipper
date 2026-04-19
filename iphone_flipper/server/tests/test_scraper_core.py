@@ -47,7 +47,7 @@ class ScraperCoreTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(core, "stop_dolphin_profile", AsyncMock()) as stop_profile:
             await core.close_profile_session(session)
 
-        stop_profile.assert_awaited_once_with("123")
+        stop_profile.assert_awaited_once_with("123", wait_for_inactive=True)
 
     async def test_scrape_marketplace_reraises_browser_session_error_when_enabled(self) -> None:
         session = _fake_session(profile_id="756486761")
@@ -67,6 +67,27 @@ class ScraperCoreTests(unittest.IsolatedAsyncioTestCase):
                 await core.scrape_marketplace(profile_id="756486761", raise_browser_errors=True)
 
         close_session.assert_awaited_once()
+
+    async def test_execute_family_claim_reuses_single_session_page(self) -> None:
+        page = object()
+        session = _fake_session(profile_id="756486761")
+        session.page = page
+
+        with (
+            patch.object(core, "ensure_single_context_page", AsyncMock(return_value=page)) as ensure_page,
+            patch.object(core, "_execute_queries_on_page", AsyncMock(return_value="ok")) as execute_queries,
+        ):
+            result = await core.execute_family_claim(session)
+
+        self.assertEqual(result, "ok")
+        ensure_page.assert_awaited_once_with(
+            session.context,
+            preferred_page=page,
+            profile_id="756486761",
+            launch_mode="fresh_start",
+        )
+        execute_queries.assert_awaited_once()
+        self.assertIs(session.page, page)
 
     async def test_wait_for_marketplace_results_surface_waits_for_feed_after_networkidle(self) -> None:
         page = _FakePage()
