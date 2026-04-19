@@ -3641,7 +3641,37 @@ async def _run_v4_worker_loop(
             idle_close = False
             warm_session_failure_backoff = 0
             try:
-                warm_session = await _open_v4_warm_session(pool, profile)
+                try:
+                    warm_session = await _open_v4_warm_session(pool, profile)
+                except Exception as exc:
+                    warm_session_failure_backoff = max(
+                        warm_session_failure_backoff,
+                        V4_WARM_SESSION_FAILURE_BACKOFF_SECONDS,
+                    )
+                    error_text = str(exc) or "Failed to open V4 warm session."
+                    logging.warning(
+                        "[%s] failed to open V4 warm session for %s: %s",
+                        WORKER_NAME,
+                        _profile_display_label(profile),
+                        error_text,
+                    )
+                    await _record_v4_profile_transient_failure(
+                        pool,
+                        profile,
+                        reason=error_text,
+                    )
+                    await _upsert_worker_heartbeat(
+                        pool=pool,
+                        route_name="",
+                        status="session_error",
+                        listings_saved=0,
+                        query_count=0,
+                        last_error=error_text[:2000],
+                        started_at=datetime.now(timezone.utc),
+                        finished_at=datetime.now(timezone.utc),
+                        route=_build_v4_family_route(profile),
+                    )
+                    continue
                 profile_heartbeat_task = await _start_v4_lease_heartbeat_task(
                     label="profile",
                     heartbeat_coro=functools.partial(
