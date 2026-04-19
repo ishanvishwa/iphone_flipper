@@ -137,6 +137,7 @@ from server.services.worker.v4_runtime import (  # noqa: E402
     next_variant_cursor,
     next_pause_seconds as next_v4_pause_seconds,
     normalize_warm_session_config,
+    summarize_listing_id_overlap,
     should_abort_warm_session,
     scrub_orphaned_chromium_locks,
     worker_rollout_enabled,
@@ -563,6 +564,8 @@ class V4FamilyAttemptResult:
     final_url: str | None = None
     feed_present: bool = False
     empty_state_detected: bool = False
+    observed_listing_ids: tuple[str, ...] = ()
+    saved_listing_ids: tuple[str, ...] = ()
 
 
 def _worker_v4_rollout_enabled() -> bool:
@@ -3213,6 +3216,30 @@ async def _run_v4_family_claim(
             feed_present = feed_present or bool(diagnostic.get("feed_present"))
             empty_state_detected = empty_state_detected or bool(diagnostic.get("empty_state_detected"))
 
+    def _collect_execution_listing_ids(
+        query_diagnostics: list[dict[str, Any]],
+        *,
+        field_name: str,
+    ) -> tuple[str, ...]:
+        seen: set[str] = set()
+        ordered_ids: list[str] = []
+        for diagnostic in query_diagnostics:
+            raw_ids = diagnostic.get(field_name)
+            if not isinstance(raw_ids, (list, tuple)):
+                continue
+            for raw_listing_id in raw_ids:
+                listing_id = str(raw_listing_id or "").strip()
+                if not listing_id or listing_id in seen:
+                    continue
+                seen.add(listing_id)
+                ordered_ids.append(listing_id)
+        return tuple(ordered_ids)
+
+    def _format_listing_id_sample(listing_ids: tuple[str, ...], limit: int = 5) -> str:
+        if not listing_ids:
+            return "-"
+        return ",".join(listing_ids[: max(1, int(limit or 5))])
+
     def _classify_attempt_result(
         attempt: V4FamilyAttemptResult,
     ) -> tuple[FamilyClaimOutcome, ErrorCategory]:
@@ -3236,6 +3263,8 @@ async def _run_v4_family_claim(
         feed_present = False
         empty_state_detected = False
         error_text: str | None = None
+        observed_listing_ids: tuple[str, ...] = ()
+        saved_listing_ids: tuple[str, ...] = ()
         try:
             execution = await execute_family_claim(
                 warm_session.session,
@@ -3247,6 +3276,14 @@ async def _run_v4_family_claim(
                 scroll_max_rounds_override=WORKER_SCROLL_MAX_ROUNDS,
                 apply_inter_query_delay=False,
             )
+            observed_listing_ids = _collect_execution_listing_ids(
+                execution.query_diagnostics,
+                field_name="listing_ids",
+            )
+            saved_listing_ids = _collect_execution_listing_ids(
+                execution.query_diagnostics,
+                field_name="saved_listing_ids",
+            )
             _apply_execution_diagnostics(execution.query_diagnostics)
         except Exception as exc:
             error_text = str(exc) or "unknown v4 family error"
@@ -3257,6 +3294,8 @@ async def _run_v4_family_claim(
             final_url=final_url,
             feed_present=feed_present,
             empty_state_detected=empty_state_detected,
+            observed_listing_ids=observed_listing_ids,
+            saved_listing_ids=saved_listing_ids,
         )
 
     final_attempt = V4FamilyAttemptResult(
@@ -3326,8 +3365,31 @@ async def _run_v4_family_claim(
                             final_attempt.listings_scraped,
                         )
                         cache_bust_attempted = True
+                        baseline_attempt = final_attempt
                         final_attempt = await _execute_family_attempt(cache_bust_urls)
                         final_outcome, final_error_category = _classify_attempt_result(final_attempt)
+                        listing_overlap = summarize_listing_id_overlap(
+                            baseline_listing_ids=baseline_attempt.observed_listing_ids,
+                            retry_listing_ids=final_attempt.observed_listing_ids,
+                        )
+                        logging.info(
+                            "[%s] V4 cache-bust evidence family=%s query=%s identical=%s baseline_ids=%s retry_ids=%s overlap=%s overlap_ratio=%.3f retry_only=%s baseline_only=%s baseline_saved=%s retry_saved=%s overlap_sample=%s retry_only_sample=%s baseline_only_sample=%s",
+                            WORKER_NAME,
+                            family.get("name"),
+                            selected_query,
+                            listing_overlap.identical,
+                            len(listing_overlap.baseline_ids),
+                            len(listing_overlap.retry_ids),
+                            len(listing_overlap.overlap_ids),
+                            listing_overlap.overlap_ratio,
+                            len(listing_overlap.retry_only_ids),
+                            len(listing_overlap.baseline_only_ids),
+                            len(baseline_attempt.saved_listing_ids),
+                            len(final_attempt.saved_listing_ids),
+                            _format_listing_id_sample(listing_overlap.overlap_ids),
+                            _format_listing_id_sample(listing_overlap.retry_only_ids),
+                            _format_listing_id_sample(listing_overlap.baseline_only_ids),
+                        )
                         if final_outcome == FamilyClaimOutcome.MATCHES:
                             logging.info(
                                 "[%s] V4 cache-bust retry success family=%s query=%s saved=%s scraped=%s",

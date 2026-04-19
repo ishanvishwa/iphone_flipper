@@ -21,6 +21,17 @@ class WarmSessionConfig:
     max_pause_seconds: float
 
 
+@dataclass(frozen=True)
+class ListingIdOverlapSummary:
+    baseline_ids: tuple[str, ...]
+    retry_ids: tuple[str, ...]
+    overlap_ids: tuple[str, ...]
+    baseline_only_ids: tuple[str, ...]
+    retry_only_ids: tuple[str, ...]
+    overlap_ratio: float
+    identical: bool
+
+
 class FamilyClaimOutcome(str, Enum):
     MATCHES = "matches"
     STALE_FEED = "stale_feed"
@@ -117,6 +128,43 @@ def build_cache_busted_search_urls(
             )
         )
     return busted_urls
+
+
+def _normalize_listing_ids(listing_ids: Sequence[str] | None) -> tuple[str, ...]:
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for raw_listing_id in listing_ids or ():
+        listing_id = str(raw_listing_id or "").strip()
+        if not listing_id or listing_id in seen:
+            continue
+        seen.add(listing_id)
+        normalized.append(listing_id)
+    return tuple(normalized)
+
+
+def summarize_listing_id_overlap(
+    *,
+    baseline_listing_ids: Sequence[str] | None,
+    retry_listing_ids: Sequence[str] | None,
+) -> ListingIdOverlapSummary:
+    baseline_ids = _normalize_listing_ids(baseline_listing_ids)
+    retry_ids = _normalize_listing_ids(retry_listing_ids)
+    baseline_set = set(baseline_ids)
+    retry_set = set(retry_ids)
+    overlap_ids = tuple(listing_id for listing_id in baseline_ids if listing_id in retry_set)
+    baseline_only_ids = tuple(listing_id for listing_id in baseline_ids if listing_id not in retry_set)
+    retry_only_ids = tuple(listing_id for listing_id in retry_ids if listing_id not in baseline_set)
+    union_count = len(baseline_set | retry_set)
+    overlap_ratio = 1.0 if union_count <= 0 else len(overlap_ids) / union_count
+    return ListingIdOverlapSummary(
+        baseline_ids=baseline_ids,
+        retry_ids=retry_ids,
+        overlap_ids=overlap_ids,
+        baseline_only_ids=baseline_only_ids,
+        retry_only_ids=retry_only_ids,
+        overlap_ratio=overlap_ratio,
+        identical=baseline_ids == retry_ids,
+    )
 
 
 def evaluate_warm_session_state(

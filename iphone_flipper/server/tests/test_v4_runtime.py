@@ -16,6 +16,7 @@ from server.services.worker.v4_runtime import (
     next_family_due_seconds,
     next_variant_cursor,
     normalize_warm_session_config,
+    summarize_listing_id_overlap,
     should_abort_warm_session,
     scrub_orphaned_chromium_locks,
     worker_rollout_enabled,
@@ -297,6 +298,35 @@ class V4RuntimeTests(unittest.TestCase):
         self.assertEqual(first_query["__cb"], ["v43-token-1"])
         self.assertEqual(second_query["query"], ["iPhone 16 Pro"])
         self.assertEqual(second_query["__cb"], ["v43-token-2"])
+
+    def test_summarize_listing_id_overlap_normalizes_duplicates_and_counts_changes(self) -> None:
+        summary = summarize_listing_id_overlap(
+            baseline_listing_ids=("111", "222", "", "111", "333"),
+            retry_listing_ids=("222", "444", "222", "333", " "),
+        )
+
+        self.assertEqual(summary.baseline_ids, ("111", "222", "333"))
+        self.assertEqual(summary.retry_ids, ("222", "444", "333"))
+        self.assertEqual(summary.overlap_ids, ("222", "333"))
+        self.assertEqual(summary.baseline_only_ids, ("111",))
+        self.assertEqual(summary.retry_only_ids, ("444",))
+        self.assertAlmostEqual(summary.overlap_ratio, 0.5)
+        self.assertFalse(summary.identical)
+
+    def test_summarize_listing_id_overlap_distinguishes_reordered_from_identical(self) -> None:
+        reordered = summarize_listing_id_overlap(
+            baseline_listing_ids=("111", "222", "333"),
+            retry_listing_ids=("222", "111", "333"),
+        )
+        identical = summarize_listing_id_overlap(
+            baseline_listing_ids=("111", "222", "333"),
+            retry_listing_ids=("111", "222", "333"),
+        )
+
+        self.assertAlmostEqual(reordered.overlap_ratio, 1.0)
+        self.assertFalse(reordered.identical)
+        self.assertTrue(identical.identical)
+        self.assertEqual(identical.retry_only_ids, ())
 
 
 if __name__ == "__main__":

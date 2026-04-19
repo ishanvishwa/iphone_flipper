@@ -541,7 +541,16 @@ async def _execute_queries_on_page(
             query_listings = merge_listing_candidates(
                 list(graphql_candidates.values()) + normalized_dom_listings
             )
+            query_listing_ids: List[str] = []
+            query_listing_seen_ids = set()
+            for listing in query_listings:
+                listing_id = _extract_text_value(listing.get("id"))
+                if not listing_id or listing_id in query_listing_seen_ids:
+                    continue
+                query_listing_seen_ids.add(listing_id)
+                query_listing_ids.append(listing_id)
             query_new_saved = 0
+            query_saved_listing_ids: List[str] = []
             for listing in query_listings:
                 listing_id = _extract_text_value(listing.get("id"))
                 if not listing_id or listing_id in seen_listing_ids:
@@ -561,6 +570,7 @@ async def _execute_queries_on_page(
                 conn.commit()
                 new_listings_count += 1
                 query_new_saved += 1
+                query_saved_listing_ids.append(listing_id)
                 processed_listings.append(saved_listing)
                 emit_progress(
                     "listing_saved",
@@ -604,6 +614,8 @@ async def _execute_queries_on_page(
                     "page_cards": int(scroll_stats.get("visible_cards", 0) or 0),
                     "scroll_rounds": int(scroll_stats.get("scroll_rounds", 0) or 0),
                     "new_saved": query_new_saved,
+                    "listing_ids": query_listing_ids,
+                    "saved_listing_ids": query_saved_listing_ids,
                     **page_state,
                 }
             )
@@ -630,6 +642,8 @@ async def _execute_queries_on_page(
                     "query": query,
                     "query_index": index,
                     "error": error_text,
+                    "listing_ids": [],
+                    "saved_listing_ids": [],
                     **page_state,
                 }
             )
