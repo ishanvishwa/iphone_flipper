@@ -332,6 +332,21 @@ PROFILE_LEASE_SECONDS = _parse_int(os.getenv("PROFILE_LEASE_SECONDS"), default=1
 FAMILY_LEASE_SECONDS = _parse_int(os.getenv("FAMILY_LEASE_SECONDS"), default=120, minimum=30)
 LEASE_HEARTBEAT_SECONDS = _parse_int(os.getenv("LEASE_HEARTBEAT_SECONDS"), default=15, minimum=5)
 PROFILE_MIN_REUSE_SECONDS = _parse_int(os.getenv("PROFILE_MIN_REUSE_SECONDS"), default=180, minimum=0)
+V4_MAX_ACTIVE_WARM_SESSIONS = _parse_int(
+    os.getenv("V4_MAX_ACTIVE_WARM_SESSIONS"),
+    default=2,
+    minimum=1,
+)
+V4_WARM_SESSION_SLOT_LEASE_SECONDS = _parse_int(
+    os.getenv("V4_WARM_SESSION_SLOT_LEASE_SECONDS"),
+    default=max(60, LEASE_HEARTBEAT_SECONDS * 4),
+    minimum=max(30, LEASE_HEARTBEAT_SECONDS * 2),
+)
+V4_WARM_SESSION_FAILURE_BACKOFF_SECONDS = _parse_int(
+    os.getenv("V4_WARM_SESSION_FAILURE_BACKOFF_SECONDS"),
+    default=20,
+    minimum=0,
+)
 WORKER_NO_PROFILE_BACKOFF_SECONDS = _parse_int(
     os.getenv("WORKER_NO_PROFILE_BACKOFF_SECONDS"),
     default=30,
@@ -542,6 +557,13 @@ class V4WarmSessionState:
     started_at: datetime
     last_activity_at: datetime
     executed_claims: int = 0
+
+
+@dataclass
+class V4WarmSessionSlotLease:
+    slot_index: int
+    slot_key: str
+    slot_token: str
 
 
 @dataclass
@@ -2369,6 +2391,82 @@ def _build_v4_family_route(
     }
 
 
+def _v4_warm_session_slot_key(slot_index: int) -> str:
+    return f"flipper:v4:warm-session-slot:{max(1, int(slot_index or 1))}"
+
+
+async def _claim_v4_warm_session_slot(
+    redis_client: Redis | None,
+    *,
+    worker_name: str,
+) -> V4WarmSessionSlotLease | None:
+    if redis_client is None:
+        return V4WarmSessionSlotLease(
+            slot_index=1,
+            slot_key=_v4_warm_session_slot_key(1),
+            slot_token=f"{worker_name}:local",
+        )
+    worker_token = str(worker_name or "worker").strip() or "worker"
+    for slot_index in range(1, V4_MAX_ACTIVE_WARM_SESSIONS + 1):
+        slot_token = f"{worker_token}:{uuid.uuid4().hex[:12]}"
+        slot_key = _v4_warm_session_slot_key(slot_index)
+        acquired = await redis_client.set(
+            slot_key,
+            slot_token,
+            ex=V4_WARM_SESSION_SLOT_LEASE_SECONDS,
+            nx=True,
+        )
+        if acquired:
+            return V4WarmSessionSlotLease(
+                slot_index=slot_index,
+                slot_key=slot_key,
+                slot_token=slot_token,
+            )
+    return None
+
+
+async def _heartbeat_v4_warm_session_slot(
+    redis_client: Redis | None,
+    slot_lease: V4WarmSessionSlotLease | None,
+) -> dict[str, Any] | None:
+    if redis_client is None:
+        return {"slot_index": 1}
+    if slot_lease is None:
+        return None
+    refreshed = await redis_client.eval(
+        """
+        if redis.call('get', KEYS[1]) == ARGV[1] then
+            return redis.call('expire', KEYS[1], ARGV[2])
+        end
+        return 0
+        """,
+        1,
+        slot_lease.slot_key,
+        slot_lease.slot_token,
+        int(V4_WARM_SESSION_SLOT_LEASE_SECONDS),
+    )
+    return {"slot_index": slot_lease.slot_index} if int(refreshed or 0) > 0 else None
+
+
+async def _release_v4_warm_session_slot(
+    redis_client: Redis | None,
+    slot_lease: V4WarmSessionSlotLease | None,
+) -> None:
+    if redis_client is None or slot_lease is None:
+        return
+    await redis_client.eval(
+        """
+        if redis.call('get', KEYS[1]) == ARGV[1] then
+            return redis.call('del', KEYS[1])
+        end
+        return 0
+        """,
+        1,
+        slot_lease.slot_key,
+        slot_lease.slot_token,
+    )
+
+
 def _v4_worker_family_allowlist() -> tuple[str, ...] | None:
     rollout_families = tuple(
         str(name).strip() for name in (V4_ROLLOUT_FAMILY_ALLOWLIST or ()) if str(name).strip()
@@ -3483,46 +3581,79 @@ async def _run_v4_worker_loop(
             logging.info("[%s] V4 warm runtime flag disabled; returning to V3 loop.", WORKER_NAME)
             return
 
-        profile = await _claim_v4_profile(pool)
-        if profile is None:
+        slot_lease = await _claim_v4_warm_session_slot(redis_client, worker_name=WORKER_NAME)
+        if slot_lease is None:
             await _upsert_worker_heartbeat(
                 pool=pool,
                 route_name="",
-                status="wait_profile_lock",
+                status="wait_warm_slot",
                 listings_saved=0,
                 query_count=0,
-                last_error="No claimable V4 profile is currently available.",
+                last_error=f"All {V4_MAX_ACTIVE_WARM_SESSIONS} V4 warm-session slots are currently occupied.",
                 started_at=datetime.now(timezone.utc),
                 finished_at=datetime.now(timezone.utc),
                 route=None,
             )
             await _interruptible_worker_sleep(
-                float(WORKER_NO_PROFILE_BACKOFF_SECONDS),
+                min(float(WORKER_NO_PROFILE_BACKOFF_SECONDS), float(LEASE_HEARTBEAT_SECONDS)),
                 feature_flags=feature_flags,
                 wake_on_v4_disable=True,
             )
             continue
 
-        warm_session: V4WarmSessionState | None = None
-        profile_heartbeat_stop = asyncio.Event()
-        profile_heartbeat_failure: dict[str, str] = {}
-        idle_close = False
+        slot_heartbeat_stop = asyncio.Event()
+        slot_heartbeat_failure: dict[str, str] = {}
+        slot_heartbeat_task = await _start_v4_lease_heartbeat_task(
+            label="warm-session slot",
+            heartbeat_coro=functools.partial(
+                _heartbeat_v4_warm_session_slot,
+                redis_client,
+                slot_lease,
+            ),
+            stop_event=slot_heartbeat_stop,
+            failure=slot_heartbeat_failure,
+        )
         try:
-            warm_session = await _open_v4_warm_session(pool, profile)
-            profile_heartbeat_task = await _start_v4_lease_heartbeat_task(
-                label="profile",
-                heartbeat_coro=functools.partial(
-                    heartbeat_profile_lease_from_module,
-                    pool,
-                    profile_id=int(profile["profile_id"]),
-                    lease_token=str(profile.get("profile_lease_token") or ""),
-                    lease_seconds=PROFILE_LEASE_SECONDS,
-                ),
-                stop_event=profile_heartbeat_stop,
-                failure=profile_heartbeat_failure,
-            )
+            profile = await _claim_v4_profile(pool)
+            if profile is None:
+                await _upsert_worker_heartbeat(
+                    pool=pool,
+                    route_name="",
+                    status="wait_profile_lock",
+                    listings_saved=0,
+                    query_count=0,
+                    last_error="No claimable V4 profile is currently available.",
+                    started_at=datetime.now(timezone.utc),
+                    finished_at=datetime.now(timezone.utc),
+                    route=None,
+                )
+                await _interruptible_worker_sleep(
+                    float(WORKER_NO_PROFILE_BACKOFF_SECONDS),
+                    feature_flags=feature_flags,
+                    wake_on_v4_disable=True,
+                )
+                continue
 
+            warm_session: V4WarmSessionState | None = None
+            profile_heartbeat_stop = asyncio.Event()
+            profile_heartbeat_failure: dict[str, str] = {}
+            profile_heartbeat_task: asyncio.Task | None = None
+            idle_close = False
+            warm_session_failure_backoff = 0
             try:
+                warm_session = await _open_v4_warm_session(pool, profile)
+                profile_heartbeat_task = await _start_v4_lease_heartbeat_task(
+                    label="profile",
+                    heartbeat_coro=functools.partial(
+                        heartbeat_profile_lease_from_module,
+                        pool,
+                        profile_id=int(profile["profile_id"]),
+                        lease_token=str(profile.get("profile_lease_token") or ""),
+                        lease_seconds=PROFILE_LEASE_SECONDS,
+                    ),
+                    stop_event=profile_heartbeat_stop,
+                    failure=profile_heartbeat_failure,
+                )
                 while not _worker_shutdown_requested():
                     recycle_reason = evaluate_warm_session_state(
                         started_at=warm_session.started_at,
@@ -3585,6 +3716,10 @@ async def _run_v4_worker_loop(
                             outcome=FamilyClaimOutcome.INFRASTRUCTURE_ERROR,
                             metrics={"listings_saved": 0, "listings_scraped": 0},
                             error="No enabled query variant is available for this family.",
+                        )
+                        warm_session_failure_backoff = max(
+                            warm_session_failure_backoff,
+                            V4_WARM_SESSION_FAILURE_BACKOFF_SECONDS,
                         )
                         continue
 
@@ -3694,6 +3829,10 @@ async def _run_v4_worker_loop(
                             claim_result.final_url or "",
                         )
                     else:
+                        warm_session_failure_backoff = max(
+                            warm_session_failure_backoff,
+                            V4_WARM_SESSION_FAILURE_BACKOFF_SECONDS,
+                        )
                         logging.warning(
                             "[%s] V4 family claim %s ended with outcome=%s error=%s",
                             WORKER_NAME,
@@ -3703,6 +3842,15 @@ async def _run_v4_worker_loop(
                         )
                         break
                     if abort_session:
+                        if claim_result.outcome not in {
+                            FamilyClaimOutcome.MATCHES,
+                            FamilyClaimOutcome.STALE_FEED,
+                            FamilyClaimOutcome.EMPTY_FEED,
+                        }:
+                            warm_session_failure_backoff = max(
+                                warm_session_failure_backoff,
+                                V4_WARM_SESSION_FAILURE_BACKOFF_SECONDS,
+                            )
                         logging.info(
                             "[%s] V4 warm session recycling after family outcome=%s profile_status=%s",
                             WORKER_NAME,
@@ -3723,22 +3871,45 @@ async def _run_v4_worker_loop(
                         )
             finally:
                 profile_heartbeat_stop.set()
-                await asyncio.gather(profile_heartbeat_task, return_exceptions=True)
+                if profile_heartbeat_task is not None:
+                    await asyncio.gather(profile_heartbeat_task, return_exceptions=True)
                 if profile_heartbeat_failure.get("error"):
                     logging.warning("[%s] %s", WORKER_NAME, profile_heartbeat_failure["error"])
+                release_delay_seconds: int | None = PROFILE_MIN_REUSE_SECONDS if idle_close else None
+                if warm_session_failure_backoff > 0:
+                    release_delay_seconds = max(
+                        int(release_delay_seconds or 0),
+                        int(warm_session_failure_backoff),
+                    )
+                if warm_session is not None:
+                    await _close_v4_warm_session(
+                        pool,
+                        warm_session,
+                        available_after_seconds=release_delay_seconds,
+                    )
+                else:
+                    await _release_v4_profile(
+                        pool,
+                        profile,
+                        available_after_seconds=release_delay_seconds,
+                    )
+                if warm_session_failure_backoff > 0 and not _worker_shutdown_requested():
+                    logging.info(
+                        "[%s] backing off %.1fs before opening another V4 warm session after browser/session failure",
+                        WORKER_NAME,
+                        float(warm_session_failure_backoff),
+                    )
+                    await _interruptible_worker_sleep(
+                        float(warm_session_failure_backoff),
+                        feature_flags=feature_flags,
+                        wake_on_v4_disable=True,
+                    )
+            if slot_heartbeat_failure.get("error"):
+                logging.warning("[%s] %s", WORKER_NAME, slot_heartbeat_failure["error"])
         finally:
-            if warm_session is not None:
-                await _close_v4_warm_session(
-                    pool,
-                    warm_session,
-                    available_after_seconds=PROFILE_MIN_REUSE_SECONDS if idle_close else None,
-                )
-            else:
-                await _release_v4_profile(
-                    pool,
-                    profile,
-                    available_after_seconds=PROFILE_MIN_REUSE_SECONDS if idle_close else None,
-                )
+            slot_heartbeat_stop.set()
+            await asyncio.gather(slot_heartbeat_task, return_exceptions=True)
+            await _release_v4_warm_session_slot(redis_client, slot_lease)
 
     logging.info("[%s] V4 warm-session worker loop drained.", WORKER_NAME)
 
