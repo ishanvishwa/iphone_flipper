@@ -17,7 +17,8 @@ INSERT INTO schema_versions (version, description) VALUES
     (10, 'Worker heartbeat route snapshot fields'),
     (11, 'Central route scheduler tables and execution profiles'),
     (12, 'V4 profile and query family lease foundation'),
-    (13, 'V4 listing dedupe and discovery timestamp fields')
+    (13, 'V4 listing dedupe and discovery timestamp fields'),
+    (14, 'V4.4 lowball report and pricing foundations')
 ON CONFLICT (version) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS listings (
@@ -35,10 +36,21 @@ CREATE TABLE IF NOT EXISTS listings (
     max_buy_price NUMERIC,
     potential_profit NUMERIC,
     status TEXT DEFAULT 'new',
+    availability_status TEXT NOT NULL DEFAULT 'active',
     enrichment_status TEXT NOT NULL DEFAULT 'complete',
     enrichment_source_hash TEXT,
     enriched_at TIMESTAMPTZ,
     enrichment_last_error TEXT,
+    last_checked_at TIMESTAMPTZ,
+    last_seen_available_at TIMESTAMPTZ,
+    last_seen_in_search_at TIMESTAMPTZ,
+    consecutive_check_failures INTEGER NOT NULL DEFAULT 0,
+    last_shown_in_report_at TIMESTAMPTZ,
+    price_when_last_shown NUMERIC,
+    last_staleness_bracket_shown INTEGER,
+    last_zone_shown TEXT,
+    report_action_taken TEXT,
+    report_action_taken_at TIMESTAMPTZ,
     discovery_ts TIMESTAMPTZ,
     first_seen_at TIMESTAMPTZ,
     last_seen_at TIMESTAMPTZ,
@@ -63,19 +75,53 @@ ALTER TABLE listings ADD COLUMN IF NOT EXISTS current_price NUMERIC;
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS last_price_hash TEXT;
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS persisted_at TIMESTAMPTZ;
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS last_event_kind TEXT;
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS availability_status TEXT NOT NULL DEFAULT 'active';
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMPTZ;
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS last_seen_available_at TIMESTAMPTZ;
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS last_seen_in_search_at TIMESTAMPTZ;
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS consecutive_check_failures INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS last_shown_in_report_at TIMESTAMPTZ;
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS price_when_last_shown NUMERIC;
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS last_staleness_bracket_shown INTEGER;
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS last_zone_shown TEXT;
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS report_action_taken TEXT;
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS report_action_taken_at TIMESTAMPTZ;
 UPDATE listings
 SET discovery_ts = COALESCE(discovery_ts, source_seen_at, created_at),
     first_seen_at = COALESCE(first_seen_at, source_seen_at, created_at),
     last_seen_at = COALESCE(last_seen_at, source_seen_at, updated_at),
     current_price = COALESCE(current_price, price),
     persisted_at = COALESCE(persisted_at, updated_at),
-    last_event_kind = COALESCE(last_event_kind, 'listing_created')
+    last_event_kind = COALESCE(last_event_kind, 'listing_created'),
+    availability_status = CASE
+        WHEN LOWER(COALESCE(availability_status, '')) IN ('active', 'sold', 'removed', 'unknown')
+            THEN LOWER(availability_status)
+        ELSE 'active'
+    END,
+    last_seen_available_at = COALESCE(last_seen_available_at, last_seen_in_search_at, last_seen_at, source_seen_at, updated_at),
+    last_seen_in_search_at = COALESCE(last_seen_in_search_at, last_seen_at, source_seen_at, updated_at),
+    consecutive_check_failures = GREATEST(0, COALESCE(consecutive_check_failures, 0)),
+    last_staleness_bracket_shown = COALESCE(last_staleness_bracket_shown, 0),
+    report_action_taken = CASE
+        WHEN LOWER(COALESCE(report_action_taken, '')) IN ('contacted', 'dismissed', 'purchased')
+            THEN LOWER(report_action_taken)
+        ELSE NULL
+    END
 WHERE discovery_ts IS NULL
    OR first_seen_at IS NULL
    OR last_seen_at IS NULL
    OR current_price IS NULL
    OR persisted_at IS NULL
-   OR last_event_kind IS NULL;
+   OR last_event_kind IS NULL
+   OR availability_status IS NULL
+   OR last_seen_available_at IS NULL
+   OR last_seen_in_search_at IS NULL
+   OR consecutive_check_failures IS NULL
+   OR last_staleness_bracket_shown IS NULL
+   OR (
+        report_action_taken IS NOT NULL
+        AND LOWER(COALESCE(report_action_taken, '')) NOT IN ('contacted', 'dismissed', 'purchased')
+   );
 UPDATE listings
 SET enrichment_status = CASE
     WHEN LOWER(COALESCE(enrichment_status, '')) IN ('pending', 'complete', 'failed')
@@ -89,6 +135,8 @@ CREATE INDEX IF NOT EXISTS idx_listings_created_at ON listings (created_at DESC)
 CREATE INDEX IF NOT EXISTS idx_listings_status ON listings (status);
 CREATE INDEX IF NOT EXISTS idx_listings_profit ON listings (potential_profit DESC);
 CREATE INDEX IF NOT EXISTS idx_listings_enrichment_status ON listings (enrichment_status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_listings_availability_status ON listings (availability_status, last_seen_in_search_at DESC);
+CREATE INDEX IF NOT EXISTS idx_listings_report_action_taken ON listings (report_action_taken, report_action_taken_at DESC);
 
 CREATE OR REPLACE FUNCTION set_updated_at_timestamp()
 RETURNS TRIGGER AS $$
@@ -101,6 +149,97 @@ $$ LANGUAGE plpgsql;
 DROP TRIGGER IF EXISTS trg_set_updated_at ON listings;
 CREATE TRIGGER trg_set_updated_at
 BEFORE UPDATE ON listings
+FOR EACH ROW
+EXECUTE FUNCTION set_updated_at_timestamp();
+
+CREATE TABLE IF NOT EXISTS model_prices (
+    model TEXT PRIMARY KEY,
+    buying_price NUMERIC NOT NULL,
+    selling_price NUMERIC NOT NULL,
+    backglass_repair NUMERIC NOT NULL DEFAULT 0,
+    screen_repair NUMERIC NOT NULL DEFAULT 0,
+    battery_repair NUMERIC NOT NULL DEFAULT 0,
+    camera_lens_repair NUMERIC NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS listing_price_history (
+    id BIGSERIAL PRIMARY KEY,
+    listing_id TEXT NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+    observed_price NUMERIC NOT NULL,
+    observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    source_event_kind TEXT,
+    mutable_hash TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_listing_price_history_listing_observed
+ON listing_price_history (listing_id, observed_at DESC);
+
+CREATE TABLE IF NOT EXISTS als_score_log (
+    id BIGSERIAL PRIMARY KEY,
+    listing_id TEXT NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+    snapshot_date DATE NOT NULL,
+    zone TEXT,
+    als NUMERIC,
+    staleness_score NUMERIC,
+    price_reachability_score NUMERIC,
+    trajectory_score NUMERIC,
+    reachability NUMERIC,
+    required_discount NUMERIC,
+    acceptable_discount NUMERIC,
+    max_acceptable_price NUMERIC,
+    walkaway_price NUMERIC,
+    days_since_first_seen INTEGER,
+    price_drop_count INTEGER,
+    seller_discount NUMERIC,
+    reason_tag TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (listing_id, snapshot_date)
+);
+
+CREATE TABLE IF NOT EXISTS lowball_report_runs (
+    id BIGSERIAL PRIMARY KEY,
+    report_date DATE NOT NULL,
+    run_source TEXT NOT NULL DEFAULT 'scheduled',
+    status TEXT NOT NULL DEFAULT 'running',
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ,
+    sent_at TIMESTAMPTZ,
+    listing_count INTEGER NOT NULL DEFAULT 0,
+    report_text TEXT,
+    telegram_message_id TEXT,
+    last_error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (report_date, run_source)
+);
+
+CREATE INDEX IF NOT EXISTS idx_lowball_report_runs_report_date
+ON lowball_report_runs (report_date DESC, run_source ASC);
+
+CREATE TABLE IF NOT EXISTS lowball_report_entries (
+    id BIGSERIAL PRIMARY KEY,
+    run_id BIGINT NOT NULL REFERENCES lowball_report_runs(id) ON DELETE CASCADE,
+    listing_id TEXT NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+    rank INTEGER NOT NULL,
+    zone TEXT,
+    reason_tag TEXT,
+    als NUMERIC,
+    reachability NUMERIC,
+    verification_status TEXT,
+    payload JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (run_id, listing_id),
+    UNIQUE (run_id, rank)
+);
+
+CREATE INDEX IF NOT EXISTS idx_lowball_report_entries_run_rank
+ON lowball_report_entries (run_id, rank ASC);
+
+DROP TRIGGER IF EXISTS trg_set_updated_at_lowball_report_runs ON lowball_report_runs;
+CREATE TRIGGER trg_set_updated_at_lowball_report_runs
+BEFORE UPDATE ON lowball_report_runs
 FOR EACH ROW
 EXECUTE FUNCTION set_updated_at_timestamp();
 

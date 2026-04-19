@@ -269,6 +269,37 @@ services:
       - ../runtime:/app/runtime
       - ../../price_list.csv:/app/price_list.csv:ro
 
+  lowball_report_worker:
+    build:
+      context: ../..
+      dockerfile: server/services/worker/Dockerfile
+    restart: unless-stopped
+    stop_grace_period: 45s
+    network_mode: host
+    command: ["python", "-m", "server.services.worker.lowball_report_worker"]
+    env_file:
+      - ../.env
+    environment:
+      DOLPHIN_API_URL: http://127.0.0.1:3001/v1.0
+      DOLPHIN_WS_HOST: '127.0.0.1'
+      DOLPHIN_ANTY_TOKEN: ${DOLPHIN_ANTY_TOKEN:-}
+      TZ: ${TZ:-Australia/Perth}
+      APP_ENV: ${APP_ENV:-production}
+      PGHOST: 127.0.0.1
+      PGPORT: 5432
+      PGDATABASE: ${POSTGRES_DB}
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      LOWBALL_REPORT_WORKER_NAME: ${LOWBALL_REPORT_WORKER_NAME:-lowball_report_worker}
+      LOWBALL_REPORT_PROFILE_LEASE_SECONDS: ${LOWBALL_REPORT_PROFILE_LEASE_SECONDS:-900}
+      LOWBALL_REPORT_VERIFICATION_TIMEOUT_MS: ${LOWBALL_REPORT_VERIFICATION_TIMEOUT_MS:-15000}
+      WORKER_HEADLESS: ${WORKER_HEADLESS:-1}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    volumes:
+      - ../runtime:/app/runtime
+      - ../../price_list.csv:/app/price_list.csv:ro
+
 volumes:
   caddy_data:
   caddy_config:

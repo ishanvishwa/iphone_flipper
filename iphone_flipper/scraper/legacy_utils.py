@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Optional, Tuple, Callable, Awaitable
 from urllib.parse import urlparse, urlunparse
 from scraper.parsers import parse_listing_price, extract_currency_price_from_text, extract_shorthand_k_price_from_text, is_accessory_only_listing, identify_model, resolve_price_model_key, assess_condition, calculate_profit_for_listing, calculate_max_offer
 
+LOWBALL_CAPTURE_CEILING_PCT = 1.35
+
 def _has_value(value: Any) -> bool:
     if value is None:
         return False
@@ -813,6 +815,10 @@ def _store_listing_candidate(
         listed_price=price_value,
         fallback_purchase_price=max_offer,
     )
+    model_price_data = price_data.get(model) or {}
+    selling_price = float(model_price_data.get("selling_price") or 0)
+    if price_value is not None and selling_price > 0 and price_value > (selling_price * LOWBALL_CAPTURE_CEILING_PCT):
+        return None
     status = "new"
 
     created_at = datetime.now().isoformat()
@@ -862,4 +868,3 @@ def _store_listing_candidate(
         "url": listing_url,
         "status": status,
     }
-

@@ -386,6 +386,15 @@ class iPhoneFlipperGUI:
         )
         self.listing_context_menu.add_separator()
         self.listing_context_menu.add_command(
+            label="📨 Mark Contacted",
+            command=lambda: self._set_selected_listing_report_action("contacted"),
+        )
+        self.listing_context_menu.add_command(
+            label="🙅 Mark Dismissed",
+            command=lambda: self._set_selected_listing_report_action("dismissed"),
+        )
+        self.listing_context_menu.add_separator()
+        self.listing_context_menu.add_command(
             label="🗑 Delete Selected",
             command=self.delete_selected_listings,
         )
@@ -2384,6 +2393,120 @@ PY
         headers = self._build_server_headers(token)
         headers["Content-Type"] = "application/json"
         return {"base_url": base_url, "headers": headers}, None
+
+    def _server_api_is_configured(self) -> bool:
+        if requests is None:
+            return False
+        base_url = self._normalize_server_base_url(self._get_scraper_setting("server_api_base_url", ""))
+        return bool(base_url)
+
+    @staticmethod
+    def _price_sheet_numeric_value(value) -> float:
+        try:
+            return float(str(value or "").strip())
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _build_price_sheet_server_payload(self):
+        items = []
+        for row in sorted(self.price_sheet_rows, key=lambda item: item.get("Model", "").lower()):
+            model = str(row.get("Model") or "").strip()
+            if not model:
+                continue
+            items.append(
+                {
+                    "model": model,
+                    "buying_price": self._price_sheet_numeric_value(row.get("Buying Price")),
+                    "selling_price": self._price_sheet_numeric_value(row.get("Selling Price")),
+                    "backglass_repair": self._price_sheet_numeric_value(row.get("Backglass repair cost")),
+                    "screen_repair": self._price_sheet_numeric_value(row.get("Screen repair cost")),
+                    "battery_repair": self._price_sheet_numeric_value(row.get("Battery repair cost")),
+                    "camera_lens_repair": self._price_sheet_numeric_value(row.get("Camera lens repair cost")),
+                }
+            )
+        return {"items": items, "replace_missing": True}
+
+    def _sync_price_sheet_to_server(self):
+        if not self._server_api_is_configured():
+            return None, None
+
+        ctx, error = self._get_server_api_context()
+        if error:
+            return False, error
+
+        try:
+            response = requests.put(
+                f"{ctx['base_url']}/model-prices",
+                headers=ctx["headers"],
+                json=self._build_price_sheet_server_payload(),
+                timeout=(8, 45),
+            )
+            if response.status_code == 401:
+                raise RuntimeError("Unauthorized (check Server API Token).")
+            response.raise_for_status()
+            payload = response.json() if response.content else {}
+            count = self._safe_int(payload.get("count"), len(self.price_sheet_rows))
+            return True, f"Synced {count} price rows to the server."
+        except Exception as exc:
+            return False, f"Saved locally, but server price sync failed: {exc}"
+
+    def _set_server_listing_report_action(self, listing_id: str, action: str):
+        if not self._server_api_is_configured():
+            return None, None
+
+        ctx, error = self._get_server_api_context()
+        if error:
+            return False, error
+
+        listing_id_clean = str(listing_id or "").strip()
+        action_clean = str(action or "").strip().lower()
+        if not listing_id_clean or action_clean not in {"contacted", "dismissed", "purchased"}:
+            return False, "Invalid listing report action request."
+
+        try:
+            response = requests.post(
+                f"{ctx['base_url']}/listings/{quote(listing_id_clean, safe='')}/report-action",
+                headers=ctx["headers"],
+                json={"action": action_clean},
+                timeout=(8, 30),
+            )
+            if response.status_code == 401:
+                raise RuntimeError("Unauthorized (check Server API Token).")
+            response.raise_for_status()
+            payload = response.json() if response.content else {}
+            return True, payload.get("item") or {}
+        except Exception as exc:
+            return False, f"Failed to update VPS report action for {listing_id_clean}: {exc}"
+
+    def _set_selected_listing_report_action(self, action: str):
+        listing_ids = self._get_selected_listing_ids()
+        if not listing_ids:
+            messagebox.showwarning("No Selection", "Please select one or more listings first.")
+            return
+        if not self._server_api_is_configured():
+            messagebox.showwarning(
+                "VPS Report Actions",
+                "Configure Server API Base URL and Server API Token first to use VPS report actions.",
+            )
+            return
+
+        updated_count = 0
+        errors = []
+        for listing_id in listing_ids:
+            ok, detail = self._set_server_listing_report_action(listing_id, action)
+            if ok:
+                updated_count += 1
+            elif detail:
+                errors.append(str(detail))
+
+        if updated_count:
+            self.refresh_listings()
+            self.status_bar.config(text=f"Marked {updated_count} listing(s) as {action} on the VPS report")
+        if errors:
+            messagebox.showwarning(
+                "VPS Report Actions",
+                "\n".join(errors[:3]),
+            )
 
     def _show_vps_route_warnings(self, warnings, title: str = "VPS Scrapers"):
         warning_items = [str(item).strip() for item in (warnings or []) if str(item).strip()]
@@ -4550,7 +4673,10 @@ PY
         if price is not None:
             result = deal_tracker.mark_as_purchased(listing_id, price)
             if result.get("success"):
+                sync_ok, sync_detail = self._set_server_listing_report_action(listing_id, "purchased")
                 messagebox.showinfo("Success", f"Listing {listing_id} marked as purchased for ${price:.2f}")
+                if sync_ok is False and sync_detail:
+                    messagebox.showwarning("VPS Report Action", sync_detail)
                 self.refresh_listings()
                 self.refresh_deals()
             else:
@@ -4718,7 +4844,10 @@ PY
         if price is not None:
             result = deal_tracker.mark_as_purchased(listing_id, price)
             if result.get("success"):
+                sync_ok, sync_detail = self._set_server_listing_report_action(listing_id, "purchased")
                 messagebox.showinfo("Success", f"Listing {listing_id} marked as purchased for ${price:.2f}")
+                if sync_ok is False and sync_detail:
+                    messagebox.showwarning("VPS Report Action", sync_detail)
                 self.refresh_negotiation_listings()
                 self.refresh_deals()
             else:
@@ -7707,10 +7836,18 @@ PY
         updated = recalculate_listing_financials()
         deal_tracker.update_listing_conversion_scores()
         self.refresh_listings()
+        sync_ok, sync_message = self._sync_price_sheet_to_server()
+        info_message = (
+            f"Saved {len(self.price_sheet_rows)} rows.\nRecalculated {updated} listings."
+        )
+        if sync_ok:
+            info_message += f"\n{sync_message}"
         messagebox.showinfo(
             "Price Sheet Saved",
-            f"Saved {len(self.price_sheet_rows)} rows.\nRecalculated {updated} listings.",
+            info_message,
         )
+        if sync_ok is False and sync_message:
+            messagebox.showwarning("Server Price Sync", sync_message)
         self.status_bar.config(text=f"Saved price sheet and recalculated {updated} listings")
 
     def recalculate_all_listing_values(self):

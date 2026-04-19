@@ -762,6 +762,40 @@ class WorkerObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cycle_metrics["v4_update_event_claim_count"], 1)
         self.assertEqual(cycle_metrics["duplicate_listing_count"], 0)
 
+    async def test_process_listing_event_v4_suppression_still_touches_search_liveness(self) -> None:
+        cycle_metrics = _base_cycle_metrics()
+        redis_client = AsyncMock()
+        feature_flags = MagicMock()
+        metadata = {
+            "route_name": "iphone_broad",
+            "query_shard_key": "v4-family:1",
+            "source": "v4",
+            "discovery_ts": "2026-03-11T00:02:00+00:00",
+        }
+        listing = {"id": "listing-v4-suppressed", "model": "iPhone 15", "price": 810, "potential_profit": 80}
+
+        with (
+            patch.object(
+                worker,
+                "_resolve_v4_listing_dedupe",
+                AsyncMock(
+                    return_value=worker.V4ListingDedupeDecision(
+                        should_process=False,
+                        dedupe_kind="first_seen",
+                        discovery_ts="2026-03-11T00:02:00+00:00",
+                        first_seen_status="duplicate",
+                    )
+                ),
+            ),
+            patch.object(worker, "_touch_listing_search_seen", AsyncMock()) as touch_mock,
+            patch.object(worker, "emit_json_log") as emit_mock,
+        ):
+            await worker._process_listing_event(object(), redis_client, feature_flags, listing, metadata, cycle_metrics)
+
+        touch_mock.assert_awaited_once()
+        emit_mock.assert_called_once()
+        self.assertEqual(touch_mock.await_args.kwargs["listing_id"], "listing-v4-suppressed")
+
     async def test_process_listing_event_v4_dedupe_fail_open_preserves_publish_path(self) -> None:
         cycle_metrics = _base_cycle_metrics()
         redis_client = AsyncMock()

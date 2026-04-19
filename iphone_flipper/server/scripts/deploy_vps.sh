@@ -8,7 +8,7 @@ SERVER_DIR="${PROJECT_ROOT}/server"
 DEPLOY_SSH_TARGET="${DEPLOY_SSH_TARGET:-ubuntu@15.235.185.32}"
 DEPLOY_REMOTE_DIR="${DEPLOY_REMOTE_DIR:-/home/ubuntu/iphone-flipper-server/server}"
 DEPLOY_REMOTE_ROOT="${DEPLOY_REMOTE_ROOT:-$(dirname "${DEPLOY_REMOTE_DIR}")}"
-DEPLOY_SERVICES="${DEPLOY_SERVICES:-api notification_worker enrichment_worker worker worker_2 worker_3}"
+DEPLOY_SERVICES="${DEPLOY_SERVICES:-api notification_worker enrichment_worker worker worker_2 worker_3 lowball_report_worker}"
 DEPLOY_RUN_MIGRATIONS="${DEPLOY_RUN_MIGRATIONS:-1}"
 
 echo "[deploy] syncing server directory to ${DEPLOY_SSH_TARGET}:${DEPLOY_REMOTE_DIR}"

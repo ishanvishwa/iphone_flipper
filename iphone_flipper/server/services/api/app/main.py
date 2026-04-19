@@ -4,7 +4,7 @@ import os
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Mapping
 from urllib.parse import unquote, urlparse
 from uuid import uuid4
@@ -25,6 +25,12 @@ from server.services.common.v42_family_catalog import (
 from server.services.common.notification_dead_letter import (
     NOTIFICATION_DEAD_LETTER_STREAM_NAME,
     NotificationDeadLetterEvent,
+)
+from server.services.common.lowball_report import load_latest_report, mark_listing_report_action
+from server.services.common.model_prices import (
+    fetch_model_price_rows,
+    replace_model_prices,
+    seed_model_prices_from_csv_if_empty,
 )
 from server.services.common.observability import emit_json_log, monotonic_duration_ms, utc_now_iso
 from server.services.common.route_lanes import normalize_route_lane
@@ -51,6 +57,7 @@ PGPASSWORD = os.getenv("PGPASSWORD", "")
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
+MODEL_PRICES_CSV_PATH = os.getenv("MODEL_PRICES_CSV_PATH", "/app/price_list.csv").strip() or "/app/price_list.csv"
 try:
     WORKER_MIN_ENABLED_ROUTES_WARN = max(1, int(os.getenv("WORKER_MIN_ENABLED_ROUTES_WARN", "2")))
 except (TypeError, ValueError):
@@ -73,6 +80,10 @@ LISTING_SELECT_COLUMNS = """
     max_buy_price,
     potential_profit,
     status,
+    availability_status,
+    report_action_taken,
+    report_action_taken_at,
+    last_seen_in_search_at,
     source_seen_at,
     created_at,
     updated_at
@@ -204,6 +215,30 @@ class NotificationReplayRequest(BaseModel):
     limit: int = Field(default=100, ge=1, le=500)
     dry_run: bool = False
     listing_id: str | None = Field(default=None, max_length=255)
+
+
+class ModelPriceItemRequest(BaseModel):
+    model: str = Field(min_length=1, max_length=255)
+    buying_price: float = Field(ge=0)
+    selling_price: float = Field(ge=0)
+    backglass_repair: float = Field(default=0, ge=0)
+    screen_repair: float = Field(default=0, ge=0)
+    battery_repair: float = Field(default=0, ge=0)
+    camera_lens_repair: float = Field(default=0, ge=0)
+
+
+class ModelPricesUpdateRequest(BaseModel):
+    items: list[ModelPriceItemRequest] = Field(default_factory=list)
+    replace_missing: bool = True
+
+
+class LowballReportRunRequest(BaseModel):
+    dry_run: bool = False
+    send_telegram: bool = False
+
+
+class ListingReportActionRequest(BaseModel):
+    action: str = Field(min_length=1, max_length=32)
 
 
 class QueryVariantUpsertRequest(BaseModel):
@@ -955,6 +990,7 @@ async def startup() -> None:
         max_size=20,
     )
     await _ensure_worker_tables(app.state.db_pool)
+    seeded_prices = await seed_model_prices_from_csv_if_empty(app.state.db_pool, csv_path=MODEL_PRICES_CSV_PATH)
     app.state.redis = Redis(
         host=REDIS_HOST,
         port=REDIS_PORT,
@@ -975,6 +1011,13 @@ async def startup() -> None:
         runtime_config_hash_key=RUNTIME_CONFIG_HASH_KEY,
         runtime_config=await app.state.runtime_config.snapshot(),
     )
+    if seeded_prices > 0:
+        emit_json_log(
+            "model_prices_seeded_from_csv",
+            service="api",
+            csv_path=MODEL_PRICES_CSV_PATH,
+            row_count=seeded_prices,
+        )
     app.state.ws_manager = WebSocketConnectionManager()
     app.state.redis_listener_task = asyncio.create_task(_redis_listener())
 
@@ -1184,6 +1227,102 @@ async def update_runtime_config(
         "feature_flags": flags_snapshot,
         "runtime_config": runtime_snapshot,
     }
+
+
+@app.put("/model-prices")
+async def put_model_prices(
+    payload: ModelPricesUpdateRequest,
+    x_api_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    await _auth_rest(x_api_token)
+    items_payload = [jsonable_encoder(item) for item in payload.items]
+    async with app.state.db_pool.acquire() as conn:
+        async with conn.transaction():
+            stored_items = await replace_model_prices(
+                conn,
+                items_payload,
+                replace_missing=bool(payload.replace_missing),
+            )
+            rows = await fetch_model_price_rows(conn)
+    emit_json_log(
+        "model_prices_updated",
+        service="api",
+        replace_missing=bool(payload.replace_missing),
+        item_count=len(stored_items),
+    )
+    return {
+        "ok": True,
+        "count": len(rows),
+        "items": rows,
+    }
+
+
+@app.post("/ops/lowball-report/run")
+async def run_lowball_report(
+    payload: LowballReportRunRequest,
+    x_api_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    await _auth_rest(x_api_token)
+    from server.services.worker.lowball_report_worker import run_lowball_report_once
+
+    result = await run_lowball_report_once(
+        pool=app.state.db_pool,
+        run_source="manual",
+        send_telegram=bool(payload.send_telegram and not payload.dry_run),
+        dry_run=bool(payload.dry_run),
+    )
+    emit_json_log(
+        "lowball_report_run_requested",
+        service="api",
+        dry_run=bool(payload.dry_run),
+        send_telegram=bool(payload.send_telegram and not payload.dry_run),
+        listing_count=int(result.get("listing_count") or 0),
+        status=str(result.get("status") or ""),
+    )
+    return result
+
+
+@app.get("/ops/lowball-report/latest")
+async def get_latest_lowball_report(
+    x_api_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    await _auth_rest(x_api_token)
+    async with app.state.db_pool.acquire() as conn:
+        payload = await load_latest_report(conn)
+    return {"ok": True, "item": payload}
+
+
+@app.post("/listings/{listing_id}/report-action")
+async def set_listing_report_action(
+    listing_id: str,
+    payload: ListingReportActionRequest,
+    x_api_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    await _auth_rest(x_api_token)
+    listing_id_clean = listing_id.strip()
+    if not listing_id_clean:
+        raise HTTPException(status_code=400, detail="listing_id is required.")
+    try:
+        async with app.state.db_pool.acquire() as conn:
+            async with conn.transaction():
+                row = await mark_listing_report_action(
+                    conn,
+                    listing_id=listing_id_clean,
+                    action=payload.action,
+                )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if row is None:
+        raise HTTPException(status_code=404, detail="Listing not found.")
+    if hasattr(row.get("report_action_taken_at"), "isoformat"):
+        row["report_action_taken_at"] = row["report_action_taken_at"].isoformat()
+    emit_json_log(
+        "listing_report_action_updated",
+        service="api",
+        listing_id=listing_id_clean,
+        action=str(row.get("report_action_taken") or ""),
+    )
+    return {"ok": True, "item": row}
 
 
 @app.get("/ops/stream-backlog")
@@ -1412,7 +1551,10 @@ async def get_listings(
     listings: list[dict[str, Any]] = []
     max_seq_id = since_id
     for row in rows:
-        item = _serialize_datetimes(dict(row), ("source_seen_at", "created_at", "updated_at"))
+        item = _serialize_datetimes(
+            dict(row),
+            ("report_action_taken_at", "last_seen_in_search_at", "source_seen_at", "created_at", "updated_at"),
+        )
         max_seq_id = max(max_seq_id, int(item["seq_id"]))
         listings.append(item)
 

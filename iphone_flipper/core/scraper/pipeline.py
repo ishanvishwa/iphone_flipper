@@ -29,6 +29,8 @@ from .storage import mark_search_query_polled
 from .storage import save_listing
 from .storage import update_fb_account_runtime_status
 
+LOWBALL_CAPTURE_CEILING_PCT = 1.35
+
 
 def _extract_text_value(value: Any) -> str:
     """Extract a readable text value from nested GraphQL objects."""
@@ -125,6 +127,10 @@ def _store_listing_candidate(
         listed_price=price_value,
         fallback_purchase_price=max_offer,
     )
+    model_price_data = price_data.get(model) or {}
+    selling_price = float(model_price_data.get("selling_price") or 0)
+    if price_value is not None and selling_price > 0 and price_value > (selling_price * LOWBALL_CAPTURE_CEILING_PCT):
+        return None
 
     final_listing = {
         "id": listing_id,
@@ -205,4 +211,3 @@ async def scrape_marketplace(
         
     except Exception as e:
         print(f"Scraper pipeline failed: {e}")
-

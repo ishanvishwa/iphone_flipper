@@ -64,6 +64,10 @@ from server.services.common.observability import (  # noqa: E402
     timestamp_delta_ms,
     utc_now_iso,
 )
+from server.services.common.model_prices import (  # noqa: E402
+    load_model_price_lookup,
+    seed_model_prices_from_csv_if_empty,
+)
 from server.services.common.schema_ensure import ensure_worker_tables as ensure_common_worker_tables  # noqa: E402
 from server.services.common.stream_events import (  # noqa: E402
     LISTING_STREAM_MAXLEN,
@@ -178,6 +182,7 @@ REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
 WORKER_NAME = os.getenv("WORKER_NAME", "worker_1")
 SCRAPE_INTERVAL_SECONDS = max(1, int(os.getenv("SCRAPE_INTERVAL_SECONDS", "8")))
 WORKER_USER_DATA_DIR = os.getenv("WORKER_USER_DATA_DIR", "").strip() or None
+MODEL_PRICES_CSV_PATH = os.getenv("MODEL_PRICES_CSV_PATH", "/app/price_list.csv").strip() or "/app/price_list.csv"
 
 
 @dataclass(frozen=True)
@@ -1607,6 +1612,72 @@ def _parse_optional_timestamp(value: Any) -> datetime | None:
         return None
 
 
+def _prices_equal(left: Any, right: Any) -> bool:
+    if left is None and right is None:
+        return True
+    if left is None or right is None:
+        return False
+    try:
+        return abs(float(left) - float(right)) < 0.005
+    except (TypeError, ValueError):
+        return str(left) == str(right)
+
+
+async def _record_listing_price_history(
+    conn: asyncpg.Connection,
+    *,
+    listing_id: str,
+    observed_price: Any,
+    observed_at: datetime,
+    source_event_kind: str,
+    mutable_hash: str | None,
+    previous_price: Any,
+) -> None:
+    if observed_price is None or _prices_equal(previous_price, observed_price):
+        return
+    await conn.execute(
+        """
+        INSERT INTO listing_price_history (
+            listing_id,
+            observed_price,
+            observed_at,
+            source_event_kind,
+            mutable_hash
+        ) VALUES ($1, $2, $3, $4, $5)
+        """,
+        listing_id,
+        observed_price,
+        observed_at,
+        source_event_kind,
+        str(mutable_hash or "").strip() or None,
+    )
+
+
+async def _touch_listing_search_seen(
+    pool: asyncpg.Pool,
+    *,
+    listing_id: str | None,
+    seen_at: datetime,
+) -> None:
+    listing_id_value = str(listing_id or "").strip()
+    if not listing_id_value:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE listings
+            SET
+                availability_status = 'active',
+                last_seen_available_at = $2,
+                last_seen_in_search_at = $2,
+                consecutive_check_failures = 0
+            WHERE id = $1
+            """,
+            listing_id_value,
+            seen_at,
+        )
+
+
 def _listing_max_buy_price(listing: dict[str, Any]) -> Any:
     if "max_buy_price" in listing:
         return listing.get("max_buy_price")
@@ -1914,6 +1985,20 @@ def _current_bad_cycle_count(route_runtime_key: str, route: dict[str, Any]) -> i
 
 async def _ensure_worker_tables(pool: asyncpg.Pool) -> None:
     await ensure_common_worker_tables(pool=pool, include_triggers=False)
+
+
+async def _load_server_price_data(pool: asyncpg.Pool) -> dict[str, dict[str, float]]:
+    try:
+        return await load_model_price_lookup(pool)
+    except Exception as exc:
+        logging.warning("[%s] failed to load model_prices from Postgres: %s", WORKER_NAME, exc)
+        return {}
+
+
+async def _refresh_session_price_data(pool: asyncpg.Pool, session: Any) -> None:
+    price_data = await _load_server_price_data(pool)
+    if price_data:
+        session.price_data = price_data
 
 
 async def _load_worker_routes(pool: asyncpg.Pool) -> list[dict[str, Any]]:
@@ -3118,7 +3203,6 @@ async def _start_v4_lease_heartbeat_task(
 
 
 async def _open_v4_warm_session(pool: asyncpg.Pool, profile: dict[str, Any]) -> V4WarmSessionState:
-    _ = pool
     user_data_dir = str(profile.get("user_data_dir") or "").strip()
     dolphin_profile_id = str(profile.get("dolphin_profile_id") or "").strip() or None
     profile_label = _profile_display_label(profile)
@@ -3156,6 +3240,7 @@ async def _open_v4_warm_session(pool: asyncpg.Pool, profile: dict[str, Any]) -> 
         session = await open_profile_session(user_data_dir=user_data_dir, headless=WORKER_HEADLESS)
         runtime_identity = user_data_dir
 
+    await _refresh_session_price_data(pool, session)
     now_dt = datetime.now(timezone.utc)
     return V4WarmSessionState(
         profile=profile,
@@ -3364,6 +3449,7 @@ async def _run_v4_family_claim(
         observed_listing_ids: tuple[str, ...] = ()
         saved_listing_ids: tuple[str, ...] = ()
         try:
+            await _refresh_session_price_data(pool, warm_session.session)
             execution = await execute_family_claim(
                 warm_session.session,
                 progress_callback=_on_progress,
@@ -5458,6 +5544,7 @@ async def _upsert_listing(
                     max_buy_price,
                     potential_profit,
                     status,
+                    current_price,
                     enrichment_status,
                     enrichment_source_hash
                 FROM listings
@@ -5591,6 +5678,15 @@ async def _upsert_listing(
                 "listing_created" if created else "listing_updated"
             )
             persisted_at = datetime.now(timezone.utc)
+            await _record_listing_price_history(
+                conn,
+                listing_id=listing_id,
+                observed_price=listing.get("price"),
+                observed_at=source_seen_at,
+                source_event_kind=effective_event_name,
+                mutable_hash=mutable_hash,
+                previous_price=(existing_row.get("current_price") if existing_row is not None else None),
+            )
             await conn.execute(
                 """
                 UPDATE listings
@@ -5601,7 +5697,11 @@ async def _upsert_listing(
                     current_price = $4,
                     last_price_hash = COALESCE($5, listings.last_price_hash),
                     persisted_at = $6,
-                    last_event_kind = $7
+                    last_event_kind = $7,
+                    availability_status = 'active',
+                    last_seen_available_at = $3,
+                    last_seen_in_search_at = $3,
+                    consecutive_check_failures = 0
                 WHERE id = $1
                 """,
                 listing_id,
@@ -5704,6 +5804,11 @@ async def _process_listing_event(
         if dedupe_decision.mutable_hash:
             metadata["mutable_hash"] = dedupe_decision.mutable_hash
         if not dedupe_decision.should_process:
+            await _touch_listing_search_seen(
+                pool,
+                listing_id=listing_id,
+                seen_at=(_parse_optional_timestamp(listing_seen_ts) or datetime.now(timezone.utc)),
+            )
             emit_json_log(
                 "v4_listing_dedupe_suppressed",
                 listing_id=listing_id,
@@ -6812,6 +6917,9 @@ async def _main() -> None:
         max_size=10,
     )
     await _ensure_worker_tables(pool)
+    seeded_prices = await seed_model_prices_from_csv_if_empty(pool, csv_path=MODEL_PRICES_CSV_PATH)
+    if seeded_prices > 0:
+        logging.info("[%s] seeded %d model_prices row(s) from %s", WORKER_NAME, seeded_prices, MODEL_PRICES_CSV_PATH)
     redis_client = Redis(
         host=REDIS_HOST,
         port=REDIS_PORT,

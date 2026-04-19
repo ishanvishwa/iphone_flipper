@@ -405,6 +405,11 @@ class _FakePool:
         return _FakeAcquire(self._conn)
 
 
+class _MinimalConn:
+    def transaction(self) -> _FakeTransaction:
+        return _FakeTransaction()
+
+
 class _FakeRedis:
     def __init__(self) -> None:
         self.xadd = AsyncMock(return_value="1741604800000-0")
@@ -993,6 +998,114 @@ class ApiOpsTests(unittest.IsolatedAsyncioTestCase):
         api_main.app.state.redis.xadd.assert_awaited_once()
         self.assertEqual(payload["count"], 1)
         self.assertEqual(payload["items"][0]["listing_id"], "listing-replay")
+
+    async def test_put_model_prices_replaces_server_price_sheet(self) -> None:
+        api_main.app.state.db_pool = _FakePool(_MinimalConn())
+        stored_rows = [
+            {
+                "model": "iPhone 14 Pro 128GB",
+                "buying_price": 380.0,
+                "selling_price": 460.0,
+                "backglass_repair": 50.0,
+                "screen_repair": 180.0,
+                "battery_repair": 35.0,
+                "camera_lens_repair": 25.0,
+            }
+        ]
+
+        with (
+            patch.object(api_main, "API_TOKEN", "test-token"),
+            patch.object(api_main, "replace_model_prices", AsyncMock(return_value=stored_rows)) as replace_mock,
+            patch.object(api_main, "fetch_model_price_rows", AsyncMock(return_value=stored_rows)) as fetch_mock,
+            patch.object(api_main, "emit_json_log"),
+        ):
+            payload = await api_main.put_model_prices(
+                payload=api_main.ModelPricesUpdateRequest(
+                    items=[
+                        api_main.ModelPriceItemRequest(
+                            model="iPhone 14 Pro 128GB",
+                            buying_price=380,
+                            selling_price=460,
+                            backglass_repair=50,
+                            screen_repair=180,
+                            battery_repair=35,
+                            camera_lens_repair=25,
+                        )
+                    ]
+                ),
+                x_api_token="test-token",
+            )
+
+        replace_mock.assert_awaited_once()
+        fetch_mock.assert_awaited_once()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["items"][0]["model"], "iPhone 14 Pro 128GB")
+
+    async def test_run_lowball_report_endpoint_uses_worker_module(self) -> None:
+        api_main.app.state.db_pool = _FakePool(_MinimalConn())
+        from server.services.worker import lowball_report_worker as report_worker
+
+        with (
+            patch.object(api_main, "API_TOKEN", "test-token"),
+            patch.object(report_worker, "run_lowball_report_once", AsyncMock(return_value={"status": "dry_run", "listing_count": 2})) as run_mock,
+            patch.object(api_main, "emit_json_log"),
+        ):
+            payload = await api_main.run_lowball_report(
+                payload=api_main.LowballReportRunRequest(dry_run=True, send_telegram=True),
+                x_api_token="test-token",
+            )
+
+        run_mock.assert_awaited_once()
+        self.assertFalse(run_mock.await_args.kwargs["send_telegram"])
+        self.assertEqual(payload["status"], "dry_run")
+
+    async def test_get_latest_lowball_report_returns_latest_item(self) -> None:
+        api_main.app.state.db_pool = _FakePool(_MinimalConn())
+
+        with (
+            patch.object(api_main, "API_TOKEN", "test-token"),
+            patch.object(
+                api_main,
+                "load_latest_report",
+                AsyncMock(return_value={"report_date": "2026-04-19", "listing_count": 3}),
+            ) as latest_mock,
+        ):
+            payload = await api_main.get_latest_lowball_report(x_api_token="test-token")
+
+        latest_mock.assert_awaited_once()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["item"]["listing_count"], 3)
+
+    async def test_set_listing_report_action_updates_listing(self) -> None:
+        api_main.app.state.db_pool = _FakePool(_MinimalConn())
+        action_time = datetime(2026, 4, 19, 6, 0, tzinfo=timezone.utc)
+
+        with (
+            patch.object(api_main, "API_TOKEN", "test-token"),
+            patch.object(
+                api_main,
+                "mark_listing_report_action",
+                AsyncMock(
+                    return_value={
+                        "id": "listing-1",
+                        "report_action_taken": "contacted",
+                        "report_action_taken_at": action_time,
+                    }
+                ),
+            ) as action_mock,
+            patch.object(api_main, "emit_json_log"),
+        ):
+            payload = await api_main.set_listing_report_action(
+                listing_id="listing-1",
+                payload=api_main.ListingReportActionRequest(action="contacted"),
+                x_api_token="test-token",
+            )
+
+        action_mock.assert_awaited_once()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["item"]["report_action_taken"], "contacted")
+        self.assertEqual(payload["item"]["report_action_taken_at"], action_time.isoformat())
 
 
 if __name__ == "__main__":
