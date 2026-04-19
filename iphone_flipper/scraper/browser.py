@@ -282,6 +282,24 @@ def _build_dolphin_ws_endpoint(automation: Dict[str, Any], profile_id: str, *, s
     return f"ws://{DOLPHIN_WS_HOST}:{port}{ws_path}"
 
 
+def _is_dolphin_duplicate_start_error(payload: Dict[str, Any] | None) -> bool:
+    data = payload or {}
+    error_obj = data.get("errorObject") or {}
+    error_code = str(error_obj.get("code") or "").strip().upper()
+    if error_code == "E_BROWSER_RUN_DUPLICATE":
+        return True
+    details_text = " ".join(
+        str(token or "")
+        for token in (
+            data.get("error"),
+            error_obj.get("text"),
+            error_obj.get("message"),
+            error_obj.get("name"),
+        )
+    ).lower()
+    return "already running" in details_text and "profile" in details_text
+
+
 async def _fetch_active_dolphin_ws_endpoint(session: aiohttp.ClientSession, profile_id: str) -> str | None:
     try:
         async with session.get(f"{DOLPHIN_API_URL}/browser_profiles/{profile_id}/active") as resp:
@@ -317,8 +335,7 @@ async def _start_or_reuse_dolphin_profile(session: aiohttp.ClientSession, profil
             launch_mode="fresh_start",
         ), "fresh_start"
 
-    error_obj = data.get("errorObject") or {}
-    if error_obj.get("code") == "E_BROWSER_RUN_DUPLICATE":
+    if _is_dolphin_duplicate_start_error(data):
         logger.info("Dolphin profile %s already running, attempting to reuse active session...", profile_id)
         active_ws_endpoint = await _fetch_active_dolphin_ws_endpoint(session, profile_id)
         if active_ws_endpoint:
@@ -368,21 +385,45 @@ async def _wait_for_dolphin_profile_inactive(session: aiohttp.ClientSession, pro
 async def _hard_recycle_dolphin_profile(session: aiohttp.ClientSession, profile_id: str) -> str:
     logger.info("Dolphin profile %s performing hard recycle before reconnect...", profile_id)
     await _stop_dolphin_profile_with_session(session, profile_id)
-    await _wait_for_dolphin_profile_inactive(session, profile_id)
-    async with session.get(f"{DOLPHIN_API_URL}/browser_profiles/{profile_id}/start?automation=1") as resp:
-        data = await resp.json()
-    if not data.get("success") or not data.get("automation"):
+    try:
+        await _wait_for_dolphin_profile_inactive(session, profile_id)
+    except BrowserLaunchError as exc:
+        logger.warning("Dolphin profile %s inactive wait fell through during recycle: %s", profile_id, exc)
+
+    start_attempts = max(2, int(max(DOLPHIN_STOP_WAIT_TIMEOUT_SECONDS, DOLPHIN_STOP_WAIT_POLL_SECONDS) // DOLPHIN_STOP_WAIT_POLL_SECONDS))
+    last_payload: Dict[str, Any] = {}
+    for attempt in range(1, start_attempts + 1):
+        async with session.get(f"{DOLPHIN_API_URL}/browser_profiles/{profile_id}/start?automation=1") as resp:
+            data = await resp.json()
+        last_payload = data
+        if data.get("success") and data.get("automation"):
+            return _build_dolphin_ws_endpoint(
+                data["automation"],
+                profile_id,
+                stage="start",
+                launch_mode="recycled_start",
+            )
+        if _is_dolphin_duplicate_start_error(data) and attempt < start_attempts:
+            logger.info(
+                "Dolphin profile %s still reports duplicate after recycle; retrying start in %.1fs (%d/%d)",
+                profile_id,
+                DOLPHIN_STOP_WAIT_POLL_SECONDS,
+                attempt,
+                start_attempts,
+            )
+            await asyncio.sleep(DOLPHIN_STOP_WAIT_POLL_SECONDS)
+            continue
         raise BrowserLaunchError(
             f"Failed to restart Dolphin profile {profile_id}: {data}",
             failure_stage="start",
             launch_mode="recycled_start",
             details={"dolphin_profile_id": str(profile_id)},
         )
-    return _build_dolphin_ws_endpoint(
-        data["automation"],
-        profile_id,
-        stage="start",
+    raise BrowserLaunchError(
+        f"Failed to restart Dolphin profile {profile_id}: {last_payload}",
+        failure_stage="start",
         launch_mode="recycled_start",
+        details={"dolphin_profile_id": str(profile_id)},
     )
 
 

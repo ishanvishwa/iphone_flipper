@@ -61,6 +61,32 @@ class _FakeClientSession:
         return None
 
 
+class _FakeJsonResponse:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self._payload = payload
+
+    async def __aenter__(self) -> "_FakeJsonResponse":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    async def json(self) -> dict[str, object]:
+        return dict(self._payload)
+
+
+class _SequencedSession:
+    def __init__(self, payloads: list[dict[str, object]]) -> None:
+        self._payloads = list(payloads)
+        self.urls: list[str] = []
+
+    def get(self, url: str) -> _FakeJsonResponse:
+        self.urls.append(url)
+        if not self._payloads:
+            raise AssertionError(f"Unexpected GET call for {url}")
+        return _FakeJsonResponse(self._payloads.pop(0))
+
+
 @unittest.skipIf(browser is None, "Scraper browser dependencies are not installed.")
 class ScraperBrowserTests(unittest.IsolatedAsyncioTestCase):
     async def test_connect_dolphin_browser_retries_before_success(self) -> None:
@@ -166,6 +192,36 @@ class ScraperBrowserTests(unittest.IsolatedAsyncioTestCase):
         recycle_mock.assert_awaited_once()
         connect_mock.assert_awaited_once()
         cleanup_mock.assert_awaited_once()
+
+    async def test_hard_recycle_retries_duplicate_restart_until_dolphin_clears_running_state(self) -> None:
+        session = _SequencedSession(
+            [
+                {
+                    "error": "Profile ID 123 already running",
+                    "errorObject": {
+                        "text": "Profile ID 123 already running",
+                        "code": "E_BROWSER_RUN_DUPLICATE",
+                    },
+                },
+                {
+                    "success": True,
+                    "automation": {"port": 9222, "wsEndpoint": "/devtools/browser/abc"},
+                },
+            ]
+        )
+
+        with (
+            patch.object(browser, "_stop_dolphin_profile_with_session", AsyncMock()) as stop_mock,
+            patch.object(browser, "_wait_for_dolphin_profile_inactive", AsyncMock()),
+            patch.object(browser.asyncio, "sleep", AsyncMock()) as sleep_mock,
+            patch.object(browser, "DOLPHIN_WS_HOST", "127.0.0.1"),
+        ):
+            ws_endpoint = await browser._hard_recycle_dolphin_profile(session, "123")
+
+        self.assertEqual(ws_endpoint, "ws://127.0.0.1:9222/devtools/browser/abc")
+        stop_mock.assert_awaited_once()
+        sleep_mock.assert_awaited_once_with(browser.DOLPHIN_STOP_WAIT_POLL_SECONDS)
+        self.assertEqual(len(session.urls), 2)
 
 
 if __name__ == "__main__":
