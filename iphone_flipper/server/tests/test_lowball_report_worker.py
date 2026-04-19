@@ -68,15 +68,18 @@ def _candidate(listing_id: str, *, verification_required: bool = False) -> Lowba
 class LowballReportWorkerTests(unittest.IsolatedAsyncioTestCase):
     def test_next_scheduled_run_at_handles_perth_cutoff(self) -> None:
         before_cutoff = datetime(2026, 4, 18, 21, 30, tzinfo=timezone.utc)
-        due_now = datetime(2026, 4, 18, 22, 30, tzinfo=timezone.utc)
+        within_grace = datetime(2026, 4, 18, 22, 3, tzinfo=timezone.utc)
+        after_grace = datetime(2026, 4, 18, 22, 30, tzinfo=timezone.utc)
 
         today_target = lowball_report_worker.next_scheduled_run_at(before_cutoff, report_sent_today=False)
-        immediate_target = lowball_report_worker.next_scheduled_run_at(due_now, report_sent_today=False)
-        tomorrow_target = lowball_report_worker.next_scheduled_run_at(due_now, report_sent_today=True)
+        immediate_target = lowball_report_worker.next_scheduled_run_at(within_grace, report_sent_today=False)
+        tomorrow_target = lowball_report_worker.next_scheduled_run_at(after_grace, report_sent_today=False)
+        sent_tomorrow_target = lowball_report_worker.next_scheduled_run_at(after_grace, report_sent_today=True)
 
         self.assertEqual(today_target, datetime(2026, 4, 18, 22, 0, tzinfo=timezone.utc))
-        self.assertEqual(immediate_target, due_now)
+        self.assertEqual(immediate_target, within_grace)
         self.assertEqual(tomorrow_target, datetime(2026, 4, 19, 22, 0, tzinfo=timezone.utc))
+        self.assertEqual(sent_tomorrow_target, datetime(2026, 4, 19, 22, 0, tzinfo=timezone.utc))
 
     async def test_select_report_entries_backfills_after_removed_listing(self) -> None:
         candidates = [

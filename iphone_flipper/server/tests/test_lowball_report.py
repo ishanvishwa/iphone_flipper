@@ -180,6 +180,27 @@ class LowballReportScoringTests(unittest.TestCase):
                 "last_zone_shown": None,
                 "report_action_taken": None,
             },
+            {
+                "id": "listing-too-old",
+                "title": "iPhone 12 Too Old",
+                "url": "https://example.com/too-old",
+                "model": "iPhone 12 128GB",
+                "condition": "Good",
+                "current_price": 330,
+                "max_buy_price": 300,
+                "selling_price": 360,
+                "availability_status": "active",
+                "last_seen_in_search_at": _iso(recent_search_seen),
+                "consecutive_check_failures": 0,
+                "first_seen_at": _iso(now - timedelta(days=41)),
+                "created_at": _iso(now - timedelta(days=41)),
+                "last_seen_at": _iso(recent_search_seen),
+                "last_shown_in_report_at": None,
+                "price_when_last_shown": None,
+                "last_staleness_bracket_shown": 0,
+                "last_zone_shown": None,
+                "report_action_taken": None,
+            },
         ]
 
         history_by_listing = {
@@ -207,6 +228,7 @@ class LowballReportScoringTests(unittest.TestCase):
         self.assertIn("listing-zone-change", ids)
         self.assertIn("listing-big-drop", ids)
         self.assertIn("listing-premium", ids)
+        self.assertNotIn("listing-too-old", ids)
         self.assertNotIn("listing-contacted-no-drop", ids)
 
         by_id = {candidate.listing_id: candidate for candidate in candidates}

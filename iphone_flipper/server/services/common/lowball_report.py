@@ -33,6 +33,7 @@ class LowballReportConfig:
     min_profit_retention_pct: float = 0.50
     scam_floor_pct: float = 0.70
     capture_ceiling_pct: float = 1.35
+    max_listing_age_days: int = 40
     staleness_ramp_days: int = 30
     staleness_clamp_days: int = 30
     staleness_milestones: tuple[int, ...] = (7, 14, 30)
@@ -379,6 +380,8 @@ def build_scored_candidates(
             continue
 
         days_since_first_seen = _days_since(first_seen_at, current_time)
+        if days_since_first_seen > effective_config.max_listing_age_days:
+            continue
         if zone == ZONE_SWEET and days_since_first_seen < effective_config.sweet_min_days:
             continue
         if zone == ZONE_PREMIUM and days_since_first_seen < effective_config.premium_min_days:

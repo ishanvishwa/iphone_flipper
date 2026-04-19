@@ -29,7 +29,6 @@ from server.services.common.lowball_report import (
 from server.services.common.model_prices import seed_model_prices_from_csv_if_empty
 from server.services.common.observability import emit_json_log
 from server.services.common.schema_ensure import ensure_worker_tables as ensure_common_worker_tables
-from server.services.worker.lease_manager import claim_next_profile, release_profile_lease
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +55,10 @@ LOWBALL_REPORT_VERIFICATION_TIMEOUT_MS = max(
 LOWBALL_REPORT_IDLE_POLL_SECONDS = max(
     15,
     int(os.getenv("LOWBALL_REPORT_IDLE_POLL_SECONDS", "60") or 60),
+)
+LOWBALL_REPORT_START_GRACE_SECONDS = max(
+    0,
+    int(os.getenv("LOWBALL_REPORT_START_GRACE_SECONDS", "300") or 300),
 )
 LOWBALL_REPORT_HEADLESS = str(os.getenv("WORKER_HEADLESS", "1")).strip().lower() not in {
     "0",
@@ -209,7 +212,10 @@ def next_scheduled_run_at(now: datetime, *, report_sent_today: bool) -> datetime
         return today_target.astimezone(timezone.utc)
     if report_sent_today:
         return report_scheduled_at(current.date() + timedelta(days=1)).astimezone(timezone.utc)
-    return current.astimezone(timezone.utc)
+    delay_seconds = max(0.0, (current - today_target).total_seconds())
+    if delay_seconds <= float(LOWBALL_REPORT_START_GRACE_SECONDS):
+        return current.astimezone(timezone.utc)
+    return report_scheduled_at(current.date() + timedelta(days=1)).astimezone(timezone.utc)
 
 
 async def seconds_until_next_scheduled_run(
@@ -253,6 +259,8 @@ class AvailabilityVerifier:
 
         if profile is not None:
             try:
+                from server.services.worker.lease_manager import release_profile_lease
+
                 await release_profile_lease(
                     self._pool,
                     profile_id=int(profile.get("profile_id") or 0) or None,
@@ -264,6 +272,8 @@ class AvailabilityVerifier:
     async def _ensure_session(self) -> Any | None:
         if self._session is not None:
             return self._session
+
+        from server.services.worker.lease_manager import claim_next_profile, release_profile_lease
 
         profile = await claim_next_profile(
             self._pool,
@@ -401,10 +411,23 @@ async def select_report_entries(
     *,
     config: LowballReportConfig | None = None,
     verifier: Callable[[LowballCandidate], Awaitable[VerificationResult]] | None = None,
+    verify_candidates: bool = True,
     now: datetime | None = None,
 ) -> list[LowballCandidate]:
     effective_config = config or LowballReportConfig()
     final_entries: list[LowballCandidate] = []
+
+    if not verify_candidates:
+        for candidate in candidates[: effective_config.report_size]:
+            if candidate.verification_required:
+                candidate.verification_required = False
+                candidate.verification_status = VERIFICATION_UNVERIFIED
+                candidate.verification_warning = "\u26a0 unverified - check before messaging"
+            else:
+                candidate.verification_status = VERIFICATION_CONFIRMED
+                candidate.verification_warning = None
+            final_entries.append(candidate)
+        return final_entries
 
     async def _finalize(
         verify_candidate: Callable[[LowballCandidate], Awaitable[VerificationResult]],
@@ -444,6 +467,7 @@ async def run_lowball_report_once(
     run_source: str,
     send_telegram: bool,
     dry_run: bool,
+    verify_candidates: bool = True,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     started_at = _now_utc(now)
@@ -479,6 +503,7 @@ async def run_lowball_report_once(
         pool,
         candidates,
         config=effective_config,
+        verify_candidates=verify_candidates,
         now=started_at,
     )
     report_text = build_report_message(report_date, selected_entries)

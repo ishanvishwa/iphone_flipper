@@ -1270,6 +1270,7 @@ async def run_lowball_report(
         run_source="manual",
         send_telegram=bool(payload.send_telegram and not payload.dry_run),
         dry_run=bool(payload.dry_run),
+        verify_candidates=False,
     )
     emit_json_log(
         "lowball_report_run_requested",

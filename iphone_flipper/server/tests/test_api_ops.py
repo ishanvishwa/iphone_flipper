@@ -1058,6 +1058,7 @@ class ApiOpsTests(unittest.IsolatedAsyncioTestCase):
 
         run_mock.assert_awaited_once()
         self.assertFalse(run_mock.await_args.kwargs["send_telegram"])
+        self.assertFalse(run_mock.await_args.kwargs["verify_candidates"])
         self.assertEqual(payload["status"], "dry_run")
 
     async def test_get_latest_lowball_report_returns_latest_item(self) -> None:
