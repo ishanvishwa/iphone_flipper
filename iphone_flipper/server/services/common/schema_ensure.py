@@ -1236,6 +1236,12 @@ async def ensure_worker_tables(pool: asyncpg.Pool, include_triggers: bool = Fals
             """
         )
         await conn.execute(
+            "ALTER TABLE query_families ADD COLUMN IF NOT EXISTS consecutive_stale INTEGER NOT NULL DEFAULT 0;"
+        )
+        await conn.execute(
+            "ALTER TABLE query_families ADD COLUMN IF NOT EXISTS last_cache_bust_at TIMESTAMPTZ;"
+        )
+        await conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_query_families_claim
             ON query_families (

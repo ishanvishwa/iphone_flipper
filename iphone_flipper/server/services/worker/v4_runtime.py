@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Sequence
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from server.services.worker.runtime import ErrorCategory, classify_error
 
@@ -59,6 +60,63 @@ def next_pause_seconds(
     if maximum <= minimum:
         return minimum
     return float(rng.uniform(minimum, maximum))
+
+
+def build_marketplace_search_url(query: str) -> str:
+    query_text = str(query or "").strip()
+    if query_text.lower().startswith(("http://", "https://")):
+        return query_text
+    encoded_query = quote(query_text, safe="")
+    return (
+        "https://www.facebook.com/marketplace/perth/search?"
+        f"query={encoded_query}&exact=false&sortBy=creation_time_descend"
+    )
+
+
+def build_cache_busted_search_urls(
+    *,
+    search_queries: Sequence[str] | None,
+    search_urls: Sequence[str] | None,
+    cache_bust_token: str,
+    cache_bust_param: str = "__cb",
+) -> list[str]:
+    token = str(cache_bust_token or "").strip()
+    param_name = str(cache_bust_param or "").strip() or "__cb"
+    if not token:
+        return []
+
+    provided_queries = [str(item or "").strip() for item in (search_queries or ())]
+    provided_urls = [str(item or "").strip() for item in (search_urls or ())]
+    target_count = max(len(provided_queries), len(provided_urls))
+    if target_count <= 0:
+        return []
+
+    busted_urls: list[str] = []
+    for index in range(target_count):
+        query_text = provided_queries[index] if index < len(provided_queries) else ""
+        base_url = provided_urls[index] if index < len(provided_urls) else ""
+        navigation_url = base_url or build_marketplace_search_url(query_text)
+        if not navigation_url:
+            continue
+        split_url = urlsplit(navigation_url)
+        query_items = [
+            (key, value)
+            for key, value in parse_qsl(split_url.query, keep_blank_values=True)
+            if key != param_name
+        ]
+        query_items.append((param_name, f"{token}-{index + 1}"))
+        busted_urls.append(
+            urlunsplit(
+                (
+                    split_url.scheme,
+                    split_url.netloc,
+                    split_url.path,
+                    urlencode(query_items, doseq=True),
+                    split_url.fragment,
+                )
+            )
+        )
+    return busted_urls
 
 
 def evaluate_warm_session_state(
@@ -151,6 +209,7 @@ def next_family_due_seconds(
     outcome: FamilyClaimOutcome,
     listings_saved: int,
     consecutive_hits: int,
+    consecutive_stale: int,
     consecutive_empty: int,
     consecutive_failures: int = 0,
     dom_backoff_seconds: int = 300,
@@ -169,7 +228,7 @@ def next_family_due_seconds(
         _ = listings_saved
         return min_gap
     if outcome == FamilyClaimOutcome.STALE_FEED:
-        streak = max(1, int(consecutive_empty or 1))
+        streak = max(1, int(consecutive_stale or 1))
         return min(max_gap, max(min_gap, safe_min_gap * (2 ** min(streak, 4))))
     if outcome == FamilyClaimOutcome.EMPTY_FEED:
         streak = max(1, int(consecutive_empty or 1))

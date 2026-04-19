@@ -4,9 +4,11 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 from server.services.worker.v4_runtime import (
     FamilyClaimOutcome,
+    build_cache_busted_search_urls,
     classify_family_claim,
     evaluate_warm_session_state,
     family_claim_succeeded,
@@ -177,6 +179,7 @@ class V4RuntimeTests(unittest.TestCase):
                 outcome=FamilyClaimOutcome.MATCHES,
                 listings_saved=3,
                 consecutive_hits=4,
+                consecutive_stale=0,
                 consecutive_empty=0,
             ),
             5,
@@ -187,6 +190,7 @@ class V4RuntimeTests(unittest.TestCase):
                 outcome=FamilyClaimOutcome.STALE_FEED,
                 listings_saved=0,
                 consecutive_hits=0,
+                consecutive_stale=3,
                 consecutive_empty=3,
             ),
             40,
@@ -197,6 +201,7 @@ class V4RuntimeTests(unittest.TestCase):
                 outcome=FamilyClaimOutcome.EMPTY_FEED,
                 listings_saved=0,
                 consecutive_hits=0,
+                consecutive_stale=0,
                 consecutive_empty=3,
             ),
             20,
@@ -207,6 +212,7 @@ class V4RuntimeTests(unittest.TestCase):
                 outcome=FamilyClaimOutcome.DOM_CHANGED,
                 listings_saved=0,
                 consecutive_hits=0,
+                consecutive_stale=0,
                 consecutive_empty=0,
                 dom_backoff_seconds=300,
             ),
@@ -260,6 +266,37 @@ class V4RuntimeTests(unittest.TestCase):
         self.assertTrue(worker_rollout_enabled("worker", allowlist))
         self.assertTrue(worker_rollout_enabled("worker_2", allowlist))
         self.assertTrue(worker_rollout_enabled("worker_3", allowlist))
+
+    def test_build_cache_busted_search_urls_replaces_existing_nonce_and_preserves_query(self) -> None:
+        urls = build_cache_busted_search_urls(
+            search_queries=("iPhone 15 Pro",),
+            search_urls=(
+                "https://www.facebook.com/marketplace/perth/search?"
+                "query=iPhone%2015%20Pro&sortBy=creation_time_descend&__cb=old",
+            ),
+            cache_bust_token="v43-token",
+        )
+
+        self.assertEqual(len(urls), 1)
+        query = parse_qs(urlsplit(urls[0]).query)
+        self.assertEqual(query["query"], ["iPhone 15 Pro"])
+        self.assertEqual(query["sortBy"], ["creation_time_descend"])
+        self.assertEqual(query["__cb"], ["v43-token-1"])
+
+    def test_build_cache_busted_search_urls_builds_marketplace_urls_when_only_queries_are_provided(self) -> None:
+        urls = build_cache_busted_search_urls(
+            search_queries=("iPhone 15 Pro", "iPhone 16 Pro"),
+            search_urls=None,
+            cache_bust_token="v43-token",
+        )
+
+        self.assertEqual(len(urls), 2)
+        first_query = parse_qs(urlsplit(urls[0]).query)
+        second_query = parse_qs(urlsplit(urls[1]).query)
+        self.assertEqual(first_query["query"], ["iPhone 15 Pro"])
+        self.assertEqual(first_query["__cb"], ["v43-token-1"])
+        self.assertEqual(second_query["query"], ["iPhone 16 Pro"])
+        self.assertEqual(second_query["__cb"], ["v43-token-2"])
 
 
 if __name__ == "__main__":

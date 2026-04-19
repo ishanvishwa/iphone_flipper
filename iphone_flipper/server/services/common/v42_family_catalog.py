@@ -35,7 +35,7 @@ V42_FAMILY_PRESETS: tuple[QueryFamilyPreset, ...] = (
         lane="hot",
         priority=300,
         min_gap_s=5,
-        max_gap_s=5,
+        max_gap_s=60,
         variants=(
             QueryVariantPreset(
                 query_text="iPhone",

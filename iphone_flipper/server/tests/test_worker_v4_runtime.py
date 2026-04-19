@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import os
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -26,6 +26,76 @@ class WorkerV4RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         with contextlib.suppress(Exception):
             worker._worker_shutdown_event().clear()
+
+    def _warm_session(self) -> worker.V4WarmSessionState:
+        return worker.V4WarmSessionState(
+            profile={
+                "profile_id": 3,
+                "user_data_dir": "/profiles/3",
+                "dolphin_profile_id": "746386753",
+                "dolphin_profile_name": "Profile 3",
+            },
+            profile_lease_token="lease-3",
+            runtime_identity="/profiles/3",
+            session=object(),
+            started_at=datetime(2026, 3, 11, tzinfo=timezone.utc),
+            last_activity_at=datetime(2026, 3, 11, tzinfo=timezone.utc),
+        )
+
+    @staticmethod
+    def _query_diagnostics(
+        *,
+        final_url: str,
+        feed_present: bool = True,
+        empty_state_detected: bool = False,
+    ) -> list[dict[str, object]]:
+        return [
+            {
+                "final_url": final_url,
+                "feed_present": feed_present,
+                "empty_state_detected": empty_state_detected,
+            }
+        ]
+
+    async def _emit_attempt(
+        self,
+        progress_callback,
+        *,
+        scraped: int,
+        saved: int = 0,
+        final_url: str = "https://www.facebook.com/marketplace/perth/search?query=iPhone",
+        feed_present: bool = True,
+        empty_state_detected: bool = False,
+    ) -> SimpleNamespace:
+        progress_callback({"event": "query_start"})
+        progress_callback(
+            {
+                "event": "query_result",
+                "found": scraped,
+                "page_cards": scraped,
+                "final_url": final_url,
+                "feed_present": feed_present,
+                "empty_state_detected": empty_state_detected,
+            }
+        )
+        for index in range(saved):
+            progress_callback(
+                {
+                    "event": "listing_saved",
+                    "listing": {"id": f"listing-{index}", "estimated_profit_aud": 250},
+                    "query": "iPhone",
+                    "query_index": 1,
+                    "query_total": 1,
+                    "discovery_ts": "2026-03-11T00:00:00+00:00",
+                }
+            )
+        return SimpleNamespace(
+            query_diagnostics=self._query_diagnostics(
+                final_url=final_url,
+                feed_present=feed_present,
+                empty_state_detected=empty_state_detected,
+            )
+        )
 
     async def test_close_v4_warm_session_releases_leases_even_if_browser_close_fails(self) -> None:
         warm_session = worker.V4WarmSessionState(
@@ -284,19 +354,7 @@ class WorkerV4RuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_run_v4_family_claim_reports_active_variant_query_in_heartbeat(self) -> None:
-        warm_session = worker.V4WarmSessionState(
-            profile={
-                "profile_id": 3,
-                "user_data_dir": "/profiles/3",
-                "dolphin_profile_id": "746386753",
-                "dolphin_profile_name": "Profile 3",
-            },
-            profile_lease_token="lease-3",
-            runtime_identity="/profiles/3",
-            session=object(),
-            started_at=datetime(2026, 3, 11, tzinfo=timezone.utc),
-            last_activity_at=datetime(2026, 3, 11, tzinfo=timezone.utc),
-        )
+        warm_session = self._warm_session()
 
         with (
             patch.object(
@@ -320,6 +378,147 @@ class WorkerV4RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first_route["source"], "v4")
         self.assertEqual(first_route["search_queries"], "iPhone")
         self.assertEqual(first_route["dolphin_profile_name"], "Profile 3")
+
+    async def test_run_v4_family_claim_does_not_cache_bust_before_threshold(self) -> None:
+        async def execute_once(*args, **kwargs):
+            return await self._emit_attempt(kwargs["progress_callback"], scraped=72)
+
+        with (
+            patch.object(worker, "execute_family_claim", AsyncMock(side_effect=execute_once)) as execute_claim,
+            patch.object(worker, "_record_scrape_events", AsyncMock()),
+            patch.object(worker, "_upsert_worker_heartbeat", AsyncMock()),
+            patch.object(worker, "_cleanup_old_scrape_events", AsyncMock()),
+        ):
+            claim_result = await worker._run_v4_family_claim(
+                pool=object(),
+                redis_client=object(),
+                feature_flags=None,
+                warm_session=self._warm_session(),
+                family={"family_id": 70, "name": "iphone_broad", "consecutive_stale": 1},
+                variant={"variant_id": 440, "query_text": "iPhone"},
+            )
+
+        self.assertEqual(execute_claim.await_count, 1)
+        self.assertEqual(claim_result.outcome, worker.FamilyClaimOutcome.STALE_FEED)
+        self.assertFalse(claim_result.cache_bust_attempted)
+
+    async def test_run_v4_family_claim_cache_busts_on_third_stale_outcome(self) -> None:
+        attempts = 0
+
+        async def execute_threshold(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            self.assertEqual(kwargs["search_queries"], ["iPhone"])
+            if attempts == 1:
+                self.assertEqual(kwargs["search_urls"], [])
+                return await self._emit_attempt(kwargs["progress_callback"], scraped=72)
+            self.assertEqual(len(kwargs["search_urls"]), 1)
+            self.assertIn("__cb=", kwargs["search_urls"][0])
+            return await self._emit_attempt(kwargs["progress_callback"], scraped=72)
+
+        with (
+            patch.object(worker, "execute_family_claim", AsyncMock(side_effect=execute_threshold)) as execute_claim,
+            patch.object(worker, "_record_scrape_events", AsyncMock()),
+            patch.object(worker, "_upsert_worker_heartbeat", AsyncMock()),
+            patch.object(worker, "_cleanup_old_scrape_events", AsyncMock()),
+        ):
+            claim_result = await worker._run_v4_family_claim(
+                pool=object(),
+                redis_client=object(),
+                feature_flags=None,
+                warm_session=self._warm_session(),
+                family={"family_id": 70, "name": "iphone_broad", "consecutive_stale": 2},
+                variant={"variant_id": 440, "query_text": "iPhone"},
+            )
+
+        self.assertEqual(execute_claim.await_count, 2)
+        self.assertEqual(claim_result.outcome, worker.FamilyClaimOutcome.STALE_FEED)
+        self.assertTrue(claim_result.cache_bust_attempted)
+
+    async def test_run_v4_family_claim_skips_cache_bust_when_scraped_count_is_too_low(self) -> None:
+        async def execute_once(*args, **kwargs):
+            return await self._emit_attempt(kwargs["progress_callback"], scraped=12)
+
+        with (
+            patch.object(worker, "execute_family_claim", AsyncMock(side_effect=execute_once)) as execute_claim,
+            patch.object(worker, "_record_scrape_events", AsyncMock()),
+            patch.object(worker, "_upsert_worker_heartbeat", AsyncMock()),
+            patch.object(worker, "_cleanup_old_scrape_events", AsyncMock()),
+        ):
+            claim_result = await worker._run_v4_family_claim(
+                pool=object(),
+                redis_client=object(),
+                feature_flags=None,
+                warm_session=self._warm_session(),
+                family={"family_id": 70, "name": "iphone_broad", "consecutive_stale": 2},
+                variant={"variant_id": 440, "query_text": "iPhone"},
+            )
+
+        self.assertEqual(execute_claim.await_count, 1)
+        self.assertEqual(claim_result.outcome, worker.FamilyClaimOutcome.STALE_FEED)
+        self.assertFalse(claim_result.cache_bust_attempted)
+
+    async def test_run_v4_family_claim_skips_cache_bust_during_cooldown(self) -> None:
+        async def execute_once(*args, **kwargs):
+            return await self._emit_attempt(kwargs["progress_callback"], scraped=72)
+
+        family = {
+            "family_id": 70,
+            "name": "iphone_broad",
+            "consecutive_stale": 2,
+            "last_cache_bust_at": datetime.now(timezone.utc) - timedelta(minutes=5),
+        }
+
+        with (
+            patch.object(worker, "execute_family_claim", AsyncMock(side_effect=execute_once)) as execute_claim,
+            patch.object(worker, "_record_scrape_events", AsyncMock()),
+            patch.object(worker, "_upsert_worker_heartbeat", AsyncMock()),
+            patch.object(worker, "_cleanup_old_scrape_events", AsyncMock()),
+        ):
+            claim_result = await worker._run_v4_family_claim(
+                pool=object(),
+                redis_client=object(),
+                feature_flags=None,
+                warm_session=self._warm_session(),
+                family=family,
+                variant={"variant_id": 440, "query_text": "iPhone"},
+            )
+
+        self.assertEqual(execute_claim.await_count, 1)
+        self.assertEqual(claim_result.outcome, worker.FamilyClaimOutcome.STALE_FEED)
+        self.assertFalse(claim_result.cache_bust_attempted)
+
+    async def test_run_v4_family_claim_cache_bust_retry_can_convert_stale_to_matches(self) -> None:
+        attempts = 0
+
+        async def execute_with_retry_match(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return await self._emit_attempt(kwargs["progress_callback"], scraped=72)
+            self.assertIn("__cb=", kwargs["search_urls"][0])
+            return await self._emit_attempt(kwargs["progress_callback"], scraped=72, saved=1)
+
+        with (
+            patch.object(worker, "execute_family_claim", AsyncMock(side_effect=execute_with_retry_match)) as execute_claim,
+            patch.object(worker, "_record_scrape_events", AsyncMock()),
+            patch.object(worker, "_process_listing_event", AsyncMock()),
+            patch.object(worker, "_upsert_worker_heartbeat", AsyncMock()),
+            patch.object(worker, "_cleanup_old_scrape_events", AsyncMock()),
+        ):
+            claim_result = await worker._run_v4_family_claim(
+                pool=object(),
+                redis_client=object(),
+                feature_flags=None,
+                warm_session=self._warm_session(),
+                family={"family_id": 70, "name": "iphone_broad", "consecutive_stale": 2},
+                variant={"variant_id": 440, "query_text": "iPhone"},
+            )
+
+        self.assertEqual(execute_claim.await_count, 2)
+        self.assertEqual(claim_result.outcome, worker.FamilyClaimOutcome.MATCHES)
+        self.assertTrue(claim_result.cache_bust_attempted)
+        self.assertEqual(claim_result.metrics["listings_saved"], 1)
 
     async def test_dom_circuit_breaker_requires_distinct_profiles(self) -> None:
         class _FakeRedis:

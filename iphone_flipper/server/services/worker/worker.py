@@ -129,6 +129,7 @@ from server.services.worker.telemetry import build_cycle_telemetry_payload  # no
 from server.services.worker.v4_runtime import (  # noqa: E402
     FamilyClaimOutcome,
     WarmSessionConfig,
+    build_cache_busted_search_urls,
     classify_family_claim,
     evaluate_warm_session_state,
     family_claim_succeeded,
@@ -369,6 +370,23 @@ REDIS_FIRST_SEEN_TTL_SECONDS = _parse_int(
 PRICE_DROP_UPDATE_MODE = _normalize_price_drop_update_mode(os.getenv("PRICE_DROP_UPDATE_MODE", "off"))
 V4_DOM_INVESTIGATION_BACKOFF_SECONDS = 300
 V4_INFRA_FAMILY_BACKOFF_SECONDS = 60
+ENABLE_V4_STALE_FEED_CACHE_BUST = _parse_bool(os.getenv("ENABLE_V4_STALE_FEED_CACHE_BUST", "1"), default=True)
+V4_STALE_FEED_CACHE_BUST_THRESHOLD = _parse_int(
+    os.getenv("V4_STALE_FEED_CACHE_BUST_THRESHOLD"),
+    default=3,
+    minimum=1,
+)
+V4_STALE_FEED_CACHE_BUST_MIN_SCRAPED = _parse_int(
+    os.getenv("V4_STALE_FEED_CACHE_BUST_MIN_SCRAPED"),
+    default=40,
+    minimum=1,
+)
+V4_STALE_FEED_CACHE_BUST_COOLDOWN_SECONDS = _parse_int(
+    os.getenv("V4_STALE_FEED_CACHE_BUST_COOLDOWN_SECONDS"),
+    default=1200,
+    minimum=60,
+)
+V4_STALE_FEED_CACHE_BUST_PARAM = str(os.getenv("V4_STALE_FEED_CACHE_BUST_PARAM", "__cb")).strip() or "__cb"
 DEFAULT_V4_ROLLOUT_FAMILY_ALLOWLIST = ",".join(
     normalize_v42_family_names(None)
 )
@@ -531,6 +549,17 @@ class V4FamilyClaimResult:
     outcome: FamilyClaimOutcome
     error_text: str | None
     error_category: ErrorCategory
+    final_url: str | None = None
+    feed_present: bool = False
+    empty_state_detected: bool = False
+    cache_bust_attempted: bool = False
+
+
+@dataclass
+class V4FamilyAttemptResult:
+    listings_saved: int
+    listings_scraped: int
+    error_text: str | None
     final_url: str | None = None
     feed_present: bool = False
     empty_state_detected: bool = False
@@ -2552,6 +2581,32 @@ def _default_v4_claim_error_text(outcome: FamilyClaimOutcome, error_text: str | 
     return None
 
 
+def _build_v4_stale_feed_cache_bust_token(
+    family: dict[str, Any],
+    variant: dict[str, Any] | None,
+) -> str:
+    family_token = str(family.get("family_id") or family.get("name") or "family").strip().replace(" ", "-")
+    variant_token = str((variant or {}).get("variant_id") or (variant or {}).get("query_text") or "variant").strip()
+    variant_token = variant_token.replace(" ", "-") or "variant"
+    return f"v4-{family_token}-{variant_token}-{uuid.uuid4().hex[:10]}"
+
+
+def _v4_cache_bust_cooldown_remaining_seconds(family: dict[str, Any]) -> int:
+    last_cache_bust_at = family.get("last_cache_bust_at")
+    if isinstance(last_cache_bust_at, str):
+        try:
+            last_cache_bust_at = datetime.fromisoformat(last_cache_bust_at.replace("Z", "+00:00"))
+        except ValueError:
+            return 0
+    if not isinstance(last_cache_bust_at, datetime):
+        return 0
+    if last_cache_bust_at.tzinfo is None:
+        last_cache_bust_at = last_cache_bust_at.replace(tzinfo=timezone.utc)
+    elapsed_seconds = max(0.0, (datetime.now(timezone.utc) - last_cache_bust_at).total_seconds())
+    remaining_seconds = int(V4_STALE_FEED_CACHE_BUST_COOLDOWN_SECONDS - elapsed_seconds)
+    return max(0, remaining_seconds)
+
+
 async def _record_v4_profile_success(
     pool: asyncpg.Pool,
     profile: dict[str, Any],
@@ -2752,6 +2807,7 @@ async def _complete_v4_family_claim(
     outcome: FamilyClaimOutcome,
     metrics: dict[str, int] | None = None,
     error: str | None = None,
+    cache_bust_attempted: bool = False,
 ) -> dict[str, Any] | None:
     family_id = family.get("family_id")
     family_token = str(family.get("family_lease_token") or "").strip()
@@ -2759,13 +2815,9 @@ async def _complete_v4_family_claim(
         return None
     metrics_payload = metrics or {}
     listings_saved = max(0, int(metrics_payload.get("listings_saved", 0) or 0))
-    listings_scraped = max(0, int(metrics_payload.get("listings_scraped", 0) or 0))
     next_hits = max(0, int(family.get("consecutive_hits") or 0)) + 1 if outcome == FamilyClaimOutcome.MATCHES else 0
-    next_empty = (
-        max(0, int(family.get("consecutive_empty") or 0)) + 1
-        if outcome in {FamilyClaimOutcome.STALE_FEED, FamilyClaimOutcome.EMPTY_FEED}
-        else 0
-    )
+    next_empty = max(0, int(family.get("consecutive_empty") or 0)) + 1 if outcome == FamilyClaimOutcome.EMPTY_FEED else 0
+    next_stale = max(0, int(family.get("consecutive_stale") or 0)) + 1 if outcome == FamilyClaimOutcome.STALE_FEED else 0
     next_cursor = next_variant_cursor(
         variant_count=int(family.get("variant_count") or 0),
         current_cursor=int(family.get("variant_cursor") or 0),
@@ -2776,6 +2828,7 @@ async def _complete_v4_family_claim(
         outcome=outcome,
         listings_saved=listings_saved,
         consecutive_hits=next_hits,
+        consecutive_stale=next_stale,
         consecutive_empty=next_empty,
         consecutive_failures=max(0, int(family.get("failure_count") or 0)),
         dom_backoff_seconds=V4_DOM_INVESTIGATION_BACKOFF_SECONDS,
@@ -2810,17 +2863,22 @@ async def _complete_v4_family_claim(
                 variant_cursor = $4::INT,
                 consecutive_hits = $5::INT,
                 consecutive_empty = $6::INT,
+                consecutive_stale = $7::INT,
                 last_discovery_at = CASE
-                    WHEN $7::BOOLEAN THEN NOW()
+                    WHEN $8::BOOLEAN THEN NOW()
                     ELSE query_families.last_discovery_at
                 END,
                 last_success_at = CASE
-                    WHEN $8::BOOLEAN THEN NOW()
+                    WHEN $9::BOOLEAN THEN NOW()
                     ELSE query_families.last_success_at
                 END,
+                last_cache_bust_at = CASE
+                    WHEN $10::BOOLEAN THEN NOW()
+                    ELSE query_families.last_cache_bust_at
+                END,
                 last_error = CASE
-                    WHEN $8::BOOLEAN THEN NULL
-                    ELSE COALESCE($9::TEXT, query_families.last_error)
+                    WHEN $9::BOOLEAN THEN NULL
+                    ELSE COALESCE($11::TEXT, query_families.last_error)
                 END
             WHERE family_id = $1
               AND family_lease_token = $2
@@ -2832,8 +2890,10 @@ async def _complete_v4_family_claim(
             int(next_cursor),
             int(next_hits),
             int(next_empty),
+            int(next_stale),
             bool(outcome == FamilyClaimOutcome.MATCHES and listings_saved > 0),
             extracted_success,
+            bool(cache_bust_attempted),
             error_text,
         )
     return dict(row) if row is not None else None
@@ -3079,6 +3139,7 @@ async def _run_v4_family_claim(
         search_queries=query_override,
     )
     selected_query = str((variant or {}).get("query_text") or "").strip() or (query_override[0] if query_override else None)
+    cache_bust_attempted = False
 
     def _on_progress(payload: dict[str, Any]) -> None:
         nonlocal final_url, feed_present, empty_state_detected
@@ -3143,7 +3204,66 @@ async def _run_v4_family_claim(
         ingest_tasks.add(task)
         task.add_done_callback(lambda done_task: ingest_tasks.discard(done_task))
 
-    error_text: str | None = None
+    def _apply_execution_diagnostics(query_diagnostics: list[dict[str, Any]]) -> None:
+        nonlocal final_url, feed_present, empty_state_detected
+        for diagnostic in query_diagnostics:
+            diagnostic_url = str(diagnostic.get("final_url") or "").strip()
+            if diagnostic_url:
+                final_url = diagnostic_url
+            feed_present = feed_present or bool(diagnostic.get("feed_present"))
+            empty_state_detected = empty_state_detected or bool(diagnostic.get("empty_state_detected"))
+
+    def _classify_attempt_result(
+        attempt: V4FamilyAttemptResult,
+    ) -> tuple[FamilyClaimOutcome, ErrorCategory]:
+        error_category = classify_error(attempt.error_text)
+        outcome = classify_family_claim(
+            listings_saved=attempt.listings_saved,
+            listings_scraped=attempt.listings_scraped,
+            error_text=attempt.error_text,
+            final_url=attempt.final_url,
+            feed_present=attempt.feed_present,
+            empty_state_detected=attempt.empty_state_detected,
+            error_category=error_category,
+        )
+        return outcome, error_category
+
+    async def _execute_family_attempt(search_urls_override: list[str] | None) -> V4FamilyAttemptResult:
+        nonlocal final_url, feed_present, empty_state_detected
+        start_saved = max(0, int(metrics.get("listings_saved", 0) or 0))
+        start_scraped = max(0, int(metrics.get("listings_scraped", 0) or 0))
+        final_url = None
+        feed_present = False
+        empty_state_detected = False
+        error_text: str | None = None
+        try:
+            execution = await execute_family_claim(
+                warm_session.session,
+                progress_callback=_on_progress,
+                stop_event=_worker_shutdown_event(),
+                search_queries=query_override,
+                search_urls=search_urls_override,
+                scroll_target_cards_override=WORKER_SCROLL_TARGET_CARDS,
+                scroll_max_rounds_override=WORKER_SCROLL_MAX_ROUNDS,
+                apply_inter_query_delay=False,
+            )
+            _apply_execution_diagnostics(execution.query_diagnostics)
+        except Exception as exc:
+            error_text = str(exc) or "unknown v4 family error"
+        return V4FamilyAttemptResult(
+            listings_saved=max(0, int(metrics.get("listings_saved", 0) or 0) - start_saved),
+            listings_scraped=max(0, int(metrics.get("listings_scraped", 0) or 0) - start_scraped),
+            error_text=error_text,
+            final_url=final_url,
+            feed_present=feed_present,
+            empty_state_detected=empty_state_detected,
+        )
+
+    final_attempt = V4FamilyAttemptResult(
+        listings_saved=0,
+        listings_scraped=0,
+        error_text=None,
+    )
     await _upsert_worker_heartbeat(
         pool=pool,
         route_name=str(family.get("name") or ""),
@@ -3155,24 +3275,86 @@ async def _run_v4_family_claim(
         route=route,
     )
     try:
-        execution = await execute_family_claim(
-            warm_session.session,
-            progress_callback=_on_progress,
-            stop_event=_worker_shutdown_event(),
-            search_queries=query_override,
-            search_urls=url_override,
-            scroll_target_cards_override=WORKER_SCROLL_TARGET_CARDS,
-            scroll_max_rounds_override=WORKER_SCROLL_MAX_ROUNDS,
-            apply_inter_query_delay=False,
-        )
-        for diagnostic in execution.query_diagnostics:
-            diagnostic_url = str(diagnostic.get("final_url") or "").strip()
-            if diagnostic_url:
-                final_url = diagnostic_url
-            feed_present = feed_present or bool(diagnostic.get("feed_present"))
-            empty_state_detected = empty_state_detected or bool(diagnostic.get("empty_state_detected"))
-    except Exception as exc:
-        error_text = str(exc) or "unknown v4 family error"
+        final_attempt = await _execute_family_attempt(url_override)
+        final_outcome, final_error_category = _classify_attempt_result(final_attempt)
+        if ENABLE_V4_STALE_FEED_CACHE_BUST and final_outcome == FamilyClaimOutcome.STALE_FEED:
+            provisional_stale_streak = max(0, int(family.get("consecutive_stale") or 0)) + 1
+            if provisional_stale_streak < V4_STALE_FEED_CACHE_BUST_THRESHOLD:
+                logging.info(
+                    "[%s] V4 cache-bust threshold not met family=%s query=%s stale_streak=%s threshold=%s scraped=%s",
+                    WORKER_NAME,
+                    family.get("name"),
+                    selected_query,
+                    provisional_stale_streak,
+                    V4_STALE_FEED_CACHE_BUST_THRESHOLD,
+                    final_attempt.listings_scraped,
+                )
+            elif final_attempt.listings_scraped < V4_STALE_FEED_CACHE_BUST_MIN_SCRAPED:
+                logging.info(
+                    "[%s] V4 cache-bust skipped low scraped count family=%s query=%s stale_streak=%s scraped=%s minimum=%s",
+                    WORKER_NAME,
+                    family.get("name"),
+                    selected_query,
+                    provisional_stale_streak,
+                    final_attempt.listings_scraped,
+                    V4_STALE_FEED_CACHE_BUST_MIN_SCRAPED,
+                )
+            else:
+                cooldown_remaining = _v4_cache_bust_cooldown_remaining_seconds(family)
+                if cooldown_remaining > 0:
+                    logging.info(
+                        "[%s] V4 cache-bust skipped cooldown family=%s query=%s remaining_s=%s",
+                        WORKER_NAME,
+                        family.get("name"),
+                        selected_query,
+                        cooldown_remaining,
+                    )
+                else:
+                    cache_bust_urls = build_cache_busted_search_urls(
+                        search_queries=query_override,
+                        search_urls=url_override,
+                        cache_bust_token=_build_v4_stale_feed_cache_bust_token(family, variant),
+                        cache_bust_param=V4_STALE_FEED_CACHE_BUST_PARAM,
+                    )
+                    if cache_bust_urls:
+                        logging.info(
+                            "[%s] V4 cache-bust attempt family=%s query=%s stale_streak=%s scraped=%s",
+                            WORKER_NAME,
+                            family.get("name"),
+                            selected_query,
+                            provisional_stale_streak,
+                            final_attempt.listings_scraped,
+                        )
+                        cache_bust_attempted = True
+                        final_attempt = await _execute_family_attempt(cache_bust_urls)
+                        final_outcome, final_error_category = _classify_attempt_result(final_attempt)
+                        if final_outcome == FamilyClaimOutcome.MATCHES:
+                            logging.info(
+                                "[%s] V4 cache-bust retry success family=%s query=%s saved=%s scraped=%s",
+                                WORKER_NAME,
+                                family.get("name"),
+                                selected_query,
+                                final_attempt.listings_saved,
+                                final_attempt.listings_scraped,
+                            )
+                        elif final_outcome == FamilyClaimOutcome.STALE_FEED:
+                            logging.info(
+                                "[%s] V4 cache-bust retry still stale family=%s query=%s saved=%s scraped=%s",
+                                WORKER_NAME,
+                                family.get("name"),
+                                selected_query,
+                                final_attempt.listings_saved,
+                                final_attempt.listings_scraped,
+                            )
+                        else:
+                            logging.warning(
+                                "[%s] V4 cache-bust retry error family=%s query=%s outcome=%s error=%s",
+                                WORKER_NAME,
+                                family.get("name"),
+                                selected_query,
+                                final_outcome.value,
+                                final_attempt.error_text,
+                            )
     finally:
         if ingest_tasks:
             results = await asyncio.gather(*list(ingest_tasks), return_exceptions=True)
@@ -3186,38 +3368,30 @@ async def _run_v4_family_claim(
                     logging.warning("[%s] failed to record v4 scrape event: %s", WORKER_NAME, result)
         await _cleanup_old_scrape_events(pool)
 
-    heartbeat_status = "idle" if not error_text else "error"
+    final_outcome, final_error_category = _classify_attempt_result(final_attempt)
+    heartbeat_status = "idle" if not final_attempt.error_text else "error"
     await _upsert_worker_heartbeat(
         pool=pool,
         route_name=str(family.get("name") or ""),
         status=heartbeat_status,
         listings_saved=metrics["listings_saved"],
         query_count=metrics["query_count"],
-        last_error=error_text or ("; ".join(query_error_text_samples) if query_error_text_samples else None),
+        last_error=final_attempt.error_text or ("; ".join(query_error_text_samples) if query_error_text_samples else None),
         started_at=datetime.now(timezone.utc),
         finished_at=datetime.now(timezone.utc),
         route=route,
     )
     if selected_query:
         family["selected_query"] = selected_query
-    error_category = classify_error(error_text)
-    outcome = classify_family_claim(
-        listings_saved=metrics["listings_saved"],
-        listings_scraped=metrics["listings_scraped"],
-        error_text=error_text,
-        final_url=final_url,
-        feed_present=feed_present,
-        empty_state_detected=empty_state_detected,
-        error_category=error_category,
-    )
     return V4FamilyClaimResult(
         metrics=metrics,
-        outcome=outcome,
-        error_text=_default_v4_claim_error_text(outcome, error_text),
-        error_category=error_category,
-        final_url=final_url,
-        feed_present=feed_present,
-        empty_state_detected=empty_state_detected,
+        outcome=final_outcome,
+        error_text=_default_v4_claim_error_text(final_outcome, final_attempt.error_text),
+        error_category=final_error_category,
+        final_url=final_attempt.final_url,
+        feed_present=final_attempt.feed_present,
+        empty_state_detected=final_attempt.empty_state_detected,
+        cache_bust_attempted=cache_bust_attempted,
     )
 
 
@@ -3396,6 +3570,7 @@ async def _run_v4_worker_loop(
                                 final_url=claim_result.final_url,
                                 feed_present=claim_result.feed_present,
                                 empty_state_detected=claim_result.empty_state_detected,
+                                cache_bust_attempted=claim_result.cache_bust_attempted,
                             )
                         await _complete_v4_family_claim(
                             pool,
@@ -3404,6 +3579,7 @@ async def _run_v4_worker_loop(
                             outcome=claim_result.outcome,
                             metrics=claim_result.metrics,
                             error=claim_result.error_text,
+                            cache_bust_attempted=claim_result.cache_bust_attempted,
                         )
                         abort_session = await _apply_v4_profile_claim_outcome(
                             pool,
