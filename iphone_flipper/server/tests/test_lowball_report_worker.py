@@ -37,6 +37,29 @@ class _AlreadySentPool:
         return _FakeAcquire(self.conn)
 
 
+class _RetryConn:
+    def __init__(self, *, completed_at: datetime | None) -> None:
+        self.completed_at = completed_at
+
+    async def fetchval(self, query: str, *args):
+        _ = query, args
+        return None
+
+    async def fetchrow(self, query: str, *args):
+        _ = query, args
+        if self.completed_at is None:
+            return None
+        return {"completed_at": self.completed_at}
+
+
+class _RetryPool:
+    def __init__(self, *, completed_at: datetime | None) -> None:
+        self.conn = _RetryConn(completed_at=completed_at)
+
+    def acquire(self) -> _FakeAcquire:
+        return _FakeAcquire(self.conn)
+
+
 def _candidate(listing_id: str, *, verification_required: bool = False) -> LowballCandidate:
     return LowballCandidate(
         listing_id=listing_id,
@@ -80,6 +103,26 @@ class LowballReportWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(immediate_target, within_grace)
         self.assertEqual(tomorrow_target, datetime(2026, 4, 19, 22, 0, tzinfo=timezone.utc))
         self.assertEqual(sent_tomorrow_target, datetime(2026, 4, 19, 22, 0, tzinfo=timezone.utc))
+
+    async def test_seconds_until_next_scheduled_run_retries_failed_delivery_same_day(self) -> None:
+        pool = _RetryPool(completed_at=datetime(2026, 4, 19, 22, 4, tzinfo=timezone.utc))
+
+        wait_seconds = await lowball_report_worker.seconds_until_next_scheduled_run(
+            pool,
+            now=datetime(2026, 4, 19, 22, 10, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(wait_seconds, 540)
+
+    async def test_seconds_until_next_scheduled_run_uses_immediate_retry_when_due(self) -> None:
+        pool = _RetryPool(completed_at=datetime(2026, 4, 19, 22, 4, tzinfo=timezone.utc))
+
+        wait_seconds = await lowball_report_worker.seconds_until_next_scheduled_run(
+            pool,
+            now=datetime(2026, 4, 19, 22, 20, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(wait_seconds, 0)
 
     async def test_select_report_entries_backfills_after_removed_listing(self) -> None:
         candidates = [

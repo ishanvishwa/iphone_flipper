@@ -60,6 +60,22 @@ LOWBALL_REPORT_START_GRACE_SECONDS = max(
     0,
     int(os.getenv("LOWBALL_REPORT_START_GRACE_SECONDS", "300") or 300),
 )
+LOWBALL_REPORT_DELIVERY_RETRY_SECONDS = max(
+    60,
+    int(os.getenv("LOWBALL_REPORT_DELIVERY_RETRY_SECONDS", "900") or 900),
+)
+LOWBALL_REPORT_TELEGRAM_TIMEOUT_SECONDS = max(
+    5,
+    int(os.getenv("LOWBALL_REPORT_TELEGRAM_TIMEOUT_SECONDS", "20") or 20),
+)
+LOWBALL_REPORT_TELEGRAM_MAX_ATTEMPTS = max(
+    1,
+    int(os.getenv("LOWBALL_REPORT_TELEGRAM_MAX_ATTEMPTS", "4") or 4),
+)
+LOWBALL_REPORT_TELEGRAM_RETRY_DELAY_SECONDS = max(
+    1,
+    int(os.getenv("LOWBALL_REPORT_TELEGRAM_RETRY_DELAY_SECONDS", "5") or 5),
+)
 LOWBALL_REPORT_HEADLESS = str(os.getenv("WORKER_HEADLESS", "1")).strip().lower() not in {
     "0",
     "false",
@@ -117,6 +133,33 @@ async def _report_already_sent(conn: asyncpg.Connection, report_date: date) -> b
     )
 
 
+async def _delivery_retry_due_at(
+    conn: asyncpg.Connection,
+    report_date: date,
+) -> datetime | None:
+    row = await conn.fetchrow(
+        """
+        SELECT completed_at
+        FROM lowball_report_runs
+        WHERE report_date = $1
+          AND run_source = $2
+          AND sent_at IS NULL
+          AND status = 'send_failed'
+        LIMIT 1
+        """,
+        report_date,
+        LOWBALL_REPORT_RUN_SOURCE_SCHEDULED,
+    )
+    if row is None:
+        return None
+    completed_at = row.get("completed_at")
+    if completed_at is None:
+        return datetime.now(timezone.utc)
+    if completed_at.tzinfo is None:
+        completed_at = completed_at.replace(tzinfo=timezone.utc)
+    return completed_at.astimezone(timezone.utc) + timedelta(seconds=LOWBALL_REPORT_DELIVERY_RETRY_SECONDS)
+
+
 async def _write_verification_state(
     conn: asyncpg.Connection,
     *,
@@ -149,6 +192,13 @@ async def _write_verification_state(
     )
 
 
+def _format_exception_message(exc: Exception) -> str:
+    detail = str(exc).strip()
+    if detail:
+        return f"{exc.__class__.__name__}: {detail}"[:250]
+    return exc.__class__.__name__[:250]
+
+
 async def _send_telegram_message(message: str) -> bool:
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -166,15 +216,35 @@ async def _send_telegram_message(message: str) -> bool:
     try:
         import aiohttp
 
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=15)
-        ) as session:
-            async with session.post(url, json=payload) as response:
-                if response.status != 200:
+        async def _send_once() -> bool:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=LOWBALL_REPORT_TELEGRAM_TIMEOUT_SECONDS)
+            ) as session:
+                async with session.post(url, json=payload) as response:
                     body = await response.text()
-                    logger.warning("Lowball report Telegram send failed with status %s: %s", response.status, body[:250])
-                    return False
-                return True
+                    if response.status != 200:
+                        logger.warning(
+                            "Lowball report Telegram send failed with status %s: %s",
+                            response.status,
+                            body[:250],
+                        )
+                        return False
+                    return True
+
+        for attempt in range(1, LOWBALL_REPORT_TELEGRAM_MAX_ATTEMPTS + 1):
+            try:
+                if await _send_once():
+                    return True
+            except Exception as exc:
+                logger.warning(
+                    "Lowball report Telegram send attempt %s/%s failed: %s",
+                    attempt,
+                    LOWBALL_REPORT_TELEGRAM_MAX_ATTEMPTS,
+                    _format_exception_message(exc),
+                )
+            if attempt < LOWBALL_REPORT_TELEGRAM_MAX_ATTEMPTS:
+                await asyncio.sleep(float(LOWBALL_REPORT_TELEGRAM_RETRY_DELAY_SECONDS))
+        return False
     except ImportError:
         try:
             import requests
@@ -183,18 +253,23 @@ async def _send_telegram_message(message: str) -> bool:
             return False
 
         def _send_sync() -> bool:
-            response = requests.post(url, json=payload, timeout=15)
+            response = requests.post(url, json=payload, timeout=LOWBALL_REPORT_TELEGRAM_TIMEOUT_SECONDS)
             response.raise_for_status()
             body = response.json() if response.content else {}
             return bool(body.get("ok", True))
 
-        try:
-            return bool(await asyncio.to_thread(_send_sync))
-        except Exception as exc:
-            logger.warning("Lowball report Telegram send failed: %s", str(exc)[:250])
-            return False
-    except Exception as exc:
-        logger.warning("Lowball report Telegram send failed: %s", str(exc)[:250])
+        for attempt in range(1, LOWBALL_REPORT_TELEGRAM_MAX_ATTEMPTS + 1):
+            try:
+                return bool(await asyncio.to_thread(_send_sync))
+            except Exception as exc:
+                logger.warning(
+                    "Lowball report Telegram send attempt %s/%s failed: %s",
+                    attempt,
+                    LOWBALL_REPORT_TELEGRAM_MAX_ATTEMPTS,
+                    _format_exception_message(exc),
+                )
+            if attempt < LOWBALL_REPORT_TELEGRAM_MAX_ATTEMPTS:
+                await asyncio.sleep(float(LOWBALL_REPORT_TELEGRAM_RETRY_DELAY_SECONDS))
         return False
 
 
@@ -227,6 +302,9 @@ async def seconds_until_next_scheduled_run(
     report_date = current_perth_date(current)
     async with pool.acquire() as conn:
         sent_today = await _report_already_sent(conn, report_date)
+        retry_due_at = None if sent_today else await _delivery_retry_due_at(conn, report_date)
+    if retry_due_at is not None:
+        return max(0, int((retry_due_at - current).total_seconds()))
     next_run = next_scheduled_run_at(current, report_sent_today=sent_today)
     return max(0, int((next_run - current).total_seconds()))
 
