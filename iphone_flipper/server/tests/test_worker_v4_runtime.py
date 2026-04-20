@@ -22,10 +22,12 @@ from server.services.common.v42_family_catalog import V42_FAMILY_PRESETS
 class WorkerV4RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         worker._worker_shutdown_event().clear()
+        worker._V4_FAMILY_DISPATCH_COUNT = 0
 
     async def asyncTearDown(self) -> None:
         with contextlib.suppress(Exception):
             worker._worker_shutdown_event().clear()
+        worker._V4_FAMILY_DISPATCH_COUNT = 0
 
     def _warm_session(self) -> worker.V4WarmSessionState:
         return worker.V4WarmSessionState(
@@ -195,6 +197,41 @@ class WorkerV4RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             claim_family.await_args.kwargs["family_names"],
             worker._v4_worker_family_allowlist(),
+        )
+        self.assertFalse(claim_family.await_args.kwargs["exploration"])
+
+    async def test_claim_v4_family_passes_exploration_flag(self) -> None:
+        with patch.object(worker, "claim_next_due_family_from_module", AsyncMock(return_value=None)) as claim_family:
+            await worker._claim_v4_family(pool=object(), exploration=True)
+
+        self.assertTrue(claim_family.await_args.kwargs["exploration"])
+
+    def test_v4_family_exploration_every_n_defaults_to_five(self) -> None:
+        self.assertEqual(worker._v4_family_exploration_every_n(None), 5)
+
+    def test_v4_family_exploration_cadence_uses_every_n_for_model_workers(self) -> None:
+        self.assertFalse(
+            worker._should_use_v4_family_exploration(
+                {"V4_FAMILY_EXPLORATION_EVERY_N": 5},
+                dispatch_count=3,
+                family_names=("iphone_16_pro", "iphone_14_pro"),
+            )
+        )
+        self.assertTrue(
+            worker._should_use_v4_family_exploration(
+                {"V4_FAMILY_EXPLORATION_EVERY_N": 5},
+                dispatch_count=4,
+                family_names=("iphone_16_pro", "iphone_14_pro"),
+            )
+        )
+
+    def test_v4_family_exploration_is_disabled_for_broad_only_workers(self) -> None:
+        self.assertFalse(
+            worker._should_use_v4_family_exploration(
+                {"V4_FAMILY_EXPLORATION_EVERY_N": 5},
+                dispatch_count=4,
+                family_names=("iphone_broad",),
+            )
         )
 
     def test_default_v4_family_allowlist_matches_v42_catalog(self) -> None:
@@ -378,6 +415,31 @@ class WorkerV4RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first_route["source"], "v4")
         self.assertEqual(first_route["search_queries"], "iPhone")
         self.assertEqual(first_route["dolphin_profile_name"], "Profile 3")
+        self.assertFalse(first_route["exploration_dispatch"])
+
+    async def test_run_v4_family_claim_includes_exploration_flag_in_heartbeat_route(self) -> None:
+        warm_session = self._warm_session()
+
+        with (
+            patch.object(
+                worker,
+                "execute_family_claim",
+                AsyncMock(return_value=SimpleNamespace(query_diagnostics=[])),
+            ),
+            patch.object(worker, "_upsert_worker_heartbeat", AsyncMock()) as heartbeat,
+            patch.object(worker, "_cleanup_old_scrape_events", AsyncMock()),
+        ):
+            await worker._run_v4_family_claim(
+                pool=object(),
+                redis_client=object(),
+                feature_flags=None,
+                warm_session=warm_session,
+                family={"family_id": 70, "name": "iphone_14_pro", "exploration_dispatch": True},
+                variant={"variant_id": 440, "query_text": "iPhone 14 Pro"},
+            )
+
+        first_route = heartbeat.await_args_list[0].kwargs["route"]
+        self.assertTrue(first_route["exploration_dispatch"])
 
     async def test_run_v4_family_claim_does_not_cache_bust_before_threshold(self) -> None:
         async def execute_once(*args, **kwargs):

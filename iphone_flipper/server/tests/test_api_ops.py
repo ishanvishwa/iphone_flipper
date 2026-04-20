@@ -503,7 +503,13 @@ class ApiOpsTests(unittest.IsolatedAsyncioTestCase):
         feature_flags.set_flag_values = AsyncMock(return_value={"ENABLE_GUI_WEBSOCKET_PUSH": False})
         runtime_config = MagicMock()
         runtime_config.snapshot = AsyncMock(return_value=api_main.DEFAULT_RUNTIME_CONFIG)
-        runtime_config.set_values = AsyncMock(return_value={**api_main.DEFAULT_RUNTIME_CONFIG, "NOTIFICATION_CONSUMER_DRAIN": True})
+        runtime_config.set_values = AsyncMock(
+            return_value={
+                **api_main.DEFAULT_RUNTIME_CONFIG,
+                "NOTIFICATION_CONSUMER_DRAIN": True,
+                "V4_FAMILY_EXPLORATION_EVERY_N": 7.0,
+            }
+        )
         api_main.app.state.feature_flags = feature_flags
         api_main.app.state.runtime_config = runtime_config
 
@@ -515,7 +521,10 @@ class ApiOpsTests(unittest.IsolatedAsyncioTestCase):
             payload = await api_main.update_runtime_config(
                 payload=api_main.RuntimeConfigUpdateRequest(
                     feature_flags={"ENABLE_GUI_WEBSOCKET_PUSH": False},
-                    runtime_config={"NOTIFICATION_CONSUMER_DRAIN": True},
+                    runtime_config={
+                        "NOTIFICATION_CONSUMER_DRAIN": True,
+                        "V4_FAMILY_EXPLORATION_EVERY_N": 7,
+                    },
                 ),
                 x_api_token="test-token",
             )
@@ -524,6 +533,17 @@ class ApiOpsTests(unittest.IsolatedAsyncioTestCase):
         runtime_config.set_values.assert_awaited_once()
         close_ws.assert_awaited_once_with("feature_flag_off")
         self.assertTrue(payload["runtime_config"]["NOTIFICATION_CONSUMER_DRAIN"])
+        self.assertEqual(payload["runtime_config"]["V4_FAMILY_EXPLORATION_EVERY_N"], 7.0)
+
+    async def test_get_runtime_config_includes_v4_family_exploration_default(self) -> None:
+        api_main.app.state.feature_flags = MagicMock(snapshot=AsyncMock(return_value={"ENABLE_GUI_WEBSOCKET_PUSH": False}))
+        api_main.app.state.runtime_config = MagicMock(snapshot=AsyncMock(return_value=api_main.DEFAULT_RUNTIME_CONFIG))
+
+        with patch.object(api_main, "API_TOKEN", "test-token"):
+            payload = await api_main.get_runtime_config(x_api_token="test-token")
+
+        self.assertIn("V4_FAMILY_EXPLORATION_EVERY_N", payload["runtime_config"])
+        self.assertEqual(payload["runtime_config"]["V4_FAMILY_EXPLORATION_EVERY_N"], 5.0)
 
     async def test_get_realtime_health_reports_publish_health_and_counts(self) -> None:
         api_main.app.state.redis = _FakeRedis()

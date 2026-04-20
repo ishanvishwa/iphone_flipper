@@ -372,6 +372,7 @@ async def claim_next_due_family(
     lease_token: str,
     lease_seconds: int,
     family_names: list[str] | tuple[str, ...] | None = None,
+    exploration: bool = False,
 ) -> dict[str, object] | None:
     lease_token_value = str(lease_token or "").strip()
     if not lease_token_value:
@@ -388,6 +389,20 @@ async def claim_next_due_family(
     if allowlisted_family_names:
         family_filter_sql = "\n                  AND LOWER(name) = ANY($3::TEXT[])"
         query_args.append(allowlisted_family_names)
+    if exploration:
+        order_sql = """
+                    last_claimed_at ASC NULLS FIRST,
+                    next_due_at ASC,
+                    priority DESC,
+                    family_id ASC
+        """
+    else:
+        order_sql = """
+                    priority_score DESC NULLS LAST,
+                    priority DESC,
+                    next_due_at ASC,
+                    family_id ASC
+        """
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             f"""
@@ -411,10 +426,7 @@ async def claim_next_due_family(
                           AND LOWER(COALESCE(query_variants.validation_state, 'pending_validation')) = 'validated'
                   )
                 ORDER BY
-                    priority_score DESC NULLS LAST,
-                    priority DESC,
-                    next_due_at ASC,
-                    family_id ASC
+                    {order_sql}
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
             )

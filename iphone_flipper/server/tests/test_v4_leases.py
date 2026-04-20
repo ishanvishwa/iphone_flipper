@@ -36,6 +36,7 @@ class _LeaseConn:
         self.variants = [dict(row) for row in (variants or [])]
         self.queries: list[str] = []
         self.last_claim_family_args: tuple[object, ...] = ()
+        self.last_claim_family_query = ""
 
     async def fetchrow(self, query: str, *args):
         normalized = " ".join(str(query).split())
@@ -49,6 +50,7 @@ class _LeaseConn:
             return self._release_profile(*args)
         if normalized.startswith("UPDATE query_families SET family_lease_token = $1"):
             self.last_claim_family_args = args
+            self.last_claim_family_query = normalized
             return self._claim_family(*args[:2])
         if normalized.startswith("UPDATE query_families SET family_lease_expires_at = NOW() + ($3::INT * INTERVAL '1 second')"):
             return self._heartbeat_family(*args)
@@ -125,6 +127,7 @@ class _LeaseConn:
                 for name in (self.last_claim_family_args[2] or [])
                 if str(name).strip()
             }
+        exploration = "ORDER BY last_claimed_at ASC NULLS FIRST" in self.last_claim_family_query
         eligible = []
         for row in self.families.values():
             if not bool(row.get("is_enabled", True)):
@@ -150,9 +153,18 @@ class _LeaseConn:
             return None
 
         def _sort_key(row: dict[str, object]):
-            priority_score = row.get("priority_score")
             priority = int(row.get("priority") or 100)
             next_due_at = row.get("next_due_at") or self.now
+            if exploration:
+                last_claimed_at = row.get("last_claimed_at")
+                return (
+                    last_claimed_at is not None,
+                    last_claimed_at or datetime.min.replace(tzinfo=timezone.utc),
+                    next_due_at,
+                    -priority,
+                    int(row["family_id"]),
+                )
+            priority_score = row.get("priority_score")
             return (
                 priority_score is None,
                 -(float(priority_score) if priority_score is not None else 0.0),
@@ -517,6 +529,94 @@ class V4LeaseManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(released["family_lease_token"])
         self.assertIn("FOR UPDATE SKIP LOCKED", conn.queries[0])
         self.assertIn("RETURNING *", conn.queries[0])
+
+    async def test_family_claim_prefers_priority_by_default(self) -> None:
+        conn = _LeaseConn(
+            families=[
+                {
+                    "family_id": 1,
+                    "name": "iphone_14_pro",
+                    "is_enabled": True,
+                    "priority": 200,
+                    "priority_score": None,
+                    "last_claimed_at": None,
+                    "next_due_at": datetime(2026, 3, 10, 23, 30, tzinfo=timezone.utc),
+                    "family_lease_expires_at": None,
+                },
+                {
+                    "family_id": 2,
+                    "name": "iphone_16_pro",
+                    "is_enabled": True,
+                    "priority": 235,
+                    "priority_score": None,
+                    "last_claimed_at": self._utc("2026-03-10T23:59:00+00:00"),
+                    "next_due_at": datetime(2026, 3, 10, 23, 59, tzinfo=timezone.utc),
+                    "family_lease_expires_at": None,
+                },
+            ],
+            variants=[
+                {"family_id": 1, "is_enabled": True, "validation_state": "validated"},
+                {"family_id": 2, "is_enabled": True, "validation_state": "validated"},
+            ],
+        )
+        pool = _LeasePool(conn)
+
+        claimed = await lease_manager.claim_next_due_family(
+            pool,
+            lease_token="lease-priority",
+            lease_seconds=120,
+            family_names=["iphone_14_pro", "iphone_16_pro"],
+        )
+
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed["family_id"], 2)
+
+    async def test_family_claim_exploration_prefers_never_claimed_oldest_due_family(self) -> None:
+        conn = _LeaseConn(
+            families=[
+                {
+                    "family_id": 1,
+                    "name": "iphone_14_pro",
+                    "is_enabled": True,
+                    "priority": 200,
+                    "priority_score": None,
+                    "last_claimed_at": None,
+                    "next_due_at": datetime(2026, 3, 10, 23, 30, tzinfo=timezone.utc),
+                    "family_lease_expires_at": None,
+                },
+                {
+                    "family_id": 2,
+                    "name": "iphone_16_pro",
+                    "is_enabled": True,
+                    "priority": 235,
+                    "priority_score": None,
+                    "last_claimed_at": self._utc("2026-03-10T23:59:00+00:00"),
+                    "next_due_at": datetime(2026, 3, 10, 23, 29, tzinfo=timezone.utc),
+                    "family_lease_expires_at": None,
+                },
+            ],
+            variants=[
+                {"family_id": 1, "is_enabled": True, "validation_state": "validated"},
+                {"family_id": 2, "is_enabled": True, "validation_state": "validated"},
+            ],
+        )
+        pool = _LeasePool(conn)
+
+        claimed = await lease_manager.claim_next_due_family(
+            pool,
+            lease_token="lease-explore",
+            lease_seconds=120,
+            family_names=["iphone_14_pro", "iphone_16_pro"],
+            exploration=True,
+        )
+
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed["family_id"], 1)
+        self.assertIn("last_claimed_at ASC NULLS FIRST", conn.last_claim_family_query)
+
+    @staticmethod
+    def _utc(value: str) -> datetime:
+        return datetime.fromisoformat(value)
 
 
 if __name__ == "__main__":

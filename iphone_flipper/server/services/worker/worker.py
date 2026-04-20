@@ -546,6 +546,7 @@ _ROUTE_LOCK_CONTENTION_UNTIL: dict[str, datetime] = {}
 _PROFILE_LOCK_CONTENTION_UNTIL: dict[str, datetime] = {}
 _SINGLE_ROUTE_ENFORCEMENT_ACTIVE = False
 _CENTRAL_ROUTE_DISPATCH_COUNT = 0
+_V4_FAMILY_DISPATCH_COUNT = 0
 _WORKER_SHUTDOWN_EVENT: asyncio.Event | None = None
 
 # Dolphin Profile failures tracking is now backed by `proxy_stats` in PostgreSQL
@@ -2465,7 +2466,7 @@ def _build_v4_family_route(
         search_queries_value = ", ".join(str(query).strip() for query in search_queries if str(query).strip()) or None
     else:
         search_queries_value = str(search_queries or "").strip() or None
-    return {
+    route = {
         "route_name": route_name,
         "worker_name": WORKER_NAME,
         "user_data_dir": str(profile.get("user_data_dir") or "").strip() or None,
@@ -2474,6 +2475,9 @@ def _build_v4_family_route(
         "source": "v4",
         "search_queries": search_queries_value,
     }
+    if family is not None:
+        route["exploration_dispatch"] = bool(family.get("exploration_dispatch"))
+    return route
 
 
 def _v4_warm_session_slot_key(slot_index: int) -> str:
@@ -2589,6 +2593,51 @@ def _v4_worker_family_allowlist() -> tuple[str, ...] | None:
     return model_families
 
 
+def _v4_family_exploration_every_n(runtime_config: dict[str, Any] | None) -> int:
+    raw_value = None if runtime_config is None else runtime_config.get("V4_FAMILY_EXPLORATION_EVERY_N")
+    try:
+        value = int(float(raw_value))
+    except (TypeError, ValueError):
+        value = 5
+    return max(0, value)
+
+
+def _v4_family_allowlist_supports_exploration(
+    family_names: tuple[str, ...] | list[str] | None,
+) -> bool:
+    normalized_allowlist = {
+        str(name).strip().lower()
+        for name in (family_names or ())
+        if str(name).strip()
+    }
+    if not normalized_allowlist:
+        return True
+
+    broad_families = {
+        str(name).strip().lower()
+        for name in (V4_BROAD_FAMILY_ALLOWLIST or ())
+        if str(name).strip()
+    }
+    if not broad_families:
+        return True
+    return not normalized_allowlist.issubset(broad_families)
+
+
+def _should_use_v4_family_exploration(
+    runtime_config: dict[str, Any] | None,
+    *,
+    dispatch_count: int,
+    family_names: tuple[str, ...] | list[str] | None,
+) -> bool:
+    if not _v4_family_allowlist_supports_exploration(family_names):
+        return False
+    exploration_every_n = _v4_family_exploration_every_n(runtime_config)
+    if exploration_every_n <= 0:
+        return False
+    safe_dispatch_count = max(0, int(dispatch_count))
+    return ((safe_dispatch_count + 1) % exploration_every_n) == 0
+
+
 async def _apply_v4_rollout_family_overrides(pool: asyncpg.Pool) -> None:
     if not V4_ROLLOUT_FAMILY_ALLOWLIST:
         return
@@ -2689,12 +2738,19 @@ async def _claim_v4_profile(pool: asyncpg.Pool) -> dict[str, Any] | None:
     )
 
 
-async def _claim_v4_family(pool: asyncpg.Pool) -> dict[str, Any] | None:
+async def _claim_v4_family(
+    pool: asyncpg.Pool,
+    *,
+    family_names: tuple[str, ...] | list[str] | None = None,
+    exploration: bool = False,
+) -> dict[str, Any] | None:
+    selected_family_names = _v4_worker_family_allowlist() if family_names is None else family_names
     return await claim_next_due_family_from_module(
         pool,
         lease_token=uuid.uuid4().hex,
         lease_seconds=FAMILY_LEASE_SECONDS,
-        family_names=_v4_worker_family_allowlist(),
+        family_names=selected_family_names,
+        exploration=exploration,
     )
 
 
@@ -3647,7 +3703,7 @@ async def _run_v4_worker_loop(
     feature_flags: RedisFeatureFlags | None,
     runtime_config: RedisRuntimeConfig | None,
 ) -> None:
-    _ = runtime_config
+    global _V4_FAMILY_DISPATCH_COUNT
     logging.info("[%s] V4 warm-session worker loop online", WORKER_NAME)
     config = _v4_warm_session_config()
     next_family_sync_at = 0.0
@@ -3803,7 +3859,20 @@ async def _run_v4_worker_loop(
                         )
                         continue
 
-                    family = await _claim_v4_family(pool)
+                    runtime_snapshot: dict[str, Any] | None = None
+                    if runtime_config is not None:
+                        runtime_snapshot = await runtime_config.snapshot()
+                    family_allowlist = _v4_worker_family_allowlist()
+                    exploration_dispatch = _should_use_v4_family_exploration(
+                        runtime_snapshot,
+                        dispatch_count=_V4_FAMILY_DISPATCH_COUNT,
+                        family_names=family_allowlist,
+                    )
+                    family = await _claim_v4_family(
+                        pool,
+                        family_names=family_allowlist,
+                        exploration=exploration_dispatch,
+                    )
                     if family is None:
                         await _upsert_worker_heartbeat(
                             pool=pool,
@@ -3822,6 +3891,18 @@ async def _run_v4_worker_loop(
                             wake_on_v4_disable=True,
                         )
                         continue
+                    _V4_FAMILY_DISPATCH_COUNT += 1
+                    family = dict(family)
+                    family["exploration_dispatch"] = bool(exploration_dispatch)
+                    logging.info(
+                        "[%s] V4 family claim selected family=%s exploration=%s priority=%s priority_score=%s next_due_at=%s",
+                        WORKER_NAME,
+                        family.get("name"),
+                        family.get("exploration_dispatch"),
+                        family.get("priority"),
+                        family.get("priority_score"),
+                        family.get("next_due_at"),
+                    )
 
                     variant = await _load_v4_family_variant(pool, family)
                     if variant is None:
@@ -3919,29 +4000,32 @@ async def _run_v4_worker_loop(
                     if claim_result.outcome == FamilyClaimOutcome.MATCHES:
                         metrics = claim_result.metrics
                         logging.info(
-                            "[%s] V4 family claim complete family=%s query=%s saved=%s scraped=%s",
+                            "[%s] V4 family claim complete family=%s query=%s exploration=%s saved=%s scraped=%s",
                             WORKER_NAME,
                             family.get("name"),
                             family.get("selected_query"),
+                            family.get("exploration_dispatch"),
                             metrics.get("listings_saved", 0),
                             metrics.get("listings_scraped", 0),
                         )
                     elif claim_result.outcome == FamilyClaimOutcome.STALE_FEED:
                         metrics = claim_result.metrics
                         logging.info(
-                            "[%s] V4 family claim stale_feed family=%s query=%s saved=%s scraped=%s",
+                            "[%s] V4 family claim stale_feed family=%s query=%s exploration=%s saved=%s scraped=%s",
                             WORKER_NAME,
                             family.get("name"),
                             family.get("selected_query"),
+                            family.get("exploration_dispatch"),
                             metrics.get("listings_saved", 0),
                             metrics.get("listings_scraped", 0),
                         )
                     elif claim_result.outcome == FamilyClaimOutcome.EMPTY_FEED:
                         logging.info(
-                            "[%s] V4 family claim empty_feed family=%s query=%s final_url=%s",
+                            "[%s] V4 family claim empty_feed family=%s query=%s exploration=%s final_url=%s",
                             WORKER_NAME,
                             family.get("name"),
                             family.get("selected_query"),
+                            family.get("exploration_dispatch"),
                             claim_result.final_url or "",
                         )
                     else:
